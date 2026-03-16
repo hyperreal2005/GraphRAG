@@ -1,0 +1,10 @@
+docling
+fastcoref
+pandas
+pypdf
+pytest
+google-genai
+sentence-transformers
+neo4j
+gliner
+python-dotenv
