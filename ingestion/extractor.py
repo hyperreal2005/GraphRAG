@@ -51,7 +51,11 @@ class GeminiExtractor:
             prompt = self._prompt_full(chunk_text)
 
         response_text = self._generate(prompt)
-        parsed = self._parse_json(response_text)
+        try:
+            parsed = self._parse_json(response_text)
+        except RuntimeError:
+            repair_text = self._generate(self._repair_prompt(response_text))
+            parsed = self._parse_json(repair_text)
         result = ExtractionResult.from_dict(parsed)
 
         if entities is not None and entities:
@@ -73,14 +77,24 @@ class GeminiExtractor:
         return (
             "SYSTEM:\n"
             "You are a knowledge graph construction engine.\n"
-            "Your task is to extract structured knowledge from text.\n"
+            "Your task is to extract structured knowledge from text with high precision.\n"
             "Rules:\n"
-            "- Extract ALL meaningful entities (people, organisations, concepts,\n"
-            "locations, events, technical terms, processes, etc.)\n"
-            "- Extract ALL relationships between those entities\n"
+            "- Extract ONLY salient, specific entities (people, organisations, systems,\n"
+            "  methods, datasets, tools, publications, concepts, locations, events).\n"
+            "- Avoid generic or deictic entities like \"this paper\", \"this study\",\n"
+            "  \"this research\", \"the system\" unless clearly named.\n"
+            "- If the paper itself must be referenced, use a single entity named\n"
+            "  \"This Study\" with type \"Document\".\n"
+            "- Extract ONLY explicit, meaningful relationships between entities.\n"
+            "- Prefer precision over recall; omit uncertain relations.\n"
             "- Do NOT use a predefined schema.\n"
             "Infer entity types and relation types from the text itself.\n"
-            "- Assign a confidence score (0.0–1.0) to each triple\n"
+            "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
+            "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
+            "  Example: \"is designed to improve\" -> \"IMPROVES\".\n"
+            "- Assign a confidence score (0.0-1.0) to each relation.\n"
+            "- Limit output to the most important 5-15 entities and relations.\n"
+            "- Properties must be JSON objects with primitive values only.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
             "Output format:\n"
             "{\n"
@@ -113,8 +127,11 @@ class GeminiExtractor:
             "Your task is to infer relationships between a provided list of entities.\n"
             "Rules:\n"
             "- Use ONLY the provided entities. Do not invent new entities.\n"
-            "- Extract relationships between them from the text.\n"
-            "- Assign a confidence score (0.0–1.0) to each relation.\n"
+            "- Extract ONLY explicit, meaningful relationships.\n"
+            "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
+            "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
+            "- Assign a confidence score (0.0-1.0) to each relation.\n"
+            "- Prefer precision over recall; omit uncertain relations.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
             "Output format:\n"
             "{\n"
@@ -126,16 +143,71 @@ class GeminiExtractor:
         )
 
     def _parse_json(self, raw_text: str) -> dict[str, Any]:
+        cleaned = self._strip_code_fence(raw_text)
+        try:
+            return self._decode_json(cleaned)
+        except json.JSONDecodeError:
+            sanitized = self._sanitize_json_text(cleaned)
+            try:
+                return self._decode_json(sanitized)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Gemini response did not contain valid JSON: {exc}") from exc
+
+    def _decode_json(self, text: str) -> dict[str, Any]:
+        decoder = json.JSONDecoder()
+        for start_char in ("{", "["):
+            idx = text.find(start_char)
+            if idx == -1:
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text[idx:])
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+        match = JSON_BLOCK_PATTERN.search(text)
+        if match:
+            obj = json.loads(match.group(0))
+            if isinstance(obj, dict):
+                return obj
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+
+    def _strip_code_fence(self, raw_text: str) -> str:
         cleaned = raw_text.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`")
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            match = JSON_BLOCK_PATTERN.search(cleaned)
-            if match:
-                return json.loads(match.group(0))
-        raise RuntimeError("Gemini response did not contain valid JSON.")
+        return cleaned.strip()
+
+    def _sanitize_json_text(self, text: str) -> str:
+        sanitized = text.replace("\u201c", '"').replace("\u201d", '"').replace("\u2019", "'")
+        sanitized = re.sub(r",\s*([}\]])", r"\1", sanitized)
+        return sanitized.strip()
+
+    def _repair_prompt(self, raw_text: str) -> str:
+        return (
+            "SYSTEM:\n"
+            "You are a JSON repair tool.\n"
+            "Fix the invalid JSON below and return ONLY valid JSON.\n"
+            "Do not add any explanations or extra text.\n"
+            "The JSON must match this schema:\n"
+            "{\n"
+            "\"entities\": [\n"
+            "{\"id\": \"e1\", \"name\": \"...\", \"type\": \"...\", \"properties\": {...}}\n"
+            "],\n"
+            "\"relations\": [\n"
+            "{\n"
+            "\"head\": \"e1\",\n"
+            "\"head_type\": \"Person\",\n"
+            "\"relation\": \"FOUNDED\",\n"
+            "\"tail\": \"e2\",\n"
+            "\"tail_type\": \"Organisation\",\n"
+            "\"properties\": {\"year\": 2003},\n"
+            "\"confidence\": 0.95\n"
+            "}\n"
+            "]\n"
+            "}\n"
+            f"INVALID_JSON:\n{raw_text}\n"
+        )
 
     def _gliner_entities(self, chunk_text: str) -> list[ExtractedEntity]:
         if not chunk_text.strip():

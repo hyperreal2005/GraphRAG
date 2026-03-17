@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -16,6 +17,27 @@ def sanitize_rel_type(relation: str) -> str:
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in relation.upper())
     cleaned = cleaned.strip("_") or "RELATED_TO"
     return cleaned
+
+
+def normalize_properties(value: Any) -> str:
+    if value is None:
+        return "{}"
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except TypeError:
+        return json.dumps(str(value))
+
+
+def normalize_aliases(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None and str(item).strip()]
+    return [str(value)]
 
 
 class GraphWriter:
@@ -56,8 +78,8 @@ class GraphWriter:
                     "id": node["id"],
                     "name": node["name"],
                     "type": node["type"],
-                    "properties": node.get("properties", {}),
-                    "aliases": node.get("aliases", []),
+                    "properties": normalize_properties(node.get("properties", {})),
+                    "aliases": normalize_aliases(node.get("aliases", [])),
                     "confidence": float(node.get("confidence", 0.0)),
                     "doc_id": doc_id,
                     "created_at": node.get("created_at", utc_now_iso()),
@@ -86,7 +108,7 @@ class GraphWriter:
                     "head_id": edge["head_id"],
                     "tail_id": edge["tail_id"],
                     "relation": edge["relation"],
-                    "properties": edge.get("properties", {}),
+                    "properties": normalize_properties(edge.get("properties", {})),
                     "weight": float(edge.get("weight", 0.0)),
                     "source_chunk": edge.get("source_chunk"),
                     "doc_id": doc_id,

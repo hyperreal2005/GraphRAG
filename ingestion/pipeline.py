@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -154,8 +155,19 @@ class PhaseOnePipeline:
                 extraction_relations = []
                 entity_mentions: list[tuple[str, str, str, float]] = []
 
-                for chunk in chunks_to_process:
-                    result = self.extractor.extract(chunk.text, doc_format)
+                def run_extract(chunk):
+                    return chunk, self.extractor.extract(chunk.text, doc_format)
+
+                max_workers = max(1, int(self.settings.gemini_max_workers))
+                if max_workers == 1 or len(chunks_to_process) <= 1:
+                    results_iter = (run_extract(chunk) for chunk in chunks_to_process)
+                else:
+                    workers = min(max_workers, len(chunks_to_process))
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [executor.submit(run_extract, chunk) for chunk in chunks_to_process]
+                        results_iter = (future.result() for future in as_completed(futures))
+
+                for chunk, result in results_iter:
                     extraction_entities.extend(result.entities)
                     extraction_relations.extend(
                         [

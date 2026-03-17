@@ -22,6 +22,7 @@ class Settings:
     enable_graph: bool = True
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
+    gemini_max_workers: int = 2
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "your_password"
@@ -56,6 +57,10 @@ class Settings:
     def __post_init__(self) -> None:
         """Allow env vars to override sensitive defaults."""
         self.gemini_api_key = self.gemini_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        try:
+            self.gemini_max_workers = int(os.getenv("GEMINI_MAX_WORKERS", self.gemini_max_workers))
+        except ValueError:
+            self.gemini_max_workers = self.gemini_max_workers
         self.neo4j_password = os.getenv("NEO4J_PASSWORD", self.neo4j_password)
         self.neo4j_uri = os.getenv("NEO4J_URI", self.neo4j_uri)
         self.neo4j_user = os.getenv("NEO4J_USER", self.neo4j_user)
