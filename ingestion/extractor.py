@@ -13,6 +13,28 @@ from models.extraction import ExtractedEntity, ExtractionResult
 
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 
+CANONICAL_RELATION_LABELS = (
+    "USES",
+    "PROVIDES",
+    "IMPROVES",
+    "SUPPORTS",
+    "REQUIRES",
+    "INCLUDES",
+    "INTEGRATES",
+    "STORES",
+    "PROCESSES",
+    "ACCESSES",
+    "ANALYZES",
+    "TARGETS",
+    "PART_OF",
+    "TYPE_OF",
+    "DEVELOPED_BY",
+    "EVALUATED_WITH",
+    "PUBLISHED_IN",
+    "LOCATED_IN",
+    "RELATED_TO",
+)
+
 
 @dataclass
 class ExtractorStats:
@@ -40,6 +62,7 @@ class GeminiExtractor:
         self._genai = genai
         self._genai_types = types
         self._client = genai.Client(api_key=self.settings.gemini_api_key)
+        self._response_schema = self._build_response_schema()
 
     def extract(self, chunk_text: str, doc_format: str) -> ExtractionResult:
         """Extract entities and relations from chunk text."""
@@ -50,28 +73,83 @@ class GeminiExtractor:
             entities = None
             prompt = self._prompt_full(chunk_text)
 
-        response_text = self._generate(prompt)
         try:
-            parsed = self._parse_json(response_text)
+            parsed = self._generate(prompt)
         except RuntimeError:
-            repair_text = self._generate(self._repair_prompt(response_text))
-            parsed = self._parse_json(repair_text)
+            parsed = self._generate(self._repair_prompt(prompt))
         result = ExtractionResult.from_dict(parsed)
 
         if entities is not None and entities:
             result.entities = entities
         return result
 
-    def _generate(self, prompt: str) -> str:
+    def _build_response_schema(self) -> Any:
+        properties_schema = self._genai_types.Schema(type="OBJECT")
+        entity_schema = self._genai_types.Schema(
+            type="OBJECT",
+            required=["id", "name", "type", "properties"],
+            properties={
+                "id": self._genai_types.Schema(type="STRING", min_length=1),
+                "name": self._genai_types.Schema(type="STRING", min_length=1),
+                "type": self._genai_types.Schema(type="STRING", min_length=1),
+                "properties": properties_schema,
+            },
+        )
+        relation_schema = self._genai_types.Schema(
+            type="OBJECT",
+            required=[
+                "head",
+                "head_type",
+                "relation",
+                "tail",
+                "tail_type",
+                "properties",
+                "confidence",
+            ],
+            properties={
+                "head": self._genai_types.Schema(type="STRING", min_length=1),
+                "head_type": self._genai_types.Schema(type="STRING", min_length=1),
+                "relation": self._genai_types.Schema(
+                    type="STRING",
+                    min_length=1,
+                    max_length=64,
+                    pattern=r"^[A-Z][A-Z0-9_]*$",
+                ),
+                "tail": self._genai_types.Schema(type="STRING", min_length=1),
+                "tail_type": self._genai_types.Schema(type="STRING", min_length=1),
+                "properties": properties_schema,
+                "confidence": self._genai_types.Schema(type="NUMBER", minimum=0.0, maximum=1.0),
+            },
+        )
+        return self._genai_types.Schema(
+            type="OBJECT",
+            required=["entities", "relations"],
+            properties={
+                "entities": self._genai_types.Schema(type="ARRAY", items=entity_schema),
+                "relations": self._genai_types.Schema(type="ARRAY", items=relation_schema),
+            },
+        )
+
+    def _generate(self, prompt: str) -> dict[str, Any]:
         response = self._client.models.generate_content(
             model=self.settings.gemini_model,
             contents=prompt,
-            config=self._genai_types.GenerateContentConfig(response_mime_type="application/json"),
+            config=self._genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=self._response_schema,
+            ),
         )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, dict):
+            return parsed
+        if parsed is not None and hasattr(parsed, "model_dump"):
+            dumped = parsed.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
         text = getattr(response, "text", None)
-        if not text:
-            raise RuntimeError("Gemini returned empty response.")
-        return text
+        if text:
+            return self._parse_json(text)
+        raise RuntimeError("Gemini returned empty/invalid structured response.")
 
     def _prompt_full(self, chunk_text: str) -> str:
         return (
@@ -87,13 +165,19 @@ class GeminiExtractor:
             "  \"This Study\" with type \"Document\".\n"
             "- Extract ONLY explicit, meaningful relationships between entities.\n"
             "- Prefer precision over recall; omit uncertain relations.\n"
-            "- Do NOT use a predefined schema.\n"
-            "Infer entity types and relation types from the text itself.\n"
+            "- For academic papers, ignore bibliography/reference entries and journal\n"
+            "  header/footer metadata (ISSN, copyright lines, repeated page header text),\n"
+            "  unless central to the chunk's main claim.\n"
+            "- Infer entity types and relation types from the text itself.\n"
             "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
             "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
             "  Example: \"is designed to improve\" -> \"IMPROVES\".\n"
+            "- Reuse canonical relation labels whenever possible:\n"
+            f"  {', '.join(CANONICAL_RELATION_LABELS)}.\n"
+            "- If none clearly fits, use RELATED_TO.\n"
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
-            "- Limit output to the most important 5-15 entities and relations.\n"
+            "- Keep extraction concise. Output zero entities/relations when the chunk\n"
+            "  lacks meaningful graph facts.\n"
             "- Properties must be JSON objects with primitive values only.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
             "Output format:\n"
@@ -128,8 +212,12 @@ class GeminiExtractor:
             "Rules:\n"
             "- Use ONLY the provided entities. Do not invent new entities.\n"
             "- Extract ONLY explicit, meaningful relationships.\n"
+            "- Ignore bibliography/reference style statements and boilerplate metadata.\n"
             "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
             "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
+            "- Prefer canonical relation labels:\n"
+            f"  {', '.join(CANONICAL_RELATION_LABELS)}.\n"
+            "- If none clearly fits, use RELATED_TO.\n"
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
             "- Prefer precision over recall; omit uncertain relations.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
@@ -183,30 +271,13 @@ class GeminiExtractor:
         sanitized = re.sub(r",\s*([}\]])", r"\1", sanitized)
         return sanitized.strip()
 
-    def _repair_prompt(self, raw_text: str) -> str:
+    def _repair_prompt(self, previous_prompt: str) -> str:
         return (
             "SYSTEM:\n"
-            "You are a JSON repair tool.\n"
-            "Fix the invalid JSON below and return ONLY valid JSON.\n"
-            "Do not add any explanations or extra text.\n"
-            "The JSON must match this schema:\n"
-            "{\n"
-            "\"entities\": [\n"
-            "{\"id\": \"e1\", \"name\": \"...\", \"type\": \"...\", \"properties\": {...}}\n"
-            "],\n"
-            "\"relations\": [\n"
-            "{\n"
-            "\"head\": \"e1\",\n"
-            "\"head_type\": \"Person\",\n"
-            "\"relation\": \"FOUNDED\",\n"
-            "\"tail\": \"e2\",\n"
-            "\"tail_type\": \"Organisation\",\n"
-            "\"properties\": {\"year\": 2003},\n"
-            "\"confidence\": 0.95\n"
-            "}\n"
-            "]\n"
-            "}\n"
-            f"INVALID_JSON:\n{raw_text}\n"
+            "Re-run the extraction task below and return ONLY strict JSON with keys\n"
+            "\"entities\" and \"relations\". Do not include any markdown or explanation.\n"
+            "If nothing can be extracted, return {\"entities\": [], \"relations\": []}.\n"
+            f"TASK:\n{previous_prompt}\n"
         )
 
     def _gliner_entities(self, chunk_text: str) -> list[ExtractedEntity]:

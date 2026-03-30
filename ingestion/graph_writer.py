@@ -7,16 +7,11 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from config import Settings
+from ingestion.relation_normalizer import sanitize_rel_type
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def sanitize_rel_type(relation: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() else "_" for ch in relation.upper())
-    cleaned = cleaned.strip("_") or "RELATED_TO"
-    return cleaned
 
 
 def normalize_properties(value: Any) -> str:
@@ -97,17 +92,23 @@ class GraphWriter:
                     f"MERGE (h)-[r:{rel_type} {{source_chunk: $source_chunk}}]->(t) "
                     "ON CREATE SET "
                     "r.type = $relation, "
+                    "r.raw_relations = [$raw_relation], "
                     "r.properties = $properties, "
                     "r.weight = $weight, "
                     "r.sources = [$doc_id], "
                     "r.created_at = $created_at "
                     "ON MATCH SET "
+                    "r.raw_relations = CASE "
+                    "WHEN $raw_relation IN coalesce(r.raw_relations, []) THEN coalesce(r.raw_relations, []) "
+                    "ELSE coalesce(r.raw_relations, []) + [$raw_relation] "
+                    "END, "
                     "r.sources = CASE WHEN $doc_id IN r.sources THEN r.sources ELSE r.sources + [$doc_id] END "
                 )
                 payload = {
                     "head_id": edge["head_id"],
                     "tail_id": edge["tail_id"],
                     "relation": edge["relation"],
+                    "raw_relation": str(edge.get("raw_relation") or edge["relation"]),
                     "properties": normalize_properties(edge.get("properties", {})),
                     "weight": float(edge.get("weight", 0.0)),
                     "source_chunk": edge.get("source_chunk"),

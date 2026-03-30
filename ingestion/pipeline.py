@@ -13,6 +13,7 @@ from config import Settings
 from ingestion.chunker import SemanticChunker
 from ingestion.coref import CoreferenceResolver
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
+from ingestion.relation_normalizer import canonicalize_relation
 from ingestion.state_store import MetadataStore
 from models.ingestion import (
     DeltaSummary,
@@ -243,11 +244,16 @@ class PhaseOnePipeline:
                     tail_id = disamb.entity_id_map.get(edge["tail_id"], edge["tail_id"])
                     if head_id not in canonical_nodes or tail_id not in canonical_nodes:
                         continue
+                    raw_relation = str(edge.get("relation") or "").strip()
+                    if not raw_relation:
+                        continue
+                    canonical_relation = canonicalize_relation(raw_relation)
                     mapped_edges.append(
                         {
                             "head_id": head_id,
                             "tail_id": tail_id,
-                            "relation": edge["relation"],
+                            "relation": canonical_relation,
+                            "raw_relation": raw_relation,
                             "properties": edge["properties"],
                             "weight": edge["weight"],
                             "source_chunk": edge["source_chunk"],

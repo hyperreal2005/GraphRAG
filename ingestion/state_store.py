@@ -170,7 +170,7 @@ class MetadataStore:
                     last_error = NULL
                 WHERE doc_id = ?
                 """,
-                (word_count, utc_now_iso(), "processing", pipeline_stage, doc_id),
+                (word_count, utc_now_iso(), "complete", pipeline_stage, doc_id),
             )
 
     def update_pipeline_stage(self, doc_id: str, stage: str) -> None:
