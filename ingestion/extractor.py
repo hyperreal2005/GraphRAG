@@ -101,6 +101,7 @@ class GeminiExtractor:
                 "head",
                 "head_type",
                 "relation",
+                "raw_relation",
                 "tail",
                 "tail_type",
                 "properties",
@@ -114,7 +115,9 @@ class GeminiExtractor:
                     min_length=1,
                     max_length=64,
                     pattern=r"^[A-Z][A-Z0-9_]*$",
+                    enum=list(CANONICAL_RELATION_LABELS),
                 ),
+                "raw_relation": self._genai_types.Schema(type="STRING", min_length=1, max_length=128),
                 "tail": self._genai_types.Schema(type="STRING", min_length=1),
                 "tail_type": self._genai_types.Schema(type="STRING", min_length=1),
                 "properties": properties_schema,
@@ -172,9 +175,11 @@ class GeminiExtractor:
             "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
             "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
             "  Example: \"is designed to improve\" -> \"IMPROVES\".\n"
-            "- Reuse canonical relation labels whenever possible:\n"
+            "- relation must be chosen from this canonical set:\n"
             f"  {', '.join(CANONICAL_RELATION_LABELS)}.\n"
             "- If none clearly fits, use RELATED_TO.\n"
+            "- raw_relation must preserve the exact surface phrasing from the chunk\n"
+            "  before canonical mapping (e.g. \"is designed to improve\").\n"
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
             "- Keep extraction concise. Output zero entities/relations when the chunk\n"
             "  lacks meaningful graph facts.\n"
@@ -189,7 +194,8 @@ class GeminiExtractor:
             "{\n"
             "\"head\": \"e1\",\n"
             "\"head_type\": \"Person\",\n"
-            "\"relation\": \"FOUNDED\",\n"
+            "\"relation\": \"DEVELOPED_BY\",\n"
+            "\"raw_relation\": \"was developed by\",\n"
             "\"tail\": \"e2\",\n"
             "\"tail_type\": \"Organisation\",\n"
             "\"properties\": {\"year\": 2003},\n"
@@ -215,16 +221,18 @@ class GeminiExtractor:
             "- Ignore bibliography/reference style statements and boilerplate metadata.\n"
             "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
             "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
-            "- Prefer canonical relation labels:\n"
+            "- relation must be chosen from this canonical set:\n"
             f"  {', '.join(CANONICAL_RELATION_LABELS)}.\n"
             "- If none clearly fits, use RELATED_TO.\n"
+            "- raw_relation must preserve the exact surface phrasing from the chunk\n"
+            "  before canonical mapping.\n"
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
             "- Prefer precision over recall; omit uncertain relations.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
             "Output format:\n"
             "{\n"
             "\"entities\": [...],\n"
-            "\"relations\": [...]\n"
+            "\"relations\": [{\"head\":\"e1\",\"head_type\":\"...\",\"relation\":\"USES\",\"raw_relation\":\"uses\",\"tail\":\"e2\",\"tail_type\":\"...\",\"properties\":{},\"confidence\":0.9}]\n"
             "}\n"
             f"ENTITIES: {json.dumps(entities_payload)}\n"
             f"TEXT: {chunk_text}\n"
@@ -276,6 +284,8 @@ class GeminiExtractor:
             "SYSTEM:\n"
             "Re-run the extraction task below and return ONLY strict JSON with keys\n"
             "\"entities\" and \"relations\". Do not include any markdown or explanation.\n"
+            "Each relation must include head, head_type, relation, raw_relation, tail,\n"
+            "tail_type, properties, and confidence.\n"
             "If nothing can be extracted, return {\"entities\": [], \"relations\": []}.\n"
             f"TASK:\n{previous_prompt}\n"
         )

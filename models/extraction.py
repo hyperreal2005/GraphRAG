@@ -28,6 +28,7 @@ class ExtractedRelation:
     head_id: str
     head_type: str
     relation: str
+    raw_relation: str
     tail_id: str
     tail_type: str
     properties: dict[str, Any] = field(default_factory=dict)
@@ -35,10 +36,13 @@ class ExtractedRelation:
 
     @staticmethod
     def from_dict(payload: dict[str, Any]) -> "ExtractedRelation":
+        relation = str(payload.get("relation") or "").strip()
+        raw_relation = str(payload.get("raw_relation") or relation).strip()
         return ExtractedRelation(
             head_id=str(payload.get("head") or ""),
             head_type=str(payload.get("head_type") or "").strip(),
-            relation=str(payload.get("relation") or "").strip(),
+            relation=relation,
+            raw_relation=raw_relation,
             tail_id=str(payload.get("tail") or ""),
             tail_type=str(payload.get("tail_type") or "").strip(),
             properties=dict(payload.get("properties") or {}),
@@ -58,4 +62,3 @@ class ExtractionResult:
         entities = [ExtractedEntity.from_dict(item) for item in entities_raw if isinstance(item, dict)]
         relations = [ExtractedRelation.from_dict(item) for item in relations_raw if isinstance(item, dict)]
         return ExtractionResult(entities=entities, relations=relations)
-

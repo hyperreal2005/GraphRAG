@@ -142,7 +142,7 @@ class PhaseOnePipeline:
                     self.store.delete_entity_mentions_for_chunks(doc_id, removed_chunk_ids)
                     remaining_entities = self.store.get_entity_ids_with_mentions(doc_id)
                     entity_ids_to_retract = entity_ids_removed - remaining_entities
-                    self.graph_writer.retract_chunks(removed_chunk_ids)
+                    self.graph_writer.retract_chunks(doc_id, removed_chunk_ids)
                     self.graph_writer.retract_entities(doc_id, entity_ids_to_retract)
                     self.store.delete_doc_entities(doc_id, list(entity_ids_to_retract))
 
@@ -176,6 +176,7 @@ class PhaseOnePipeline:
                                 "head_id": relation.head_id,
                                 "head_type": relation.head_type,
                                 "relation": relation.relation,
+                                "raw_relation": relation.raw_relation,
                                 "tail_id": relation.tail_id,
                                 "tail_type": relation.tail_type,
                                 "properties": relation.properties,
@@ -244,10 +245,10 @@ class PhaseOnePipeline:
                     tail_id = disamb.entity_id_map.get(edge["tail_id"], edge["tail_id"])
                     if head_id not in canonical_nodes or tail_id not in canonical_nodes:
                         continue
-                    raw_relation = str(edge.get("relation") or "").strip()
+                    raw_relation = str(edge.get("raw_relation") or edge.get("relation") or "").strip()
                     if not raw_relation:
                         continue
-                    canonical_relation = canonicalize_relation(raw_relation)
+                    canonical_relation = canonicalize_relation(str(edge.get("relation") or raw_relation))
                     mapped_edges.append(
                         {
                             "head_id": head_id,

@@ -13,7 +13,28 @@ def sanitize_rel_type(relation: str) -> str:
 def canonicalize_relation(relation: str) -> str:
     """Map free-form relation labels into stable canonical labels."""
     label = sanitize_rel_type(relation)
-    if label == "RELATED_TO":
+    canonical_labels = {
+        "USES",
+        "PROVIDES",
+        "IMPROVES",
+        "SUPPORTS",
+        "REQUIRES",
+        "INCLUDES",
+        "INTEGRATES",
+        "STORES",
+        "PROCESSES",
+        "ACCESSES",
+        "ANALYZES",
+        "TARGETS",
+        "PART_OF",
+        "TYPE_OF",
+        "DEVELOPED_BY",
+        "EVALUATED_WITH",
+        "PUBLISHED_IN",
+        "LOCATED_IN",
+        "RELATED_TO",
+    }
+    if label in canonical_labels:
         return label
 
     tokens = [token for token in label.split("_") if token]
@@ -32,12 +53,22 @@ def canonicalize_relation(relation: str) -> str:
         "DEVELOPED_BY": "DEVELOPED_BY",
         "CREATED_BY": "DEVELOPED_BY",
         "AUTHORED_BY": "DEVELOPED_BY",
+        "AUTHORED": "DEVELOPED_BY",
         "PUBLISHED_IN": "PUBLISHED_IN",
         "PUBLISHED_ON": "PUBLISHED_IN",
         "LOCATED_IN": "LOCATED_IN",
         "USED_FOR": "USES",
         "USED_IN": "USES",
         "UTILIZED_IN": "USES",
+        "RELIES_ON": "REQUIRES",
+        "RELY_ON": "REQUIRES",
+        "DEPENDS_ON": "REQUIRES",
+        "IS": "RELATED_TO",
+        "FOR": "RELATED_TO",
+        "BETWEEN": "RELATED_TO",
+        "MAKES": "RELATED_TO",
+        "PASSES": "RELATED_TO",
+        "MATCHED": "RELATED_TO",
         "RELATED_TO": "RELATED_TO",
     }
     if label in exact_map:
@@ -92,7 +123,5 @@ def canonicalize_relation(relation: str) -> str:
     if has_prefix("RELAT", "ASSOCIAT", "LINK", "CONNECT", "CORRELAT"):
         return "RELATED_TO"
 
-    # Keep already-compact labels; collapse long tails.
-    if len(tokens) <= 3:
-        return label
+    # Conservative fallback: avoid long-tail relation explosion.
     return "RELATED_TO"
