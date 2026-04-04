@@ -15,6 +15,7 @@ from ingestion.coref import CoreferenceResolver
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
 from ingestion.relation_normalizer import canonicalize_relation
 from ingestion.state_store import MetadataStore
+from ingestion.vector_indexer import ChunkVectorInput, EntityVectorInput, QdrantVectorIndexer, build_entity_summary
 from models.ingestion import (
     DeltaSummary,
     FileIngestionResult,
@@ -30,7 +31,7 @@ def utc_now_iso() -> str:
 
 
 class PhaseOnePipeline:
-    """Implements Stage 1-6 for ingestion plane."""
+    """Implements Stage 1-7 for ingestion plane."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -49,6 +50,7 @@ class PhaseOnePipeline:
         self.extractor = None
         self.disambiguator = None
         self.graph_writer = None
+        self.vector_indexer = None
         if self.settings.enable_graph:
             from ingestion.disambiguator import EntityDisambiguator
             from ingestion.extractor import GeminiExtractor
@@ -58,17 +60,20 @@ class PhaseOnePipeline:
             self.extractor = GeminiExtractor(self.settings)
             self.disambiguator = EntityDisambiguator(self.settings)
             self.graph_writer = GraphWriter(self.settings)
+            self.vector_indexer = QdrantVectorIndexer(self.settings)
 
     def ingest_path(self, input_path: Path, recursive: bool = True) -> IngestionRunSummary:
         """Ingest one file or directory."""
         files = self._discover_files(input_path, recursive=recursive)
+        if self.settings.enable_graph and self.settings.auto_backfill_vectors:
+            self._backfill_graph_written_docs()
         summary = IngestionRunSummary()
         for file_path in files:
             summary.add(self.ingest_file(file_path))
         return summary
 
     def ingest_file(self, source_path: Path) -> FileIngestionResult:
-        """Ingest a single file from Stage 1 through Stage 6."""
+        """Ingest a single file from Stage 1 through Stage 7."""
         started_at = utc_now_iso()
         run_id = str(uuid.uuid4())
         absolute_path = source_path.resolve()
@@ -133,10 +138,16 @@ class PhaseOnePipeline:
             relations_created = 0
 
             if self.settings.enable_graph:
-                if self.extractor is None or self.disambiguator is None or self.graph_writer is None:
+                if (
+                    self.extractor is None
+                    or self.disambiguator is None
+                    or self.graph_writer is None
+                    or self.vector_indexer is None
+                ):
                     raise RuntimeError("Extraction components are not initialized.")
 
                 removed_chunk_ids = [old_hash_to_chunk_id[h] for h in removed if h in old_hash_to_chunk_id]
+                entity_ids_to_retract: set[str] = set()
                 if removed_chunk_ids:
                     entity_ids_removed = self.store.get_entity_ids_for_chunks(doc_id, removed_chunk_ids)
                     self.store.delete_entity_mentions_for_chunks(doc_id, removed_chunk_ids)
@@ -145,6 +156,8 @@ class PhaseOnePipeline:
                     self.graph_writer.retract_chunks(doc_id, removed_chunk_ids)
                     self.graph_writer.retract_entities(doc_id, entity_ids_to_retract)
                     self.store.delete_doc_entities(doc_id, list(entity_ids_to_retract))
+                    self.vector_indexer.delete_chunk_vectors(removed_chunk_ids)
+                    self.vector_indexer.delete_entity_vectors(list(entity_ids_to_retract))
 
                 chunks_to_process = (
                     [chunk for chunk in chunks if chunk.chunk_hash in added]
@@ -238,6 +251,9 @@ class PhaseOnePipeline:
                     for entity_id, chunk_id, doc_id, confidence in entity_mentions
                 ]
                 self.store.upsert_entity_mentions(mapped_mentions)
+                mentions_by_chunk: dict[str, list[str]] = {}
+                for entity_id, chunk_id, _, _ in mapped_mentions:
+                    mentions_by_chunk.setdefault(chunk_id, []).append(entity_id)
 
                 mapped_edges = []
                 for edge in extraction_relations:
@@ -276,9 +292,41 @@ class PhaseOnePipeline:
                 self.graph_writer.write_edges(doc_id, mapped_edges)
                 self.store.update_pipeline_stage(doc_id, "GRAPH_WRITTEN")
 
+                chunk_vector_inputs = [
+                    ChunkVectorInput(
+                        chunk_id=chunk.chunk_id,
+                        doc_id=doc_id,
+                        text=chunk.text,
+                        section_heading=chunk.section_heading,
+                        page=chunk.page_number,
+                        entity_ids_mentioned=mentions_by_chunk.get(chunk.chunk_id, []),
+                    )
+                    for chunk in chunks_to_process
+                ]
+                entity_vector_inputs = [
+                    EntityVectorInput(
+                        neo4j_node_id=node["id"],
+                        name=node["name"],
+                        entity_type=node["type"],
+                        summary=build_entity_summary(
+                            name=str(node["name"]),
+                            entity_type=str(node["type"]),
+                            properties=node.get("properties", {}),
+                        ),
+                    )
+                    for node in canonical_nodes.values()
+                ]
+                self.vector_indexer.upsert_chunk_vectors(chunk_vector_inputs)
+                self.vector_indexer.upsert_entity_vectors(entity_vector_inputs)
+                self.store.set_chunk_embedding_version(
+                    [item.chunk_id for item in chunk_vector_inputs],
+                    self.settings.embedding_version,
+                )
+                self.store.update_pipeline_stage(doc_id, "VECTORS_WRITTEN")
+
                 entities_created = len(canonical_nodes)
                 relations_created = len(mapped_edges)
-                self.store.finish_document(doc_id, resolved.metadata.word_count, "GRAPH_WRITTEN")
+                self.store.finish_document(doc_id, resolved.metadata.word_count, "DONE")
 
             self._write_artifacts(
                 run_id=run_id,
@@ -372,9 +420,62 @@ class PhaseOnePipeline:
             encoding="utf-8",
         )
 
+    def _backfill_graph_written_docs(self) -> None:
+        """Backfill vectors for complete docs that reached GRAPH_WRITTEN before Stage 7 existed."""
+        if self.graph_writer is None or self.vector_indexer is None:
+            return
+        rows = self.store.list_documents(status="complete", pipeline_stage="GRAPH_WRITTEN")
+        for row in rows:
+            doc_id = str(row["doc_id"])
+            try:
+                chunks = self.store.get_chunks_for_doc(doc_id)
+                mentions_by_chunk = self.store.get_entity_mentions_map(doc_id)
+                chunk_inputs = [
+                    ChunkVectorInput(
+                        chunk_id=str(chunk["chunk_id"]),
+                        doc_id=str(chunk["doc_id"]),
+                        text=str(chunk["text"] or ""),
+                        section_heading=str(chunk["section"]) if chunk["section"] is not None else None,
+                        page=int(chunk["page"]) if chunk["page"] is not None else None,
+                        entity_ids_mentioned=mentions_by_chunk.get(str(chunk["chunk_id"]), []),
+                    )
+                    for chunk in chunks
+                ]
+                entity_rows = self.graph_writer.get_entities_for_doc(doc_id)
+                entity_inputs = [
+                    EntityVectorInput(
+                        neo4j_node_id=str(entity_row.get("id") or ""),
+                        name=str(entity_row.get("name") or ""),
+                        entity_type=str(entity_row.get("type") or "Entity"),
+                        summary=build_entity_summary(
+                            name=str(entity_row.get("name") or ""),
+                            entity_type=str(entity_row.get("type") or "Entity"),
+                            properties=entity_row.get("properties"),
+                        ),
+                    )
+                    for entity_row in entity_rows
+                    if str(entity_row.get("id") or "").strip()
+                ]
+                self.vector_indexer.upsert_chunk_vectors(chunk_inputs)
+                self.vector_indexer.upsert_entity_vectors(entity_inputs)
+                self.store.set_chunk_embedding_version(
+                    [item.chunk_id for item in chunk_inputs],
+                    self.settings.embedding_version,
+                )
+                self.store.update_pipeline_stage(doc_id, "VECTORS_WRITTEN")
+                self.store.finish_document(
+                    doc_id=doc_id,
+                    word_count=int(row["word_count"] or 0),
+                    pipeline_stage="DONE",
+                )
+            except Exception as exc:
+                self.store.fail_document(doc_id=doc_id, error_message=f"Vector backfill failed: {exc}")
+                raise RuntimeError(f"Vector backfill failed for doc_id={doc_id}: {exc}") from exc
+
     def _ensure_embedding_metadata(self) -> None:
         stored_model = self.store.get_system_metadata("embedding_model_id")
         stored_dim = self.store.get_system_metadata("embedding_dim")
+        stored_version = self.store.get_system_metadata("embedding_version")
         if stored_model is None:
             self.store.set_system_metadata("embedding_model_id", self.settings.embedding_model_id)
             self.store.set_system_metadata("embedding_dim", str(self.settings.embedding_dim))
@@ -384,3 +485,5 @@ class PhaseOnePipeline:
             raise RuntimeError(
                 "Embedding model mismatch. Re-embed vectors or fix config before ingestion."
             )
+        if stored_version is None:
+            self.store.set_system_metadata("embedding_version", self.settings.embedding_version)

@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phase1-only",
         action="store_true",
-        help="Run only Phase 1 stages (parse/coref/chunk) without extraction/Neo4j writes",
+        help="Run only Phase 1 stages (parse/coref/chunk) without graph/vector writes",
     )
     return parser
 

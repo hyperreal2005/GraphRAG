@@ -200,3 +200,14 @@ class GraphWriter:
         )
         with self._driver.session() as session:
             session.run(query, {"entity_ids": entity_list, "doc_id": doc_id})
+
+    def get_entities_for_doc(self, doc_id: str) -> list[dict[str, Any]]:
+        """Fetch entity nodes sourced from a specific document."""
+        query = (
+            "MATCH (n:Entity) "
+            "WHERE $doc_id IN coalesce(n.sources, []) "
+            "RETURN n.id AS id, n.name AS name, n.type AS type, n.properties AS properties"
+        )
+        with self._driver.session() as session:
+            records = session.run(query, {"doc_id": doc_id})
+            return [dict(record) for record in records]

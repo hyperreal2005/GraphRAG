@@ -121,6 +121,22 @@ class MetadataStore:
             ).fetchone()
         return row
 
+    def list_documents(self, status: str | None = None, pipeline_stage: str | None = None) -> list[sqlite3.Row]:
+        """List documents filtered by optional status/stage."""
+        clauses = []
+        params: list[str] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if pipeline_stage is not None:
+            clauses.append("pipeline_stage = ?")
+            params.append(pipeline_stage)
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"SELECT * FROM documents {where_clause} ORDER BY ingested_at ASC"
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return rows
+
     def start_document(
         self,
         doc_id: str,
@@ -202,6 +218,20 @@ class MetadataStore:
             ).fetchall()
         return {str(row["chunk_hash"]): str(row["chunk_id"]) for row in rows}
 
+    def get_chunks_for_doc(self, doc_id: str) -> list[sqlite3.Row]:
+        """Fetch all chunk rows for one document."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_id, doc_id, text, section, page, chunk_hash, embedding_version
+                FROM chunks
+                WHERE doc_id = ?
+                ORDER BY position ASC
+                """,
+                (doc_id,),
+            ).fetchall()
+        return rows
+
     def delete_chunks_by_hashes(self, doc_id: str, hashes: Iterable[str]) -> None:
         """Delete only removed chunk hashes for delta update flow."""
         hash_list = list(hashes)
@@ -245,6 +275,18 @@ class MetadataStore:
                     )
                     for chunk in chunks
                 ],
+            )
+
+    def set_chunk_embedding_version(self, chunk_ids: Sequence[str], embedding_version: str) -> None:
+        """Set embedding_version for successfully indexed chunk IDs."""
+        if not chunk_ids:
+            return
+        placeholders = ",".join(["?"] * len(chunk_ids))
+        params = [embedding_version, *chunk_ids]
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE chunks SET embedding_version = ? WHERE chunk_id IN ({placeholders})",
+                params,
             )
 
     def upsert_doc_entities(self, doc_id: str, entities: Sequence[dict[str, object]]) -> None:
@@ -336,6 +378,34 @@ class MetadataStore:
                 """,
                 mentions,
             )
+
+    def get_entity_mentions_map(
+        self,
+        doc_id: str,
+        chunk_ids: Sequence[str] | None = None,
+    ) -> dict[str, list[str]]:
+        """Return mapping chunk_id -> mentioned canonical entity IDs."""
+        params: list[str] = [doc_id]
+        chunk_filter = ""
+        if chunk_ids:
+            placeholders = ",".join(["?"] * len(chunk_ids))
+            chunk_filter = f"AND chunk_id IN ({placeholders})"
+            params.extend(chunk_ids)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT chunk_id, entity_id
+                FROM entity_mentions
+                WHERE doc_id = ?
+                {chunk_filter}
+                """,
+                params,
+            ).fetchall()
+        mapping: dict[str, list[str]] = {}
+        for row in rows:
+            chunk_id = str(row["chunk_id"])
+            mapping.setdefault(chunk_id, []).append(str(row["entity_id"]))
+        return mapping
 
     def delete_entity_mentions_for_chunks(self, doc_id: str, chunk_ids: Sequence[str]) -> None:
         """Delete entity mention rows for specific chunks."""
