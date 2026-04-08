@@ -29,7 +29,7 @@ class GeminiEmbedder:
         self._types = types
         self._client = genai.Client(api_key=self.settings.gemini_api_key)
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
         """Embed texts in deterministic batching order."""
         if not texts:
             return []
@@ -38,15 +38,15 @@ class GeminiEmbedder:
         vectors: list[list[float]] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
-            vectors.extend(self._embed_batch(batch))
+            vectors.extend(self._embed_batch(batch, task_type=task_type))
         return vectors
 
-    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+    def _embed_batch(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
         config = None
         if self._types is not None:
             config = self._types.EmbedContentConfig(
                 output_dimensionality=int(self.settings.embedding_dim),
-                task_type=self.settings.gemini_embedding_task_type,
+                task_type=task_type or self.settings.gemini_embedding_task_type,
             )
 
         try:

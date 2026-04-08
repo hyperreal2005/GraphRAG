@@ -55,7 +55,24 @@ class Settings:
     qdrant_timeout_seconds: float = 30.0
     qdrant_chunks_collection: str = "chunks"
     qdrant_entities_collection: str = "entities"
+    qdrant_communities_collection: str = "communities"
     auto_backfill_vectors: bool = True
+    query_embedding_task_type: str = "RETRIEVAL_QUERY"
+    entity_link_resolve_threshold: float = 0.85
+    entity_link_ambiguous_threshold: float = 0.70
+    query_vector_top_k: int = 15
+    query_graph_local_hops: int = 3
+    query_graph_multihop_hops: int = 4
+    query_graph_path_limit: int = 25
+    query_context_max_items: int = 20
+    query_context_max_chars: int = 12000
+    query_temperature_local: float = 0.1
+    query_temperature_multihop: float = 0.1
+    query_temperature_comparative: float = 0.2
+    query_temperature_global: float = 0.35
+    query_temperature_hybrid: float = 0.2
+    query_cache_enabled: bool = False
+    query_cache_ttl_seconds: int = 3600
 
     def ensure_directories(self) -> None:
         """Ensure required directories exist before execution."""
@@ -77,6 +94,70 @@ class Settings:
             self.qdrant_timeout_seconds = float(os.getenv("QDRANT_TIMEOUT_SECONDS", self.qdrant_timeout_seconds))
         except ValueError:
             self.qdrant_timeout_seconds = self.qdrant_timeout_seconds
+        try:
+            self.query_vector_top_k = int(os.getenv("QUERY_VECTOR_TOP_K", self.query_vector_top_k))
+        except ValueError:
+            self.query_vector_top_k = self.query_vector_top_k
+        try:
+            self.query_graph_local_hops = int(os.getenv("QUERY_GRAPH_LOCAL_HOPS", self.query_graph_local_hops))
+        except ValueError:
+            self.query_graph_local_hops = self.query_graph_local_hops
+        try:
+            self.query_graph_multihop_hops = int(
+                os.getenv("QUERY_GRAPH_MULTIHOP_HOPS", self.query_graph_multihop_hops)
+            )
+        except ValueError:
+            self.query_graph_multihop_hops = self.query_graph_multihop_hops
+        try:
+            self.query_graph_path_limit = int(os.getenv("QUERY_GRAPH_PATH_LIMIT", self.query_graph_path_limit))
+        except ValueError:
+            self.query_graph_path_limit = self.query_graph_path_limit
+        try:
+            self.query_context_max_items = int(os.getenv("QUERY_CONTEXT_MAX_ITEMS", self.query_context_max_items))
+        except ValueError:
+            self.query_context_max_items = self.query_context_max_items
+        try:
+            self.query_context_max_chars = int(os.getenv("QUERY_CONTEXT_MAX_CHARS", self.query_context_max_chars))
+        except ValueError:
+            self.query_context_max_chars = self.query_context_max_chars
+        try:
+            self.entity_link_resolve_threshold = float(
+                os.getenv("ENTITY_LINK_RESOLVE_THRESHOLD", self.entity_link_resolve_threshold)
+            )
+        except ValueError:
+            self.entity_link_resolve_threshold = self.entity_link_resolve_threshold
+        try:
+            self.entity_link_ambiguous_threshold = float(
+                os.getenv("ENTITY_LINK_AMBIGUOUS_THRESHOLD", self.entity_link_ambiguous_threshold)
+            )
+        except ValueError:
+            self.entity_link_ambiguous_threshold = self.entity_link_ambiguous_threshold
+        try:
+            self.query_temperature_local = float(os.getenv("QUERY_TEMP_LOCAL", self.query_temperature_local))
+        except ValueError:
+            self.query_temperature_local = self.query_temperature_local
+        try:
+            self.query_temperature_multihop = float(os.getenv("QUERY_TEMP_MULTIHOP", self.query_temperature_multihop))
+        except ValueError:
+            self.query_temperature_multihop = self.query_temperature_multihop
+        try:
+            self.query_temperature_comparative = float(
+                os.getenv("QUERY_TEMP_COMPARATIVE", self.query_temperature_comparative)
+            )
+        except ValueError:
+            self.query_temperature_comparative = self.query_temperature_comparative
+        try:
+            self.query_temperature_global = float(os.getenv("QUERY_TEMP_GLOBAL", self.query_temperature_global))
+        except ValueError:
+            self.query_temperature_global = self.query_temperature_global
+        try:
+            self.query_temperature_hybrid = float(os.getenv("QUERY_TEMP_HYBRID", self.query_temperature_hybrid))
+        except ValueError:
+            self.query_temperature_hybrid = self.query_temperature_hybrid
+        try:
+            self.query_cache_ttl_seconds = int(os.getenv("QUERY_CACHE_TTL_SECONDS", self.query_cache_ttl_seconds))
+        except ValueError:
+            self.query_cache_ttl_seconds = self.query_cache_ttl_seconds
         self.neo4j_password = os.getenv("NEO4J_PASSWORD", self.neo4j_password)
         self.neo4j_uri = os.getenv("NEO4J_URI", self.neo4j_uri)
         self.neo4j_user = os.getenv("NEO4J_USER", self.neo4j_user)
@@ -84,15 +165,23 @@ class Settings:
         self.qdrant_api_key = os.getenv("QDRANT_API_KEY", self.qdrant_api_key)
         self.qdrant_chunks_collection = os.getenv("QDRANT_CHUNKS_COLLECTION", self.qdrant_chunks_collection)
         self.qdrant_entities_collection = os.getenv("QDRANT_ENTITIES_COLLECTION", self.qdrant_entities_collection)
+        self.qdrant_communities_collection = os.getenv(
+            "QDRANT_COMMUNITIES_COLLECTION",
+            self.qdrant_communities_collection,
+        )
         self.embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", self.embedding_model_id)
         self.gemini_embedding_task_type = os.getenv(
             "GEMINI_EMBED_TASK_TYPE",
             self.gemini_embedding_task_type,
         )
+        self.query_embedding_task_type = os.getenv("QUERY_EMBED_TASK_TYPE", self.query_embedding_task_type)
         try:
             self.embedding_dim = int(os.getenv("EMBEDDING_DIM", self.embedding_dim))
         except ValueError:
             self.embedding_dim = self.embedding_dim
+        cache_enabled_env = os.getenv("QUERY_CACHE_ENABLED")
+        if cache_enabled_env is not None:
+            self.query_cache_enabled = cache_enabled_env.strip().lower() not in {"0", "false", "no"}
         auto_backfill_env = os.getenv("AUTO_BACKFILL_VECTORS")
         if auto_backfill_env is not None:
             self.auto_backfill_vectors = auto_backfill_env.strip().lower() not in {"0", "false", "no"}

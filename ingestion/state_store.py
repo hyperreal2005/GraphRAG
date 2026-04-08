@@ -121,6 +121,15 @@ class MetadataStore:
             ).fetchone()
         return row
 
+    def get_document_by_id(self, doc_id: str) -> sqlite3.Row | None:
+        """Fetch document row by document id."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM documents WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+        return row
+
     def list_documents(self, status: str | None = None, pipeline_stage: str | None = None) -> list[sqlite3.Row]:
         """List documents filtered by optional status/stage."""
         clauses = []
