@@ -66,6 +66,8 @@ class Settings:
     query_graph_path_limit: int = 25
     query_context_max_items: int = 20
     query_context_max_chars: int = 12000
+    query_filter_boilerplate_chunks: bool = True
+    query_citation_max: int = 8
     query_temperature_local: float = 0.1
     query_temperature_multihop: float = 0.1
     query_temperature_comparative: float = 0.2
@@ -120,6 +122,10 @@ class Settings:
             self.query_context_max_chars = int(os.getenv("QUERY_CONTEXT_MAX_CHARS", self.query_context_max_chars))
         except ValueError:
             self.query_context_max_chars = self.query_context_max_chars
+        try:
+            self.query_citation_max = int(os.getenv("QUERY_CITATION_MAX", self.query_citation_max))
+        except ValueError:
+            self.query_citation_max = self.query_citation_max
         try:
             self.entity_link_resolve_threshold = float(
                 os.getenv("ENTITY_LINK_RESOLVE_THRESHOLD", self.entity_link_resolve_threshold)
@@ -182,6 +188,9 @@ class Settings:
         cache_enabled_env = os.getenv("QUERY_CACHE_ENABLED")
         if cache_enabled_env is not None:
             self.query_cache_enabled = cache_enabled_env.strip().lower() not in {"0", "false", "no"}
+        filter_boilerplate_env = os.getenv("QUERY_FILTER_BOILERPLATE_CHUNKS")
+        if filter_boilerplate_env is not None:
+            self.query_filter_boilerplate_chunks = filter_boilerplate_env.strip().lower() not in {"0", "false", "no"}
         auto_backfill_env = os.getenv("AUTO_BACKFILL_VECTORS")
         if auto_backfill_env is not None:
             self.auto_backfill_vectors = auto_backfill_env.strip().lower() not in {"0", "false", "no"}

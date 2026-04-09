@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +21,18 @@ SOURCE_PRIORITY = {
     "vector": 1,
     "community": 2,
 }
+BOILERPLATE_HINTS = (
+    "e-issn",
+    "issn",
+    "all rights reserved",
+    "copyright",
+    "<! -- image -->",
+    "www.",
+    "vol.",
+    "no.",
+    "doi:",
+    "journal",
+)
 
 
 class FusionEngine:
@@ -68,6 +81,12 @@ class FusionEngine:
     def _dedupe_and_score(self, results: list[RetrieverResult]) -> dict[str, RetrieverResult]:
         deduped: dict[str, RetrieverResult] = {}
         for item in results:
+            if (
+                item.source_type == "vector"
+                and self.settings.query_filter_boilerplate_chunks
+                and self._is_boilerplate_chunk(item.text_or_path)
+            ):
+                continue
             source_weight = SOURCE_WEIGHTS.get(item.source_type, 0.6)
             base_score = max(0.0, min(1.0, float(item.score_raw)))
             item.score_fused = base_score * source_weight
@@ -82,8 +101,11 @@ class FusionEngine:
         doc_name_map = self._build_doc_name_map(vector_items)
         citations: list[Citation] = []
         seen_chunks: set[str] = set()
+        max_citations = max(1, int(self.settings.query_citation_max))
 
         for item in vector_items:
+            if len(citations) >= max_citations:
+                break
             chunk_id = str(item.provenance.get("chunk_id") or item.source_id or "")
             if not chunk_id or chunk_id in seen_chunks:
                 continue
@@ -100,6 +122,29 @@ class FusionEngine:
                 )
             )
         return citations
+
+    def _is_boilerplate_chunk(self, text: str) -> bool:
+        normalized = " ".join((text or "").lower().split())
+        if not normalized:
+            return True
+        hint_hits = sum(1 for hint in BOILERPLATE_HINTS if hint in normalized)
+        # Frequent PDF table/header fragments often combine separators and metadata-heavy tokens.
+        has_table_rule = "|" in normalized and normalized.count("-") >= 8
+        has_meta_pattern = bool(re.search(r"\bvol\.\s*\d+\b", normalized)) and bool(
+            re.search(r"\b(?:no\.?|number)\s*\d+\b", normalized)
+        )
+        alpha_chars = sum(1 for char in normalized if char.isalpha())
+        non_alpha_chars = len(normalized) - alpha_chars
+        alpha_ratio = alpha_chars / max(1, len(normalized))
+        noisy_surface = non_alpha_chars > alpha_chars and alpha_ratio < 0.45
+
+        if hint_hits >= 3:
+            return True
+        if hint_hits >= 2 and (has_table_rule or has_meta_pattern or noisy_surface):
+            return True
+        if has_table_rule and noisy_surface:
+            return True
+        return False
 
     def _build_doc_name_map(self, vector_items: list[RetrieverResult]) -> dict[str, str]:
         doc_name_map: dict[str, str] = {}
@@ -150,4 +195,3 @@ class FusionEngine:
         page = item.provenance.get("page")
         source_line = f"Source: doc_id={doc_id}, chunk_id={chunk_id}, section={section}, page={page}"
         return f"[DOCUMENT CHUNK]\n{source_line}\nText: {item.text_or_path}"
-
