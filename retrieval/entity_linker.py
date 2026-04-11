@@ -94,26 +94,40 @@ class EntityLinker:
         )
 
     def _search_entities(self, query_vector: list[float], limit: int) -> list[Any]:
-        try:
-            response = self._client.query_points(
+        if hasattr(self._client, "query_points"):
+            try:
+                response = self._client.query_points(
+                    collection_name=self.settings.qdrant_entities_collection,
+                    query=query_vector,
+                    limit=limit,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points = self._extract_points(response)
+                if points:
+                    return points
+            except Exception:
+                pass
+
+        if hasattr(self._client, "search"):
+            response = self._client.search(
                 collection_name=self.settings.qdrant_entities_collection,
-                query=query_vector,
+                query_vector=query_vector,
                 limit=limit,
                 with_payload=True,
-                with_vectors=False,
             )
-            points = self._extract_points(response)
-            if points:
-                return points
-        except Exception:
-            pass
-        response = self._client.search(
-            collection_name=self.settings.qdrant_entities_collection,
-            query_vector=query_vector,
-            limit=limit,
-            with_payload=True,
-        )
-        return self._extract_points(response)
+            return self._extract_points(response)
+
+        if hasattr(self._client, "search_points"):
+            response = self._client.search_points(
+                collection_name=self.settings.qdrant_entities_collection,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+            )
+            return self._extract_points(response)
+
+        raise RuntimeError("Qdrant client does not expose a compatible search API.")
 
     def _extract_points(self, response: Any) -> list[Any]:
         if isinstance(response, list):
@@ -151,4 +165,3 @@ class EntityLinker:
         if candidate is None:
             return None
         return str(candidate)
-

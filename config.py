@@ -64,6 +64,9 @@ class Settings:
     query_graph_local_hops: int = 3
     query_graph_multihop_hops: int = 4
     query_graph_path_limit: int = 25
+    query_graph_allow_ambiguous_fallback: bool = True
+    query_graph_ambiguous_min_similarity: float = 0.75
+    query_graph_ambiguous_score_penalty: float = 0.85
     query_context_max_items: int = 20
     query_context_max_chars: int = 12000
     query_filter_boilerplate_chunks: bool = True
@@ -114,6 +117,18 @@ class Settings:
             self.query_graph_path_limit = int(os.getenv("QUERY_GRAPH_PATH_LIMIT", self.query_graph_path_limit))
         except ValueError:
             self.query_graph_path_limit = self.query_graph_path_limit
+        try:
+            self.query_graph_ambiguous_min_similarity = float(
+                os.getenv("QUERY_GRAPH_AMBIGUOUS_MIN_SIMILARITY", self.query_graph_ambiguous_min_similarity)
+            )
+        except ValueError:
+            self.query_graph_ambiguous_min_similarity = self.query_graph_ambiguous_min_similarity
+        try:
+            self.query_graph_ambiguous_score_penalty = float(
+                os.getenv("QUERY_GRAPH_AMBIGUOUS_SCORE_PENALTY", self.query_graph_ambiguous_score_penalty)
+            )
+        except ValueError:
+            self.query_graph_ambiguous_score_penalty = self.query_graph_ambiguous_score_penalty
         try:
             self.query_context_max_items = int(os.getenv("QUERY_CONTEXT_MAX_ITEMS", self.query_context_max_items))
         except ValueError:
@@ -188,6 +203,13 @@ class Settings:
         cache_enabled_env = os.getenv("QUERY_CACHE_ENABLED")
         if cache_enabled_env is not None:
             self.query_cache_enabled = cache_enabled_env.strip().lower() not in {"0", "false", "no"}
+        ambiguous_graph_fallback_env = os.getenv("QUERY_GRAPH_ALLOW_AMBIGUOUS_FALLBACK")
+        if ambiguous_graph_fallback_env is not None:
+            self.query_graph_allow_ambiguous_fallback = ambiguous_graph_fallback_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
         filter_boilerplate_env = os.getenv("QUERY_FILTER_BOILERPLATE_CHUNKS")
         if filter_boilerplate_env is not None:
             self.query_filter_boilerplate_chunks = filter_boilerplate_env.strip().lower() not in {"0", "false", "no"}

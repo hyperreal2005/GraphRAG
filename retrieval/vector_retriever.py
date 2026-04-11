@@ -67,27 +67,40 @@ class VectorRetriever:
         return results
 
     def _search_chunks(self, query_vector: list[float], limit: int) -> list[Any]:
-        try:
-            response = self._client.query_points(
+        if hasattr(self._client, "query_points"):
+            try:
+                response = self._client.query_points(
+                    collection_name=self.settings.qdrant_chunks_collection,
+                    query=query_vector,
+                    limit=limit,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points = self._extract_points(response)
+                if points:
+                    return points
+            except Exception:
+                pass
+
+        if hasattr(self._client, "search"):
+            response = self._client.search(
                 collection_name=self.settings.qdrant_chunks_collection,
-                query=query_vector,
+                query_vector=query_vector,
                 limit=limit,
                 with_payload=True,
-                with_vectors=False,
             )
-            points = self._extract_points(response)
-            if points:
-                return points
-        except Exception:
-            pass
+            return self._extract_points(response)
 
-        response = self._client.search(
-            collection_name=self.settings.qdrant_chunks_collection,
-            query_vector=query_vector,
-            limit=limit,
-            with_payload=True,
-        )
-        return self._extract_points(response)
+        if hasattr(self._client, "search_points"):
+            response = self._client.search_points(
+                collection_name=self.settings.qdrant_chunks_collection,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+            )
+            return self._extract_points(response)
+
+        raise RuntimeError("Qdrant client does not expose a compatible search API.")
 
     def _extract_points(self, response: Any) -> list[Any]:
         if isinstance(response, list):
@@ -122,4 +135,3 @@ class VectorRetriever:
         else:
             point_id = getattr(point, "id", None)
         return str(payload.get("chunk_id") or point_id or "")
-

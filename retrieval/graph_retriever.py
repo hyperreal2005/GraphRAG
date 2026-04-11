@@ -38,19 +38,33 @@ class GraphRetriever:
             self._driver.close()
 
     def retrieve(self, analysis: QueryAnalysis, linked_entities: list[LinkedEntity]) -> list[RetrieverResult]:
-        """Retrieve graph paths from resolved entity anchors."""
-        resolved = [item for item in linked_entities if item.status == "resolved" and item.entity_id]
-        if not resolved:
+        """Retrieve graph paths from resolved anchors with ambiguous fallback policy."""
+        anchors = self._select_graph_anchors(linked_entities)
+        if not anchors:
             return []
 
-        if analysis.query_type is QueryType.COMPARATIVE and len(resolved) >= 2:
-            return self._retrieve_comparative(resolved[:2], analysis)
+        if analysis.query_type is QueryType.COMPARATIVE and len(anchors) >= 2:
+            return self._retrieve_comparative(anchors[:2], analysis)
         max_hops = (
             int(self.settings.query_graph_multihop_hops)
             if analysis.query_type is QueryType.MULTIHOP
             else int(self.settings.query_graph_local_hops)
         )
-        return self._retrieve_neighborhood(resolved, max_hops=max_hops, query_type=analysis.query_type)
+        return self._retrieve_neighborhood(anchors, max_hops=max_hops, query_type=analysis.query_type)
+
+    def _select_graph_anchors(self, linked_entities: list[LinkedEntity]) -> list[LinkedEntity]:
+        resolved = [item for item in linked_entities if item.status == "resolved" and item.entity_id]
+        if resolved:
+            return resolved
+        if not bool(self.settings.query_graph_allow_ambiguous_fallback):
+            return []
+        min_similarity = float(self.settings.query_graph_ambiguous_min_similarity)
+        ambiguous = [
+            item
+            for item in linked_entities
+            if item.status == "ambiguous" and item.entity_id and float(item.similarity) >= min_similarity
+        ]
+        return ambiguous
 
     def _retrieve_neighborhood(
         self,
@@ -67,7 +81,13 @@ class GraphRetriever:
             }
             rows = self._execute_read(query, params)
             for row in rows:
-                result = self._build_result_from_row(row=row, anchor_entity_id=str(linked.entity_id), query_type=query_type)
+                result = self._build_result_from_row(
+                    row=row,
+                    anchor_entity_id=str(linked.entity_id),
+                    query_type=query_type,
+                    anchor_status=linked.status,
+                    anchor_similarity=float(linked.similarity),
+                )
                 if result is not None:
                     all_results.append(result)
         return all_results
@@ -85,8 +105,20 @@ class GraphRetriever:
         rows = self._execute_read(query, params)
         results: list[RetrieverResult] = []
         anchor = f"{linked_entities[0].entity_id}|{linked_entities[1].entity_id}"
+        anchor_status = (
+            "resolved"
+            if all(item.status == "resolved" for item in linked_entities[:2])
+            else "ambiguous"
+        )
+        anchor_similarity = min(float(item.similarity) for item in linked_entities[:2])
         for row in rows:
-            result = self._build_result_from_row(row=row, anchor_entity_id=anchor, query_type=analysis.query_type)
+            result = self._build_result_from_row(
+                row=row,
+                anchor_entity_id=anchor,
+                query_type=analysis.query_type,
+                anchor_status=anchor_status,
+                anchor_similarity=anchor_similarity,
+            )
             if result is not None:
                 results.append(result)
         return results
@@ -132,12 +164,17 @@ class GraphRetriever:
         row: dict[str, Any],
         anchor_entity_id: str,
         query_type: QueryType,
+        anchor_status: str,
+        anchor_similarity: float,
     ) -> RetrieverResult | None:
         node_names, rel_types, rel_weights = self._extract_path_parts(row)
         if len(node_names) < 2 or not rel_types:
             return None
         path = self._format_path(node_names, rel_types)
         score = self._score_path(rel_weights)
+        if anchor_status == "ambiguous":
+            penalty = max(0.0, min(1.0, float(self.settings.query_graph_ambiguous_score_penalty)))
+            score = score * penalty
         source_id = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
         return RetrieverResult(
             source_type="graph",
@@ -146,6 +183,8 @@ class GraphRetriever:
             score_raw=score,
             provenance={
                 "anchor_entity_id": anchor_entity_id,
+                "anchor_status": anchor_status,
+                "anchor_similarity": anchor_similarity,
                 "query_type": query_type.value,
                 "hop_count": len(rel_types),
                 "node_names": node_names,
@@ -185,4 +224,3 @@ class GraphRetriever:
             return 0.5
         avg = sum(rel_weights) / len(rel_weights)
         return max(0.0, min(1.0, float(avg)))
-

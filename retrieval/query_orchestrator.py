@@ -52,7 +52,10 @@ class QueryOrchestrator:
                 return GraphRAGResponse.from_dict(cached_payload)
 
         analysis = await asyncio.to_thread(self.analyzer.analyze, user_query)
-        linked_entities = await asyncio.to_thread(self.entity_linker.link_entities, analysis.mentioned_entities)
+        try:
+            linked_entities = await asyncio.to_thread(self.entity_linker.link_entities, analysis.mentioned_entities)
+        except Exception:
+            linked_entities = []
 
         graph_task = self._to_thread_or_empty(
             enabled=bool(analysis.retrieval_flags.get("graph")),
