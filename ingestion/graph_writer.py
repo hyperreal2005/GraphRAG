@@ -81,17 +81,25 @@ class GraphWriter:
             "ON MATCH SET "
             "n.sources = CASE WHEN $doc_id IN n.sources THEN n.sources ELSE n.sources + [$doc_id] END, "
             "n.updated_at = $updated_at, "
-            "n.aliases = $aliases "
+            "n.name = $name, "
+            "n.type = $type, "
+            "n.properties = $properties, "
+            "n.aliases = $aliases, "
+            "n.confidence = CASE WHEN $confidence > coalesce(n.confidence, 0.0) "
+            "THEN $confidence ELSE coalesce(n.confidence, 0.0) END "
         )
         with self._driver.session() as session:
             for node in nodes:
+                node_id = str(node["id"])
+                existing = self._get_entity_by_id(session, node_id)
+                merged = self._merge_node_payload(existing, node)
                 payload = {
-                    "id": node["id"],
-                    "name": node["name"],
-                    "type": node["type"],
-                    "properties": normalize_properties(node.get("properties", {})),
-                    "aliases": normalize_aliases(node.get("aliases", [])),
-                    "confidence": float(node.get("confidence", 0.0)),
+                    "id": node_id,
+                    "name": merged["name"],
+                    "type": merged["type"],
+                    "properties": normalize_properties(merged.get("properties", {})),
+                    "aliases": normalize_aliases(merged.get("aliases", [])),
+                    "confidence": float(merged.get("confidence", 0.0)),
                     "doc_id": doc_id,
                     "created_at": node.get("created_at", utc_now_iso()),
                     "updated_at": utc_now_iso(),
@@ -211,3 +219,73 @@ class GraphWriter:
         with self._driver.session() as session:
             records = session.run(query, {"doc_id": doc_id})
             return [dict(record) for record in records]
+
+    def _get_entity_by_id(self, session: Any, node_id: str) -> dict[str, Any] | None:
+        record = session.run(
+            "MATCH (n:Entity {id: $id}) "
+            "RETURN n.id AS id, n.name AS name, n.type AS type, n.properties AS properties, "
+            "n.aliases AS aliases, n.confidence AS confidence",
+            {"id": node_id},
+        ).single()
+        if record is None:
+            return None
+        return dict(record)
+
+    def _merge_node_payload(self, existing: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
+        if existing is None:
+            return {
+                "name": str(incoming.get("name") or ""),
+                "type": str(incoming.get("type") or "Entity"),
+                "properties": self._coerce_properties_to_dict(incoming.get("properties")),
+                "aliases": normalize_aliases(incoming.get("aliases")),
+                "confidence": float(incoming.get("confidence") or 0.0),
+            }
+
+        existing_name = str(existing.get("name") or "")
+        incoming_name = str(incoming.get("name") or "")
+        existing_type = str(existing.get("type") or "Entity")
+        incoming_type = str(incoming.get("type") or "Entity")
+
+        merged_properties = self._coerce_properties_to_dict(existing.get("properties"))
+        incoming_properties = self._coerce_properties_to_dict(incoming.get("properties"))
+        for key, value in incoming_properties.items():
+            if key not in merged_properties:
+                merged_properties[key] = value
+
+        merged_aliases = normalize_aliases(existing.get("aliases"))
+        alias_set = set(merged_aliases)
+        for alias in normalize_aliases(incoming.get("aliases")):
+            if alias not in alias_set:
+                merged_aliases.append(alias)
+                alias_set.add(alias)
+
+        return {
+            "name": self._choose_name(existing_name, incoming_name),
+            "type": self._choose_type(existing_type, incoming_type),
+            "properties": merged_properties,
+            "aliases": merged_aliases,
+            "confidence": max(float(existing.get("confidence") or 0.0), float(incoming.get("confidence") or 0.0)),
+        }
+
+    def _coerce_properties_to_dict(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(decoded, dict):
+                return decoded
+            return {}
+        return {}
+
+    def _choose_name(self, existing_name: str, incoming_name: str) -> str:
+        if not existing_name.strip() or existing_name.strip().lower() == "entity":
+            return incoming_name.strip() or existing_name.strip()
+        return existing_name.strip()
+
+    def _choose_type(self, existing_type: str, incoming_type: str) -> str:
+        if not existing_type.strip() or existing_type.strip().lower() == "entity":
+            return incoming_type.strip() or existing_type.strip() or "Entity"
+        return existing_type.strip()

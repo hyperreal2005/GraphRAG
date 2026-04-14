@@ -45,6 +45,12 @@ class Settings:
     )
     disamb_model: str = "all-MiniLM-L6-v2"
     disamb_threshold: float = 0.92
+    cross_doc_auto_merge_threshold: float = 0.90
+    cross_doc_llm_min_threshold: float = 0.75
+    cross_doc_llm_max_threshold: float = 0.90
+    cross_doc_candidate_k: int = 1
+    cross_doc_same_type_required_for_auto: bool = True
+    cross_doc_llm_enabled: bool = True
     embedding_model_id: str = "gemini-embedding-001"
     embedding_dim: int = 3072
     embedding_version: str = "v1"
@@ -95,6 +101,28 @@ class Settings:
             self.embedding_batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", self.embedding_batch_size))
         except ValueError:
             self.embedding_batch_size = self.embedding_batch_size
+        try:
+            self.cross_doc_auto_merge_threshold = float(
+                os.getenv("CROSS_DOC_AUTO_MERGE_THRESHOLD", self.cross_doc_auto_merge_threshold)
+            )
+        except ValueError:
+            self.cross_doc_auto_merge_threshold = self.cross_doc_auto_merge_threshold
+        try:
+            self.cross_doc_llm_min_threshold = float(
+                os.getenv("CROSS_DOC_LLM_MIN_THRESHOLD", self.cross_doc_llm_min_threshold)
+            )
+        except ValueError:
+            self.cross_doc_llm_min_threshold = self.cross_doc_llm_min_threshold
+        try:
+            self.cross_doc_llm_max_threshold = float(
+                os.getenv("CROSS_DOC_LLM_MAX_THRESHOLD", self.cross_doc_llm_max_threshold)
+            )
+        except ValueError:
+            self.cross_doc_llm_max_threshold = self.cross_doc_llm_max_threshold
+        try:
+            self.cross_doc_candidate_k = int(os.getenv("CROSS_DOC_CANDIDATE_K", self.cross_doc_candidate_k))
+        except ValueError:
+            self.cross_doc_candidate_k = self.cross_doc_candidate_k
         try:
             self.qdrant_timeout_seconds = float(os.getenv("QDRANT_TIMEOUT_SECONDS", self.qdrant_timeout_seconds))
         except ValueError:
@@ -213,6 +241,16 @@ class Settings:
         filter_boilerplate_env = os.getenv("QUERY_FILTER_BOILERPLATE_CHUNKS")
         if filter_boilerplate_env is not None:
             self.query_filter_boilerplate_chunks = filter_boilerplate_env.strip().lower() not in {"0", "false", "no"}
+        cross_doc_same_type_env = os.getenv("CROSS_DOC_SAME_TYPE_REQUIRED_FOR_AUTO")
+        if cross_doc_same_type_env is not None:
+            self.cross_doc_same_type_required_for_auto = cross_doc_same_type_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
+        cross_doc_llm_env = os.getenv("CROSS_DOC_LLM_ENABLED")
+        if cross_doc_llm_env is not None:
+            self.cross_doc_llm_enabled = cross_doc_llm_env.strip().lower() not in {"0", "false", "no"}
         auto_backfill_env = os.getenv("AUTO_BACKFILL_VECTORS")
         if auto_backfill_env is not None:
             self.auto_backfill_vectors = auto_backfill_env.strip().lower() not in {"0", "false", "no"}

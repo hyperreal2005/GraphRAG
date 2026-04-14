@@ -49,9 +49,11 @@ class PhaseOnePipeline:
         )
         self.extractor = None
         self.disambiguator = None
+        self.cross_doc_merger = None
         self.graph_writer = None
         self.vector_indexer = None
         if self.settings.enable_graph:
+            from ingestion.cross_doc_merger import CrossDocumentMerger
             from ingestion.disambiguator import EntityDisambiguator
             from ingestion.extractor import GeminiExtractor
             from ingestion.graph_writer import GraphWriter
@@ -59,6 +61,7 @@ class PhaseOnePipeline:
             self._ensure_embedding_metadata()
             self.extractor = GeminiExtractor(self.settings)
             self.disambiguator = EntityDisambiguator(self.settings)
+            self.cross_doc_merger = CrossDocumentMerger(self.settings)
             self.graph_writer = GraphWriter(self.settings)
             self.vector_indexer = QdrantVectorIndexer(self.settings)
 
@@ -135,12 +138,14 @@ class PhaseOnePipeline:
                 unchanged_chunk_hashes=unchanged,
             )
             entities_created = 0
+            entities_merged = 0
             relations_created = 0
 
             if self.settings.enable_graph:
                 if (
                     self.extractor is None
                     or self.disambiguator is None
+                    or self.cross_doc_merger is None
                     or self.graph_writer is None
                     or self.vector_indexer is None
                 ):
@@ -235,6 +240,16 @@ class PhaseOnePipeline:
                     if counts:
                         canonical_nodes[canonical_id]["type"] = max(counts, key=counts.get)
 
+                merge_result = self.cross_doc_merger.resolve(list(canonical_nodes.values()))
+                local_to_final_map = {node_id: node_id for node_id in canonical_nodes.keys()}
+                local_to_final_map.update(merge_result.local_to_final_id)
+                canonical_nodes = self._remap_canonical_nodes(canonical_nodes, local_to_final_map)
+                entities_merged = merge_result.merged_total
+                raw_to_final_id_map = {
+                    raw_id: local_to_final_map.get(local_id, local_id)
+                    for raw_id, local_id in disamb.entity_id_map.items()
+                }
+
                 canonical_entities = [
                     {
                         "entity_id": node["id"],
@@ -247,7 +262,7 @@ class PhaseOnePipeline:
 
                 self.store.delete_entity_mentions_for_chunks(doc_id, [chunk.chunk_id for chunk in chunks_to_process])
                 mapped_mentions = [
-                    (disamb.entity_id_map.get(entity_id, entity_id), chunk_id, doc_id, confidence)
+                    (raw_to_final_id_map.get(entity_id, entity_id), chunk_id, doc_id, confidence)
                     for entity_id, chunk_id, doc_id, confidence in entity_mentions
                 ]
                 self.store.upsert_entity_mentions(mapped_mentions)
@@ -257,8 +272,8 @@ class PhaseOnePipeline:
 
                 mapped_edges = []
                 for edge in extraction_relations:
-                    head_id = disamb.entity_id_map.get(edge["head_id"], edge["head_id"])
-                    tail_id = disamb.entity_id_map.get(edge["tail_id"], edge["tail_id"])
+                    head_id = raw_to_final_id_map.get(edge["head_id"], edge["head_id"])
+                    tail_id = raw_to_final_id_map.get(edge["tail_id"], edge["tail_id"])
                     if head_id not in canonical_nodes or tail_id not in canonical_nodes:
                         continue
                     raw_relation = str(edge.get("raw_relation") or edge.get("relation") or "").strip()
@@ -324,7 +339,7 @@ class PhaseOnePipeline:
                 )
                 self.store.update_pipeline_stage(doc_id, "VECTORS_WRITTEN")
 
-                entities_created = len(canonical_nodes)
+                entities_created = merge_result.new_nodes
                 relations_created = len(mapped_edges)
                 self.store.finish_document(doc_id, resolved.metadata.word_count, "DONE")
 
@@ -343,6 +358,7 @@ class PhaseOnePipeline:
                 status="complete",
                 entities_created=entities_created,
                 relations_created=relations_created,
+                entities_merged=entities_merged,
             )
             return FileIngestionResult(
                 source_path=source_key,
@@ -487,3 +503,52 @@ class PhaseOnePipeline:
             )
         if stored_version is None:
             self.store.set_system_metadata("embedding_version", self.settings.embedding_version)
+
+    def _remap_canonical_nodes(
+        self,
+        canonical_nodes: dict[str, dict[str, object]],
+        local_to_final_map: dict[str, str],
+    ) -> dict[str, dict[str, object]]:
+        merged: dict[str, dict[str, object]] = {}
+        for local_id, node in canonical_nodes.items():
+            final_id = str(local_to_final_map.get(local_id, local_id))
+            existing = merged.get(final_id)
+            if existing is None:
+                node_copy = dict(node)
+                node_copy["id"] = final_id
+                node_copy["aliases"] = list(node.get("aliases", []))
+                node_copy["properties"] = dict(node.get("properties", {}))
+                merged[final_id] = node_copy
+                continue
+
+            existing_aliases = set(str(item) for item in existing.get("aliases", []))
+            for alias in node.get("aliases", []):
+                alias_text = str(alias)
+                if alias_text not in existing_aliases:
+                    existing.setdefault("aliases", []).append(alias_text)
+                    existing_aliases.add(alias_text)
+
+            existing_props = existing.get("properties", {})
+            if not isinstance(existing_props, dict):
+                existing_props = {}
+            incoming_props = node.get("properties", {})
+            if isinstance(incoming_props, dict):
+                for key, value in incoming_props.items():
+                    if key not in existing_props:
+                        existing_props[key] = value
+            existing["properties"] = existing_props
+
+            existing_type = str(existing.get("type", "Entity"))
+            incoming_type = str(node.get("type", "Entity"))
+            if existing_type.strip().lower() == "entity" and incoming_type.strip():
+                existing["type"] = incoming_type
+
+            existing_name = str(existing.get("name", "")).strip()
+            incoming_name = str(node.get("name", "")).strip()
+            if (not existing_name or existing_name.lower() == "entity") and incoming_name:
+                existing["name"] = incoming_name
+
+            existing_conf = float(existing.get("confidence", 0.0))
+            incoming_conf = float(node.get("confidence", 0.0))
+            existing["confidence"] = max(existing_conf, incoming_conf)
+        return merged
