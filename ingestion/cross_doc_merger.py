@@ -216,9 +216,10 @@ class CrossDocumentMerger:
                     with_payload=True,
                     with_vectors=False,
                 )
-                points = self._extract_points(response)
-                if points:
-                    return points
+                # Successful query_points call may validly return zero points
+                # (e.g., first entity in an empty collection). Treat that as
+                # "no candidate" instead of falling through to API-shape errors.
+                return self._extract_points(response)
             except Exception:
                 pass
 
@@ -353,4 +354,3 @@ class CrossDocumentMerger:
                 except json.JSONDecodeError:
                     return False
         return False
-
