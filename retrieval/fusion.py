@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Iterable
@@ -9,7 +10,9 @@ from typing import Iterable
 from config import Settings
 from ingestion.state_store import MetadataStore
 from models.query import Citation, FusionOutput, RetrieverResult
+from retrieval.reranker import QueryReranker
 
+logger = logging.getLogger(__name__)
 
 SOURCE_WEIGHTS = {
     "graph": 1.0,
@@ -38,9 +41,15 @@ BOILERPLATE_HINTS = (
 class FusionEngine:
     """Merge retrieval results with deterministic dedupe/ranking."""
 
-    def __init__(self, settings: Settings, store: MetadataStore | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        store: MetadataStore | None = None,
+        reranker: QueryReranker | None = None,
+    ) -> None:
         self.settings = settings
         self.store = store or MetadataStore(settings.metadata_db_path)
+        self.reranker = reranker or QueryReranker(settings)
 
     def fuse(
         self,
@@ -48,6 +57,7 @@ class FusionEngine:
         vector_results: Iterable[RetrieverResult],
         community_results: Iterable[RetrieverResult],
         community_fallback_used: bool = False,
+        user_query: str = "",
     ) -> FusionOutput:
         merged: list[RetrieverResult] = []
         merged.extend(graph_results)
@@ -55,18 +65,26 @@ class FusionEngine:
         merged.extend(community_results)
 
         deduped = self._dedupe_and_score(merged)
-        ranked = sorted(deduped.values(), key=lambda item: item.score_fused, reverse=True)
-        selected = ranked[: max(1, int(self.settings.query_context_max_items))]
-        top_scores = [float(item.score_fused) for item in selected[:3]]
+        ranked = sorted(deduped.values(), key=self._ranking_score, reverse=True)
+        reranked, rerank_mode = self._apply_rerank(user_query=user_query, ranked=ranked)
+        selected = self._select_context_items(reranked)
+        top_scores = [self._confidence_score(item) for item in selected[:3]]
 
         prioritized = sorted(
             selected,
-            key=lambda item: (SOURCE_PRIORITY.get(item.source_type, 99), -item.score_fused),
+            key=lambda item: (SOURCE_PRIORITY.get(item.source_type, 99), -self._ranking_score(item)),
         )
         citations = self._build_citations(prioritized)
         graph_paths = [item.text_or_path for item in prioritized if item.source_type == "graph" and item.text_or_path]
         retrieval_sources = list(dict.fromkeys(item.source_type for item in prioritized))
         context_text = self._build_context_text(prioritized)
+        logger.info(
+            "fusion_rerank mode=%s merged=%d deduped=%d selected=%d",
+            rerank_mode,
+            len(merged),
+            len(deduped),
+            len(prioritized),
+        )
 
         return FusionOutput(
             context_items=prioritized,
@@ -77,6 +95,44 @@ class FusionEngine:
             context_text=context_text,
             community_fallback_used=community_fallback_used,
         )
+
+    def _apply_rerank(self, user_query: str, ranked: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
+        if not ranked:
+            return [], "empty"
+        try:
+            return self.reranker.rerank(user_query, ranked)
+        except Exception:
+            return ranked, "deterministic_fallback"
+
+    def _select_context_items(self, ranked: list[RetrieverResult]) -> list[RetrieverResult]:
+        max_items = max(1, int(self.settings.query_context_max_items))
+        if len(ranked) <= max_items:
+            return list(ranked)
+
+        has_graph = any(item.source_type == "graph" for item in ranked)
+        has_vector = any(item.source_type == "vector" for item in ranked)
+        if not (has_graph and has_vector):
+            return ranked[:max_items]
+
+        selected: list[RetrieverResult] = []
+        selected_indices: set[int] = set()
+        graph_index = next((index for index, item in enumerate(ranked) if item.source_type == "graph"), None)
+        vector_index = next((index for index, item in enumerate(ranked) if item.source_type == "vector"), None)
+        for index in (graph_index, vector_index):
+            if index is None or index in selected_indices:
+                continue
+            selected.append(ranked[index])
+            selected_indices.add(index)
+
+        for index, item in enumerate(ranked):
+            if len(selected) >= max_items:
+                break
+            if index in selected_indices:
+                continue
+            selected.append(item)
+            selected_indices.add(index)
+
+        return selected[:max_items]
 
     def _dedupe_and_score(self, results: list[RetrieverResult]) -> dict[str, RetrieverResult]:
         deduped: dict[str, RetrieverResult] = {}
@@ -90,11 +146,21 @@ class FusionEngine:
             source_weight = SOURCE_WEIGHTS.get(item.source_type, 0.6)
             base_score = max(0.0, min(1.0, float(item.score_raw)))
             item.score_fused = base_score * source_weight
+            item.score_reranked = None
             key = item.dedupe_key()
             existing = deduped.get(key)
             if existing is None or item.score_fused > existing.score_fused:
                 deduped[key] = item
         return deduped
+
+    def _ranking_score(self, item: RetrieverResult) -> float:
+        if item.score_reranked is not None:
+            return float(item.score_reranked)
+        return float(item.score_fused)
+
+    def _confidence_score(self, item: RetrieverResult) -> float:
+        score = self._ranking_score(item)
+        return max(0.0, min(1.0, score))
 
     def _build_citations(self, results: list[RetrieverResult]) -> list[Citation]:
         vector_items = [item for item in results if item.source_type == "vector"]

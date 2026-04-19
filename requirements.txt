@@ -9,3 +9,4 @@ neo4j
 gliner
 python-dotenv
 qdrant-client
+cohere

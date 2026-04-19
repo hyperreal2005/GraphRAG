@@ -79,6 +79,7 @@ class RetrieverResult:
     score_raw: float
     provenance: dict[str, Any] = field(default_factory=dict)
     score_fused: float = 0.0
+    score_reranked: float | None = None
 
     def dedupe_key(self) -> str:
         chunk_id = self.provenance.get("chunk_id")
@@ -93,6 +94,7 @@ class RetrieverResult:
             "text_or_path": self.text_or_path,
             "score_raw": float(self.score_raw),
             "score_fused": float(self.score_fused),
+            "score_reranked": float(self.score_reranked) if self.score_reranked is not None else None,
             "provenance": dict(self.provenance),
         }
 

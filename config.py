@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -67,6 +67,9 @@ class Settings:
     entity_link_resolve_threshold: float = 0.85
     entity_link_ambiguous_threshold: float = 0.70
     query_vector_top_k: int = 15
+    query_mmr_enabled: bool = True
+    query_mmr_lambda: float = 0.65
+    query_mmr_candidate_multiplier: int = 3
     query_graph_local_hops: int = 3
     query_graph_multihop_hops: int = 4
     query_graph_path_limit: int = 25
@@ -82,6 +85,10 @@ class Settings:
     query_temperature_comparative: float = 0.2
     query_temperature_global: float = 0.35
     query_temperature_hybrid: float = 0.2
+    cohere_api_key: str | None = None
+    query_rerank_enabled: bool = True
+    query_rerank_model: str = "rerank-v3.5"
+    query_rerank_top_n: int = 15
     query_cache_enabled: bool = False
     query_cache_ttl_seconds: int = 3600
 
@@ -131,6 +138,16 @@ class Settings:
             self.query_vector_top_k = int(os.getenv("QUERY_VECTOR_TOP_K", self.query_vector_top_k))
         except ValueError:
             self.query_vector_top_k = self.query_vector_top_k
+        try:
+            self.query_mmr_lambda = float(os.getenv("QUERY_MMR_LAMBDA", self.query_mmr_lambda))
+        except ValueError:
+            self.query_mmr_lambda = self.query_mmr_lambda
+        try:
+            self.query_mmr_candidate_multiplier = int(
+                os.getenv("QUERY_MMR_CANDIDATE_MULTIPLIER", self.query_mmr_candidate_multiplier)
+            )
+        except ValueError:
+            self.query_mmr_candidate_multiplier = self.query_mmr_candidate_multiplier
         try:
             self.query_graph_local_hops = int(os.getenv("QUERY_GRAPH_LOCAL_HOPS", self.query_graph_local_hops))
         except ValueError:
@@ -207,9 +224,14 @@ class Settings:
             self.query_cache_ttl_seconds = int(os.getenv("QUERY_CACHE_TTL_SECONDS", self.query_cache_ttl_seconds))
         except ValueError:
             self.query_cache_ttl_seconds = self.query_cache_ttl_seconds
+        try:
+            self.query_rerank_top_n = int(os.getenv("QUERY_RERANK_TOP_N", self.query_rerank_top_n))
+        except ValueError:
+            self.query_rerank_top_n = self.query_rerank_top_n
         self.neo4j_password = os.getenv("NEO4J_PASSWORD", self.neo4j_password)
         self.neo4j_uri = os.getenv("NEO4J_URI", self.neo4j_uri)
         self.neo4j_user = os.getenv("NEO4J_USER", self.neo4j_user)
+        self.cohere_api_key = self.cohere_api_key or os.getenv("COHERE_API_KEY")
         self.qdrant_url = os.getenv("QDRANT_URL", self.qdrant_url)
         self.qdrant_api_key = os.getenv("QDRANT_API_KEY", self.qdrant_api_key)
         self.qdrant_chunks_collection = os.getenv("QDRANT_CHUNKS_COLLECTION", self.qdrant_chunks_collection)
@@ -219,6 +241,7 @@ class Settings:
             self.qdrant_communities_collection,
         )
         self.embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", self.embedding_model_id)
+        self.query_rerank_model = os.getenv("QUERY_RERANK_MODEL", self.query_rerank_model)
         self.gemini_embedding_task_type = os.getenv(
             "GEMINI_EMBED_TASK_TYPE",
             self.gemini_embedding_task_type,
@@ -231,6 +254,12 @@ class Settings:
         cache_enabled_env = os.getenv("QUERY_CACHE_ENABLED")
         if cache_enabled_env is not None:
             self.query_cache_enabled = cache_enabled_env.strip().lower() not in {"0", "false", "no"}
+        mmr_enabled_env = os.getenv("QUERY_MMR_ENABLED")
+        if mmr_enabled_env is not None:
+            self.query_mmr_enabled = mmr_enabled_env.strip().lower() not in {"0", "false", "no"}
+        rerank_enabled_env = os.getenv("QUERY_RERANK_ENABLED")
+        if rerank_enabled_env is not None:
+            self.query_rerank_enabled = rerank_enabled_env.strip().lower() not in {"0", "false", "no"}
         ambiguous_graph_fallback_env = os.getenv("QUERY_GRAPH_ALLOW_AMBIGUOUS_FALLBACK")
         if ambiguous_graph_fallback_env is not None:
             self.query_graph_allow_ambiguous_fallback = ambiguous_graph_fallback_env.strip().lower() not in {

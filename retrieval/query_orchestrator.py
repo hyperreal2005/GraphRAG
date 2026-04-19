@@ -88,6 +88,7 @@ class QueryOrchestrator:
             vector_results,
             community_results,
             community_fallback_used,
+            user_query,
         )
         response = await asyncio.to_thread(
             self.generator.generate,
