@@ -62,6 +62,7 @@ class QueryOrchestrator:
             fn=self.graph_retriever.retrieve,
             analysis=analysis,
             linked_entities=linked_entities,
+            user_query=user_query,
         )
         vector_task = self._to_thread_or_empty(
             enabled=bool(analysis.retrieval_flags.get("vector", True)),

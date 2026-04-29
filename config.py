@@ -73,6 +73,12 @@ class Settings:
     query_graph_local_hops: int = 3
     query_graph_multihop_hops: int = 4
     query_graph_path_limit: int = 25
+    query_graph_dynamic_enabled: bool = True
+    query_graph_dynamic_fallback_to_static: bool = True
+    query_graph_schema_cache_ttl_seconds: int = 300
+    query_graph_dynamic_model: str | None = None
+    query_graph_dynamic_temperature: float = 0.0
+    query_graph_dynamic_max_retries: int = 1
     query_graph_allow_ambiguous_fallback: bool = True
     query_graph_ambiguous_min_similarity: float = 0.75
     query_graph_ambiguous_score_penalty: float = 0.85
@@ -163,6 +169,24 @@ class Settings:
         except ValueError:
             self.query_graph_path_limit = self.query_graph_path_limit
         try:
+            self.query_graph_schema_cache_ttl_seconds = int(
+                os.getenv("QUERY_GRAPH_SCHEMA_CACHE_TTL_SECONDS", self.query_graph_schema_cache_ttl_seconds)
+            )
+        except ValueError:
+            self.query_graph_schema_cache_ttl_seconds = self.query_graph_schema_cache_ttl_seconds
+        try:
+            self.query_graph_dynamic_temperature = float(
+                os.getenv("QUERY_GRAPH_DYNAMIC_TEMPERATURE", self.query_graph_dynamic_temperature)
+            )
+        except ValueError:
+            self.query_graph_dynamic_temperature = self.query_graph_dynamic_temperature
+        try:
+            self.query_graph_dynamic_max_retries = int(
+                os.getenv("QUERY_GRAPH_DYNAMIC_MAX_RETRIES", self.query_graph_dynamic_max_retries)
+            )
+        except ValueError:
+            self.query_graph_dynamic_max_retries = self.query_graph_dynamic_max_retries
+        try:
             self.query_graph_ambiguous_min_similarity = float(
                 os.getenv("QUERY_GRAPH_AMBIGUOUS_MIN_SIMILARITY", self.query_graph_ambiguous_min_similarity)
             )
@@ -242,6 +266,9 @@ class Settings:
         )
         self.embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", self.embedding_model_id)
         self.query_rerank_model = os.getenv("QUERY_RERANK_MODEL", self.query_rerank_model)
+        dynamic_model = os.getenv("QUERY_GRAPH_DYNAMIC_MODEL")
+        if dynamic_model is not None and dynamic_model.strip():
+            self.query_graph_dynamic_model = dynamic_model.strip()
         self.gemini_embedding_task_type = os.getenv(
             "GEMINI_EMBED_TASK_TYPE",
             self.gemini_embedding_task_type,
@@ -260,6 +287,16 @@ class Settings:
         rerank_enabled_env = os.getenv("QUERY_RERANK_ENABLED")
         if rerank_enabled_env is not None:
             self.query_rerank_enabled = rerank_enabled_env.strip().lower() not in {"0", "false", "no"}
+        dynamic_graph_enabled_env = os.getenv("QUERY_GRAPH_DYNAMIC_ENABLED")
+        if dynamic_graph_enabled_env is not None:
+            self.query_graph_dynamic_enabled = dynamic_graph_enabled_env.strip().lower() not in {"0", "false", "no"}
+        dynamic_graph_fallback_env = os.getenv("QUERY_GRAPH_DYNAMIC_FALLBACK_TO_STATIC")
+        if dynamic_graph_fallback_env is not None:
+            self.query_graph_dynamic_fallback_to_static = dynamic_graph_fallback_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
         ambiguous_graph_fallback_env = os.getenv("QUERY_GRAPH_ALLOW_AMBIGUOUS_FALLBACK")
         if ambiguous_graph_fallback_env is not None:
             self.query_graph_allow_ambiguous_fallback = ambiguous_graph_fallback_env.strip().lower() not in {
@@ -283,3 +320,5 @@ class Settings:
         auto_backfill_env = os.getenv("AUTO_BACKFILL_VECTORS")
         if auto_backfill_env is not None:
             self.auto_backfill_vectors = auto_backfill_env.strip().lower() not in {"0", "false", "no"}
+        if self.query_graph_dynamic_model is None:
+            self.query_graph_dynamic_model = self.gemini_model
