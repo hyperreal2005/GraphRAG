@@ -12,6 +12,9 @@ from typing import Iterable, Sequence
 from models.ingestion import Chunk
 
 
+SCHEMA_VERSION = 2
+
+
 def utc_now_iso() -> str:
     """Current UTC timestamp as ISO string."""
     return datetime.now(timezone.utc).isoformat()
@@ -26,8 +29,10 @@ class MetadataStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         return conn
 
     @contextmanager
@@ -44,6 +49,7 @@ class MetadataStore:
 
     def _initialize(self) -> None:
         with self._connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -55,7 +61,14 @@ class MetadataStore:
                     ingested_at TEXT,
                     status TEXT,
                     pipeline_stage TEXT,
-                    last_error TEXT
+                    last_error TEXT,
+                    active_checksum TEXT,
+                    desired_checksum TEXT,
+                    last_completed_stage TEXT,
+                    target_stage TEXT,
+                    active_pipeline_fingerprint TEXT,
+                    desired_pipeline_fingerprint TEXT,
+                    current_run_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS chunks (
@@ -111,6 +124,39 @@ class MetadataStore:
                     ON doc_entities (doc_id, canonical_name);
                 """
             )
+            self._migrate_documents_table(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _migrate_documents_table(self, conn: sqlite3.Connection) -> None:
+        """Add resumable-ingestion columns to databases created by earlier phases."""
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        additions = {
+            "active_checksum": "TEXT",
+            "desired_checksum": "TEXT",
+            "last_completed_stage": "TEXT",
+            "target_stage": "TEXT",
+            "active_pipeline_fingerprint": "TEXT",
+            "desired_pipeline_fingerprint": "TEXT",
+            "current_run_id": "TEXT",
+        }
+        for name, sql_type in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {sql_type}")
+
+        conn.execute(
+            """
+            UPDATE documents
+            SET active_checksum = CASE
+                    WHEN active_checksum IS NULL AND status = 'complete' THEN checksum
+                    ELSE active_checksum
+                END,
+                desired_checksum = coalesce(desired_checksum, checksum),
+                last_completed_stage = CASE
+                    WHEN last_completed_stage IS NULL AND pipeline_stage <> 'FAILED' THEN pipeline_stage
+                    ELSE last_completed_stage
+                END
+            """
+        )
 
     def get_document_by_source(self, source_path: str) -> sqlite3.Row | None:
         """Fetch document row by source path."""
@@ -152,19 +198,28 @@ class MetadataStore:
         source_path: str,
         doc_format: str,
         checksum: str,
+        target_stage: str = "PARSING",
+        pipeline_fingerprint: str = "legacy",
+        run_id: str | None = None,
     ) -> None:
-        """Upsert document row at pipeline start."""
+        """Record desired state without replacing the last active generation."""
         with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO documents (
                     doc_id, source_path, format, checksum, word_count,
-                    ingested_at, status, pipeline_stage, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ingested_at, status, pipeline_stage, last_error,
+                    active_checksum, desired_checksum, last_completed_stage,
+                    target_stage, active_pipeline_fingerprint,
+                    desired_pipeline_fingerprint, current_run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_path) DO UPDATE SET
                     doc_id = excluded.doc_id,
                     format = excluded.format,
-                    checksum = excluded.checksum,
+                    desired_checksum = excluded.desired_checksum,
+                    desired_pipeline_fingerprint = excluded.desired_pipeline_fingerprint,
+                    target_stage = excluded.target_stage,
+                    current_run_id = excluded.current_run_id,
                     status = excluded.status,
                     pipeline_stage = excluded.pipeline_stage,
                     last_error = excluded.last_error
@@ -173,17 +228,24 @@ class MetadataStore:
                     doc_id,
                     source_path,
                     doc_format,
-                    checksum,
+                    None,
                     0,
                     utc_now_iso(),
                     "processing",
                     "PARSING",
                     None,
+                    None,
+                    checksum,
+                    None,
+                    target_stage,
+                    None,
+                    pipeline_fingerprint,
+                    run_id,
                 ),
             )
 
     def finish_document(self, doc_id: str, word_count: int, pipeline_stage: str) -> None:
-        """Mark ingestion completion for the latest stage."""
+        """Promote the desired generation to active after its target stage succeeds."""
         with self._connection() as conn:
             conn.execute(
                 """
@@ -192,18 +254,31 @@ class MetadataStore:
                     ingested_at = ?,
                     status = ?,
                     pipeline_stage = ?,
+                    last_completed_stage = ?,
+                    active_checksum = coalesce(desired_checksum, active_checksum, checksum),
+                    active_pipeline_fingerprint = coalesce(
+                        desired_pipeline_fingerprint,
+                        active_pipeline_fingerprint
+                    ),
                     last_error = NULL
                 WHERE doc_id = ?
                 """,
-                (word_count, utc_now_iso(), "complete", pipeline_stage, doc_id),
+                (word_count, utc_now_iso(), "complete", pipeline_stage, pipeline_stage, doc_id),
             )
 
-    def update_pipeline_stage(self, doc_id: str, stage: str) -> None:
-        """Update document pipeline stage explicitly."""
+    def update_pipeline_stage(self, doc_id: str, stage: str, word_count: int | None = None) -> None:
+        """Record a durable successful checkpoint without promoting the generation."""
         with self._connection() as conn:
             conn.execute(
-                "UPDATE documents SET pipeline_stage = ? WHERE doc_id = ?",
-                (stage, doc_id),
+                """
+                UPDATE documents
+                SET pipeline_stage = ?,
+                    last_completed_stage = ?,
+                    word_count = coalesce(?, word_count),
+                    status = 'processing'
+                WHERE doc_id = ?
+                """,
+                (stage, stage, word_count, doc_id),
             )
 
     def fail_document(self, doc_id: str, error_message: str) -> None:
@@ -383,9 +458,16 @@ class MetadataStore:
             conn.executemany(
                 """
                 INSERT INTO entity_mentions (entity_id, chunk_id, doc_id, confidence)
-                VALUES (?, ?, ?, ?)
+                SELECT ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM entity_mentions
+                    WHERE entity_id = ? AND chunk_id = ? AND doc_id = ?
+                )
                 """,
-                mentions,
+                [
+                    (entity_id, chunk_id, doc_id, confidence, entity_id, chunk_id, doc_id)
+                    for entity_id, chunk_id, doc_id, confidence in mentions
+                ],
             )
 
     def get_entity_mentions_map(

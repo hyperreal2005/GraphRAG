@@ -21,11 +21,13 @@ class Settings:
     strict_coref: bool = True
     enable_graph: bool = True
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.1-flash-lite"
     gemini_max_workers: int = 2
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "your_password"
+    neo4j_query_user: str | None = None
+    neo4j_query_password: str | None = None
     gliner_model: str = "urchade/gliner_base"
     gliner_labels: tuple[str, ...] = (
         "Person",
@@ -48,7 +50,7 @@ class Settings:
     cross_doc_auto_merge_threshold: float = 0.90
     cross_doc_llm_min_threshold: float = 0.75
     cross_doc_llm_max_threshold: float = 0.90
-    cross_doc_candidate_k: int = 1
+    cross_doc_candidate_k: int = 5
     cross_doc_same_type_required_for_auto: bool = True
     cross_doc_llm_enabled: bool = True
     embedding_model_id: str = "gemini-embedding-001"
@@ -73,12 +75,15 @@ class Settings:
     query_graph_local_hops: int = 3
     query_graph_multihop_hops: int = 4
     query_graph_path_limit: int = 25
-    query_graph_dynamic_enabled: bool = True
+    # Raw LLM-generated Cypher is intentionally opt-in. The default query path
+    # uses application-owned, bounded Cypher templates.
+    query_graph_dynamic_enabled: bool = False
     query_graph_dynamic_fallback_to_static: bool = True
     query_graph_schema_cache_ttl_seconds: int = 300
     query_graph_dynamic_model: str | None = None
     query_graph_dynamic_temperature: float = 0.0
     query_graph_dynamic_max_retries: int = 1
+    query_graph_transaction_timeout_seconds: float = 5.0
     query_graph_allow_ambiguous_fallback: bool = True
     query_graph_ambiguous_min_similarity: float = 0.75
     query_graph_ambiguous_score_penalty: float = 0.85
@@ -106,6 +111,7 @@ class Settings:
     def __post_init__(self) -> None:
         """Allow env vars to override sensitive defaults."""
         self.gemini_api_key = self.gemini_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        self.gemini_model = os.getenv("GEMINI_MODEL", self.gemini_model).strip() or self.gemini_model
         try:
             self.gemini_max_workers = int(os.getenv("GEMINI_MAX_WORKERS", self.gemini_max_workers))
         except ValueError:
@@ -255,6 +261,11 @@ class Settings:
         self.neo4j_password = os.getenv("NEO4J_PASSWORD", self.neo4j_password)
         self.neo4j_uri = os.getenv("NEO4J_URI", self.neo4j_uri)
         self.neo4j_user = os.getenv("NEO4J_USER", self.neo4j_user)
+        self.neo4j_query_user = os.getenv("NEO4J_QUERY_USER", self.neo4j_query_user or self.neo4j_user)
+        self.neo4j_query_password = os.getenv(
+            "NEO4J_QUERY_PASSWORD",
+            self.neo4j_query_password or self.neo4j_password,
+        )
         self.cohere_api_key = self.cohere_api_key or os.getenv("COHERE_API_KEY")
         self.qdrant_url = os.getenv("QDRANT_URL", self.qdrant_url)
         self.qdrant_api_key = os.getenv("QDRANT_API_KEY", self.qdrant_api_key)
@@ -269,6 +280,15 @@ class Settings:
         dynamic_model = os.getenv("QUERY_GRAPH_DYNAMIC_MODEL")
         if dynamic_model is not None and dynamic_model.strip():
             self.query_graph_dynamic_model = dynamic_model.strip()
+        try:
+            self.query_graph_transaction_timeout_seconds = float(
+                os.getenv(
+                    "QUERY_GRAPH_TRANSACTION_TIMEOUT_SECONDS",
+                    self.query_graph_transaction_timeout_seconds,
+                )
+            )
+        except ValueError:
+            self.query_graph_transaction_timeout_seconds = 5.0
         self.gemini_embedding_task_type = os.getenv(
             "GEMINI_EMBED_TASK_TYPE",
             self.gemini_embedding_task_type,

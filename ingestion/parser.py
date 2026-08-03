@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ except ImportError:  # pragma: no cover - optional dependency in dev environment
 
 
 SUPPORTED_FORMATS = {"pdf", "txt", "md", "csv", "json"}
+logger = logging.getLogger(__name__)
 
 
 def detect_format(source_path: Path) -> str:
@@ -192,10 +194,14 @@ class DocumentParser:
 
         try:
             result = self._docling_converter.convert(str(source_path))
-        except Exception:
+        except Exception as exc:
+            logger.warning("docling_pdf_parse_failed source=%s error_type=%s", source_path, type(exc).__name__)
             return []
 
         doc = getattr(result, "document", result)
+        structured_sections = self._sections_from_docling(doc, source_path)
+        if structured_sections:
+            return structured_sections
 
         markdown: str | None = None
         for attr_name in ("export_to_markdown", "to_markdown"):
@@ -230,6 +236,103 @@ class DocumentParser:
             ]
 
         return []
+
+    def _sections_from_docling(self, doc: Any, source_path: Path) -> list[Section]:
+        """Preserve Docling item order, page provenance, spans, and table rows."""
+        iterate_items = getattr(doc, "iterate_items", None)
+        if not callable(iterate_items):
+            return []
+
+        sections: list[Section] = []
+        current_heading = source_path.stem
+        section_index = 1
+        try:
+            items = iterate_items(with_groups=False)
+            for item, _level in items:
+                label = getattr(item, "label", None)
+                label_value = str(getattr(label, "value", label) or "").casefold()
+                item_text = normalize_whitespace(str(getattr(item, "text", "") or ""))
+                page, char_start, char_end, bbox = self._docling_provenance(item)
+
+                if label_value in {"title", "section_header"}:
+                    if item_text:
+                        current_heading = item_text
+                    continue
+                if label_value in {"page_header", "page_footer"}:
+                    continue
+
+                export_dataframe = getattr(item, "export_to_dataframe", None)
+                if callable(export_dataframe):
+                    try:
+                        dataframe = export_dataframe(doc=doc)
+                        headers = [str(column) for column in dataframe.columns]
+                        for row in dataframe.itertuples(index=False, name=None):
+                            values = [str(value) for value in row]
+                            sections.append(
+                                Section(
+                                    section_id=f"pdf-{section_index}",
+                                    section_type=SectionType.TABLE_ROW,
+                                    heading=current_heading,
+                                    page=page,
+                                    table_headers=headers,
+                                    table_row=values,
+                                    char_start=char_start,
+                                    char_end=char_end,
+                                    bbox=bbox,
+                                )
+                            )
+                            section_index += 1
+                        continue
+                    except Exception as exc:
+                        logger.warning(
+                            "docling_table_parse_failed source=%s error_type=%s",
+                            source_path,
+                            type(exc).__name__,
+                        )
+
+                if not item_text:
+                    continue
+                sections.append(
+                    Section(
+                        section_id=f"pdf-{section_index}",
+                        section_type=SectionType.TEXT,
+                        heading=current_heading,
+                        text=item_text,
+                        page=page,
+                        char_start=char_start,
+                        char_end=char_end,
+                        bbox=bbox,
+                    )
+                )
+                section_index += 1
+        except Exception as exc:
+            logger.warning("docling_item_iteration_failed source=%s error_type=%s", source_path, type(exc).__name__)
+            return []
+        return sections
+
+    def _docling_provenance(
+        self,
+        item: Any,
+    ) -> tuple[int | None, int | None, int | None, tuple[float, float, float, float] | None]:
+        provenance = getattr(item, "prov", None)
+        if not provenance:
+            return None, None, None, None
+        first = provenance[0]
+        page_value = getattr(first, "page_no", None)
+        page = int(page_value) if page_value is not None else None
+        charspan = getattr(first, "charspan", None)
+        char_start = int(charspan[0]) if isinstance(charspan, (list, tuple)) and len(charspan) == 2 else None
+        char_end = int(charspan[1]) if isinstance(charspan, (list, tuple)) and len(charspan) == 2 else None
+        bbox_value = getattr(first, "bbox", None)
+        bbox = None
+        if bbox_value is not None and all(hasattr(bbox_value, key) for key in ("l", "t", "r", "b")):
+            bbox = (
+                float(bbox_value.l),
+                float(bbox_value.t),
+                float(bbox_value.r),
+                float(bbox_value.b),
+            )
+        return page, char_start, char_end, bbox
 
     def _parse_pdf_with_pypdf(self, source_path: Path) -> list[Section]:
         if PdfReader is None:

@@ -68,26 +68,26 @@ class FusionEngine:
         ranked = sorted(deduped.values(), key=self._ranking_score, reverse=True)
         reranked, rerank_mode = self._apply_rerank(user_query=user_query, ranked=ranked)
         selected = self._select_context_items(reranked)
-        top_scores = [self._confidence_score(item) for item in selected[:3]]
 
         prioritized = sorted(
             selected,
             key=lambda item: (SOURCE_PRIORITY.get(item.source_type, 99), -self._ranking_score(item)),
         )
-        citations = self._build_citations(prioritized)
-        graph_paths = [item.text_or_path for item in prioritized if item.source_type == "graph" and item.text_or_path]
-        retrieval_sources = list(dict.fromkeys(item.source_type for item in prioritized))
-        context_text = self._build_context_text(prioritized)
+        packed_items, context_text = self._pack_context(prioritized)
+        top_scores = [self._confidence_score(item) for item in packed_items[:3]]
+        citations = self._build_citations(packed_items)
+        graph_paths = [item.text_or_path for item in packed_items if item.source_type == "graph" and item.text_or_path]
+        retrieval_sources = list(dict.fromkeys(item.source_type for item in packed_items))
         logger.info(
             "fusion_rerank mode=%s merged=%d deduped=%d selected=%d",
             rerank_mode,
             len(merged),
             len(deduped),
-            len(prioritized),
+            len(packed_items),
         )
 
         return FusionOutput(
-            context_items=prioritized,
+            context_items=packed_items,
             citations=citations,
             graph_paths=graph_paths,
             retrieval_sources=retrieval_sources,
@@ -232,12 +232,13 @@ class FusionEngine:
             return normalized
         return normalized[: limit - 3].rstrip() + "..."
 
-    def _build_context_text(self, results: list[RetrieverResult]) -> str:
+    def _pack_context(self, results: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
         if not results:
-            return ""
+            return [], ""
 
         max_chars = max(500, int(self.settings.query_context_max_chars))
         lines: list[str] = []
+        packed: list[RetrieverResult] = []
         total = 0
         for item in results:
             block = self._context_block(item)
@@ -245,10 +246,14 @@ class FusionEngine:
                 continue
             projected = total + len(block) + 1
             if projected > max_chars:
+                if not lines:
+                    lines.append(block[:max_chars].rstrip())
+                    packed.append(item)
                 break
             lines.append(block)
+            packed.append(item)
             total = projected
-        return "\n".join(lines)
+        return packed, "\n".join(lines)
 
     def _context_block(self, item: RetrieverResult) -> str:
         if item.source_type == "graph":

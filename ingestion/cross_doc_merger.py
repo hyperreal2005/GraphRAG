@@ -122,44 +122,45 @@ class CrossDocumentMerger:
             [query_text],
             task_type=self.settings.query_embedding_task_type,
         )[0]
-        candidate = self._get_top_candidate(query_vector=query_vector)
-        if candidate is None:
+        candidates = self._get_candidates(query_vector=query_vector)
+        if not candidates:
             return CrossDocMergeDecision(
                 local_entity_id=local_id,
                 final_entity_id=local_id,
                 decision="NEW_NODE",
             )
-
-        score = float(candidate.get("score") or 0.0)
-        payload = candidate.get("payload") or {}
-        candidate_id = str(payload.get("neo4j_node_id") or candidate.get("id") or "").strip()
-        if not candidate_id:
-            return CrossDocMergeDecision(
-                local_entity_id=local_id,
-                final_entity_id=local_id,
-                decision="NEW_NODE",
-                similarity=score,
-            )
-        candidate_type = str(payload.get("type") or "Entity").strip() or "Entity"
-        candidate_name = str(payload.get("name") or "").strip() or None
 
         auto_threshold = float(self.settings.cross_doc_auto_merge_threshold)
         llm_low = float(self.settings.cross_doc_llm_min_threshold)
-        llm_high = float(self.settings.cross_doc_llm_max_threshold)
+        best_observed: tuple[float, str, str | None, str] | None = None
 
-        if score > auto_threshold and self._types_compatible(entity_type=entity_type, candidate_type=candidate_type):
-            return CrossDocMergeDecision(
-                local_entity_id=local_id,
-                final_entity_id=candidate_id,
-                decision="AUTO_MERGE",
-                similarity=score,
-                candidate_entity_id=candidate_id,
-                candidate_name=candidate_name,
-                candidate_type=candidate_type,
-            )
+        for candidate in candidates:
+            score = float(candidate.get("score") or 0.0)
+            payload = candidate.get("payload") or {}
+            candidate_id = str(payload.get("neo4j_node_id") or candidate.get("id") or "").strip()
+            if not candidate_id or candidate_id == local_id:
+                continue
+            candidate_type = str(payload.get("type") or "Entity").strip() or "Entity"
+            candidate_name = str(payload.get("name") or "").strip() or None
+            if best_observed is None:
+                best_observed = (score, candidate_id, candidate_name, candidate_type)
 
-        if llm_low <= score <= llm_high:
-            if self._llm_should_merge(
+            types_compatible = self._types_compatible(entity_type=entity_type, candidate_type=candidate_type)
+            if score >= auto_threshold and types_compatible:
+                return CrossDocMergeDecision(
+                    local_entity_id=local_id,
+                    final_entity_id=candidate_id,
+                    decision="AUTO_MERGE",
+                    similarity=score,
+                    candidate_entity_id=candidate_id,
+                    candidate_name=candidate_name,
+                    candidate_type=candidate_type,
+                )
+
+            # High-scoring type mismatches are not silently discarded. They
+            # enter the conservative LLM review path along with the ambiguity
+            # band, while lower-ranked compatible candidates are still checked.
+            if score >= llm_low and self._llm_should_merge(
                 incoming_name=name,
                 incoming_type=entity_type,
                 incoming_properties=node.get("properties"),
@@ -178,6 +179,7 @@ class CrossDocumentMerger:
                     candidate_type=candidate_type,
                 )
 
+        score, candidate_id, candidate_name, candidate_type = best_observed or (0.0, "", None, "Entity")
         return CrossDocMergeDecision(
             local_entity_id=local_id,
             final_entity_id=local_id,
@@ -198,12 +200,10 @@ class CrossDocumentMerger:
         )
         return f"{name}\nType: {entity_type}\nSummary: {summary}"
 
-    def _get_top_candidate(self, query_vector: list[float]) -> dict[str, Any] | None:
+    def _get_candidates(self, query_vector: list[float]) -> list[dict[str, Any]]:
         limit = max(1, int(self.settings.cross_doc_candidate_k))
         points = self._search_points(query_vector=query_vector, limit=limit)
-        if not points:
-            return None
-        return points[0]
+        return sorted(points, key=lambda item: float(item.get("score") or 0.0), reverse=True)
 
     def _search_points(self, query_vector: list[float], limit: int) -> list[dict[str, Any]]:
         collection = self.settings.qdrant_entities_collection
@@ -276,7 +276,18 @@ class CrossDocumentMerger:
     def _types_compatible(self, entity_type: str, candidate_type: str) -> bool:
         if not self.settings.cross_doc_same_type_required_for_auto:
             return True
-        return entity_type.strip().lower() == candidate_type.strip().lower()
+        aliases = {
+            "org": "organization",
+            "organisation": "organization",
+            "company": "organization",
+            "business": "organization",
+            "institution": "organization",
+            "university": "organization",
+            "human": "person",
+        }
+        incoming = entity_type.strip().lower()
+        candidate = candidate_type.strip().lower()
+        return aliases.get(incoming, incoming) == aliases.get(candidate, candidate)
 
     def _llm_should_merge(
         self,

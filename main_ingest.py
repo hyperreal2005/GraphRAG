@@ -27,7 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--recursive",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Recursively ingest files when input is a directory",
     )
     parser.add_argument(
@@ -63,7 +64,10 @@ def main() -> int:
         enable_graph=not args.phase1_only,
     )
     pipeline = PhaseOnePipeline(settings=settings)
-    summary = pipeline.ingest_path(Path(args.input), recursive=bool(args.recursive))
+    try:
+        summary = pipeline.ingest_path(Path(args.input), recursive=bool(args.recursive))
+    finally:
+        pipeline.close()
     print(json.dumps(summary.to_dict(), indent=2))
     return 0 if summary.failed == 0 else 1
 

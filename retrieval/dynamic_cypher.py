@@ -39,15 +39,17 @@ class SchemaSnapshot:
 
 @dataclass
 class DynamicCypherPlan:
+    """Validated logical graph plan; it never contains executable model output."""
+
     mode: str
-    cypher: str
     params: dict[str, object]
     schema_generated_at: str
+    relationship_types: list[str]
     temporal_filter_hint: str | None = None
 
 
 class DynamicCypherPlanner:
-    """Generate read-only Cypher plans from query intent + graph schema."""
+    """Generate a constrained logical plan that application code compiles."""
 
     def __init__(
         self,
@@ -104,13 +106,12 @@ class DynamicCypherPlanner:
         for _ in range(attempts):
             try:
                 raw_payload = self._generate_payload(prompt)
-                cypher = self._extract_cypher(raw_payload)
-                self._validate_parameter_usage(cypher, mode, params)
+                relationship_types = self._extract_relationship_types(raw_payload, schema)
                 return DynamicCypherPlan(
                     mode=mode,
-                    cypher=cypher,
                     params=params,
                     schema_generated_at=schema.generated_at,
+                    relationship_types=relationship_types,
                     temporal_filter_hint=temporal_hint,
                 )
             except Exception as exc:
@@ -232,43 +233,30 @@ class DynamicCypherPlanner:
         ]
         mode_instructions = {
             "neighborhood": (
-                "Return graph neighborhoods around provided anchor_ids. "
-                "Use MATCH with variable-length traversal up to $max_hops."
+                "Select zero or more relationship types useful for a neighborhood around the anchors."
             ),
             "multihop_pair": (
-                "Return paths connecting anchor_a and anchor_b using shortestPath "
-                "or bounded path expansion up to $max_hops."
+                "Select zero or more relationship types useful for connecting the two anchors."
             ),
             "comparative": (
-                "Return separate subgraph evidence for each anchor in anchor_ids. "
-                "Use UNWIND anchor_ids and keep provenance by anchor_entity_id."
+                "Select zero or more relationship types useful for separate evidence around each anchor."
             ),
         }
-        required_columns = (
-            "The Cypher MUST RETURN these columns exactly:\n"
-            "- anchor_entity_id (string)\n"
-            "- node_names (list[str])\n"
-            "- rel_types (list[str])\n"
-            "- rel_weights (list[number])\n"
-            "And MUST include LIMIT $path_limit."
-        )
         safety_rules = (
-            "Safety constraints:\n"
-            "- Single read-only statement only.\n"
-            "- Do NOT use CREATE, MERGE, DELETE, DETACH, SET, REMOVE, DROP, CALL, LOAD, FOREACH, APOC, DBMS.\n"
-            "- Use only supplied parameter names; do not invent parameters.\n"
-            "- No comments, no markdown, no explanation."
+            "Return data only. Never output Cypher, database clauses, comments, markdown, or explanations. "
+            "Every relationship type must exactly match a type in the supplied schema. "
+            "Use an empty list when no safe filter is useful."
         )
         output_rules = (
-            'Output strict JSON object with key "cypher" only, for example:\n'
-            '{"cypher":"MATCH ... RETURN ..."}'
+            'Output one strict JSON object with key "relationship_types" only, for example:\n'
+            '{"relationship_types":["WORKS_AT","FOUNDED"]}'
         )
 
         schema_json = json.dumps(schema.to_prompt_dict(), ensure_ascii=True)
         anchors_json = json.dumps(anchor_payload, ensure_ascii=True)
         params_json = json.dumps(params, ensure_ascii=True)
         return (
-            "You generate safe Cypher for a GraphRAG graph retriever.\n"
+            "You select schema-backed relationship filters for a GraphRAG retriever.\n"
             f"User question: {user_query}\n"
             f"Query type: {analysis.query_type.value}\n"
             f"Planning mode: {mode}\n"
@@ -277,7 +265,6 @@ class DynamicCypherPlanner:
             f"Schema snapshot: {schema_json}\n"
             f"Required parameters: {params_json}\n"
             f"Mode instructions: {mode_instructions.get(mode, mode_instructions['neighborhood'])}\n"
-            f"{required_columns}\n"
             f"{safety_rules}\n"
             f"{output_rules}"
         )
@@ -302,12 +289,19 @@ class DynamicCypherPlanner:
             return json.dumps(parsed)
         raise RuntimeError("Dynamic Cypher model returned empty payload.")
 
-    def _extract_cypher(self, raw_payload: str) -> str:
+    def _extract_relationship_types(self, raw_payload: str, schema: SchemaSnapshot) -> list[str]:
         payload = self._parse_json(raw_payload)
-        cypher = payload.get("cypher")
-        if not isinstance(cypher, str) or not cypher.strip():
-            raise RuntimeError("Dynamic Cypher payload missing non-empty 'cypher' string.")
-        return cypher.strip()
+        if set(payload) != {"relationship_types"}:
+            raise RuntimeError("Logical graph plan must contain only 'relationship_types'.")
+        values = payload.get("relationship_types")
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            raise RuntimeError("Logical graph plan 'relationship_types' must be a list of strings.")
+        allowed = set(schema.relationship_types)
+        normalized = list(dict.fromkeys(item.strip() for item in values if item.strip()))
+        unknown = [item for item in normalized if item not in allowed]
+        if unknown:
+            raise RuntimeError(f"Logical graph plan used relationship types outside the schema: {unknown}")
+        return normalized
 
     def _parse_json(self, raw_text: str) -> dict[str, Any]:
         stripped = raw_text.strip().strip("`")
@@ -325,30 +319,6 @@ class DynamicCypherPlanner:
         if not isinstance(decoded, dict):
             raise RuntimeError("Dynamic Cypher response JSON was not an object.")
         return decoded
-
-    def _validate_parameter_usage(self, cypher: str, mode: str, params: dict[str, object]) -> None:
-        used_params = set(re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", cypher))
-        allowed_params = set(params.keys())
-        unknown = used_params - allowed_params
-        if unknown:
-            raise RuntimeError(f"Dynamic Cypher used unknown parameters: {sorted(unknown)}")
-
-        required_by_mode = {
-            "neighborhood": {"anchor_ids", "max_hops", "path_limit"},
-            "multihop_pair": {"anchor_a", "anchor_b", "max_hops", "path_limit"},
-            "comparative": {"anchor_ids", "max_hops", "path_limit"},
-        }
-        missing = required_by_mode.get(mode, set()) - used_params
-        if missing:
-            raise RuntimeError(f"Dynamic Cypher missing required parameters for mode {mode}: {sorted(missing)}")
-
-        lowered = cypher.lower()
-        required_aliases = ("as anchor_entity_id", "as node_names", "as rel_types", "as rel_weights")
-        for alias in required_aliases:
-            if alias not in lowered:
-                raise RuntimeError(f"Dynamic Cypher missing required return alias: {alias}")
-        if "$path_limit" not in cypher:
-            raise RuntimeError("Dynamic Cypher must include LIMIT $path_limit.")
 
     def _safe_list(self, record: Any) -> list[str]:
         if record is None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from typing import Any
 
 from config import Settings
@@ -16,6 +17,9 @@ from retrieval.entity_linker import EntityLinker
 from retrieval.fusion import FusionEngine
 from retrieval.graph_retriever import GraphRetriever
 from retrieval.vector_retriever import VectorRetriever
+
+
+logger = logging.getLogger(__name__)
 
 
 class QueryOrchestrator:
@@ -52,12 +56,16 @@ class QueryOrchestrator:
                 return GraphRAGResponse.from_dict(cached_payload)
 
         analysis = await asyncio.to_thread(self.analyzer.analyze, user_query)
+        warnings: list[str] = []
         try:
             linked_entities = await asyncio.to_thread(self.entity_linker.link_entities, analysis.mentioned_entities)
-        except Exception:
+        except Exception as exc:
+            logger.warning("entity_linking_failed error_type=%s", type(exc).__name__)
+            warnings.append(f"entity_linking_failed:{type(exc).__name__}")
             linked_entities = []
 
         graph_task = self._to_thread_or_empty(
+            component="graph_retrieval",
             enabled=bool(analysis.retrieval_flags.get("graph")),
             fn=self.graph_retriever.retrieve,
             analysis=analysis,
@@ -65,21 +73,31 @@ class QueryOrchestrator:
             user_query=user_query,
         )
         vector_task = self._to_thread_or_empty(
+            component="vector_retrieval",
             enabled=bool(analysis.retrieval_flags.get("vector", True)),
             fn=self.vector_retriever.retrieve,
             query=user_query,
             top_k=int(self.settings.query_vector_top_k),
         )
         community_task = self._to_thread_or_empty(
+            component="community_retrieval",
             enabled=bool(analysis.retrieval_flags.get("community")),
             fn=self.community_retriever.retrieve,
             query=user_query,
         )
 
-        graph_results, vector_results, community_results = await asyncio.gather(
+        graph_outcome, vector_outcome, community_outcome = await asyncio.gather(
             graph_task,
             vector_task,
             community_task,
+        )
+        graph_results, graph_warning = graph_outcome
+        vector_results, vector_warning = vector_outcome
+        community_results, community_warning = community_outcome
+        warnings.extend(
+            warning
+            for warning in (graph_warning, vector_warning, community_warning)
+            if warning is not None
         )
         community_fallback_used = bool(analysis.retrieval_flags.get("community")) and not community_results
 
@@ -97,6 +115,9 @@ class QueryOrchestrator:
             analysis,
             fusion_output,
         )
+        if warnings:
+            response.degraded = True
+            response.warnings = list(dict.fromkeys([*response.warnings, *warnings]))
 
         if self.settings.query_cache_enabled:
             self.cache.set_query(
@@ -113,17 +134,36 @@ class QueryOrchestrator:
         )
         return response
 
-    async def _to_thread_or_empty(self, enabled: bool, fn: Any, **kwargs: Any) -> list[RetrieverResult]:
+    async def _to_thread_or_empty(
+        self,
+        component: str,
+        enabled: bool,
+        fn: Any,
+        **kwargs: Any,
+    ) -> tuple[list[RetrieverResult], str | None]:
         if not enabled:
-            return []
+            return [], None
         try:
-            return await asyncio.to_thread(fn, **kwargs)
-        except Exception:
-            return []
+            return await asyncio.to_thread(fn, **kwargs), None
+        except Exception as exc:
+            logger.warning("%s_failed error_type=%s", component, type(exc).__name__)
+            return [], f"{component}_failed:{type(exc).__name__}"
 
     def _build_cache_key(self, user_query: str, session_id: str) -> str:
         payload = f"{session_id}|{user_query.strip().lower()}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def close(self) -> None:
-        self.graph_retriever.close()
+        resources = [
+            self.graph_retriever,
+            getattr(self.entity_linker, "_client", None),
+            getattr(self.vector_retriever, "_client", None),
+        ]
+        seen: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()

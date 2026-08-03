@@ -63,6 +63,15 @@ class GraphWriter:
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password),
         )
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """Install the identity constraint required for safe concurrent MERGE."""
+        with self._driver.session() as session:
+            session.run(
+                "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS "
+                "FOR (n:Entity) REQUIRE n.id IS UNIQUE"
+            ).consume()
 
     def close(self) -> None:
         self._driver.close()
@@ -194,20 +203,32 @@ class GraphWriter:
             session.run(delete_legacy_query, {"chunk_ids": chunk_list})
             session.run(query, {"chunk_ids": chunk_list, "source_refs": source_refs})
 
-    def retract_entities(self, doc_id: str, entity_ids: Iterable[str]) -> None:
+    def retract_entities(self, doc_id: str, entity_ids: Iterable[str]) -> set[str]:
+        """Remove one document's contribution and return nodes actually deleted."""
         entity_list = list(entity_ids)
         if not entity_list:
-            return
-        query = (
+            return set()
+        update_query = (
             "MATCH (n:Entity) "
             "WHERE n.id IN $entity_ids "
-            "SET n.sources = [s IN n.sources WHERE s <> $doc_id] "
-            "WITH n "
-            "WHERE size(n.sources) = 0 "
+            "SET n.sources = [s IN coalesce(n.sources, []) WHERE s <> $doc_id] "
+            "RETURN n.id AS entity_id, size(n.sources) = 0 AS orphaned"
+        )
+        delete_query = (
+            "MATCH (n:Entity) "
+            "WHERE n.id IN $entity_ids AND size(coalesce(n.sources, [])) = 0 "
             "DETACH DELETE n"
         )
         with self._driver.session() as session:
-            session.run(query, {"entity_ids": entity_list, "doc_id": doc_id})
+            rows = session.run(update_query, {"entity_ids": entity_list, "doc_id": doc_id})
+            orphaned = {
+                str(row["entity_id"])
+                for row in rows
+                if bool(row["orphaned"])
+            }
+            if orphaned:
+                session.run(delete_query, {"entity_ids": sorted(orphaned)})
+        return orphaned
 
     def get_entities_for_doc(self, doc_id: str) -> list[dict[str, Any]]:
         """Fetch entity nodes sourced from a specific document."""

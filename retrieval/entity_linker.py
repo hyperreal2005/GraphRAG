@@ -94,6 +94,7 @@ class EntityLinker:
         )
 
     def _search_entities(self, query_vector: list[float], limit: int) -> list[Any]:
+        query_points_error: Exception | None = None
         if hasattr(self._client, "query_points"):
             try:
                 response = self._client.query_points(
@@ -103,11 +104,11 @@ class EntityLinker:
                     with_payload=True,
                     with_vectors=False,
                 )
-                points = self._extract_points(response)
-                if points:
-                    return points
-            except Exception:
-                pass
+                # An empty result is a successful query, not a signal to call
+                # legacy methods that may not exist on modern clients.
+                return self._extract_points(response)
+            except Exception as exc:
+                query_points_error = exc
 
         if hasattr(self._client, "search"):
             response = self._client.search(
@@ -127,6 +128,8 @@ class EntityLinker:
             )
             return self._extract_points(response)
 
+        if query_points_error is not None:
+            raise RuntimeError(f"Qdrant entity search failed: {query_points_error}") from query_points_error
         raise RuntimeError("Qdrant client does not expose a compatible search API.")
 
     def _extract_points(self, response: Any) -> list[Any]:

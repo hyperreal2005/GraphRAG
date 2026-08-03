@@ -14,8 +14,6 @@ venv/
 
 data/
 artifacts/
-docs/
-tests/
 
 *.db
 *.sqlite
@@ -30,6 +28,6 @@ tests/
 .DS_Store
 Thumbs.db
 .vscode/
-.idea/
 
-.huggingface/
+docs/
+tests/

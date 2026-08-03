@@ -12,7 +12,9 @@ from retrieval.dynamic_cypher import DynamicCypherPlan, DynamicCypherPlanner
 
 
 WRITE_CLAUSE_PATTERN = re.compile(
-    r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|CALL|LOAD|FOREACH|APOC|DBMS)\b",
+    r"\b(CREATE|INSERT|MERGE|DELETE|DETACH|SET|REMOVE|DROP|ALTER|RENAME|GRANT|DENY|REVOKE|"
+    r"CALL|LOAD|FOREACH|APOC|DBMS)\b|\bSTART\s+(DATABASE|TRANSACTION)\b|"
+    r"\bSTOP\s+DATABASE\b|\bTERMINATE\s+TRANSACTIONS?\b",
     re.IGNORECASE,
 )
 READ_START_PATTERN = re.compile(r"^\s*(MATCH|OPTIONAL\s+MATCH|WITH|UNWIND|RETURN)\b", re.IGNORECASE)
@@ -37,7 +39,10 @@ class GraphRetriever:
                 raise RuntimeError("neo4j driver is required for graph retrieval.") from exc
             self._driver = GraphDatabase.driver(
                 self.settings.neo4j_uri,
-                auth=(self.settings.neo4j_user, self.settings.neo4j_password),
+                auth=(
+                    self.settings.neo4j_query_user or self.settings.neo4j_user,
+                    self.settings.neo4j_query_password or self.settings.neo4j_password,
+                ),
             )
         self._planner = planner or DynamicCypherPlanner(settings=self.settings, driver=self._driver)
 
@@ -75,8 +80,8 @@ class GraphRetriever:
         anchors: list[LinkedEntity],
     ) -> list[RetrieverResult]:
         plan = self._planner.generate_plan(user_query=user_query, analysis=analysis, anchors=anchors)
-        self._assert_read_only(plan.cypher)
-        rows = self._execute_read(plan.cypher, plan.params)
+        cypher, params = self._compile_logical_plan(plan)
+        rows = self._execute_read(cypher, params)
         return self._rows_to_results(
             rows=rows,
             analysis=analysis,
@@ -86,6 +91,54 @@ class GraphRetriever:
             plan=plan,
         )
 
+    def _compile_logical_plan(self, plan: DynamicCypherPlan) -> tuple[str, dict[str, Any]]:
+        """Compile validated model choices into application-owned bounded Cypher."""
+        max_hops = max(1, min(6, int(plan.params.get("max_hops", 1))))
+        path_limit = max(1, min(100, int(plan.params.get("path_limit", self.settings.query_graph_path_limit))))
+        params = dict(plan.params)
+        params.pop("max_hops", None)
+        params["path_limit"] = path_limit
+        params["relationship_types"] = list(plan.relationship_types)
+        relationship_filter = (
+            "WHERE size($relationship_types) = 0 OR "
+            "all(rel IN relationships(p) WHERE coalesce(rel.type, type(rel)) IN $relationship_types) "
+        )
+        projection = (
+            "[n IN nodes(p) | coalesce(n.name, n.id)] AS node_names, "
+            "[rel IN relationships(p) | coalesce(rel.type, type(rel))] AS rel_types, "
+            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights, "
+            "[i IN range(0, size(relationships(p)) - 1) | "
+            "CASE WHEN startNode(relationships(p)[i]) = nodes(p)[i] THEN 'out' ELSE 'in' END] AS rel_directions, "
+            "[rel IN relationships(p) | coalesce(rel.source_refs, [])] AS rel_source_refs "
+            "LIMIT $path_limit"
+        )
+
+        if plan.mode in {"neighborhood", "comparative"}:
+            anchor_ids = params.get("anchor_ids")
+            if not isinstance(anchor_ids, list) or not anchor_ids:
+                raise ValueError(f"Logical graph plan mode {plan.mode} requires anchor_ids.")
+            cypher = (
+                "UNWIND $anchor_ids AS anchor_id "
+                f"MATCH p=(start:Entity {{id: anchor_id}})-[*1..{max_hops}]-(nbr:Entity) "
+                f"{relationship_filter}"
+                "RETURN anchor_id AS anchor_entity_id, "
+                f"{projection}"
+            )
+        elif plan.mode == "multihop_pair":
+            if not params.get("anchor_a") or not params.get("anchor_b"):
+                raise ValueError("Logical graph plan mode multihop_pair requires anchor_a and anchor_b.")
+            cypher = (
+                f"MATCH p=shortestPath((a:Entity {{id: $anchor_a}})-[*1..{max_hops}]-(b:Entity {{id: $anchor_b}})) "
+                f"{relationship_filter}"
+                "RETURN $anchor_a + '|' + $anchor_b AS anchor_entity_id, "
+                f"{projection}"
+            )
+        else:
+            raise ValueError(f"Unsupported logical graph plan mode: {plan.mode}")
+
+        self._assert_read_only(cypher)
+        return cypher, params
+
     def _retrieve_static(
         self,
         analysis: QueryAnalysis,
@@ -93,10 +146,20 @@ class GraphRetriever:
         query_mode: str,
         fallback_reason: str | None = None,
     ) -> list[RetrieverResult]:
-        if analysis.query_type is QueryType.COMPARATIVE and len(anchors) >= 2:
-            return self._retrieve_comparative(
+        if analysis.query_type is QueryType.GLOBAL:
+            return []
+        if analysis.query_type is QueryType.MULTIHOP and len(anchors) >= 2:
+            return self._retrieve_connecting_path(
                 linked_entities=anchors[:2],
                 analysis=analysis,
+                query_mode=query_mode,
+                fallback_reason=fallback_reason,
+            )
+        if analysis.query_type is QueryType.COMPARATIVE:
+            return self._retrieve_neighborhood(
+                linked_entities=anchors,
+                max_hops=int(self.settings.query_graph_local_hops),
+                query_type=analysis.query_type,
                 query_mode=query_mode,
                 fallback_reason=fallback_reason,
             )
@@ -154,14 +217,14 @@ class GraphRetriever:
             )
         return all_results
 
-    def _retrieve_comparative(
+    def _retrieve_connecting_path(
         self,
         linked_entities: list[LinkedEntity],
         analysis: QueryAnalysis,
         query_mode: str,
         fallback_reason: str | None,
     ) -> list[RetrieverResult]:
-        query = self._build_comparative_query(max_hops=int(self.settings.query_graph_multihop_hops))
+        query = self._build_connecting_query(max_hops=int(self.settings.query_graph_multihop_hops))
         params = {
             "entity_a": str(linked_entities[0].entity_id),
             "entity_b": str(linked_entities[1].entity_id),
@@ -186,11 +249,14 @@ class GraphRetriever:
             "$entity_id AS anchor_entity_id, "
             "[n IN nodes(p) | coalesce(n.name, n.id)] AS node_names, "
             "[rel IN relationships(p) | coalesce(rel.type, type(rel))] AS rel_types, "
-            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights "
+            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights, "
+            "[i IN range(0, size(relationships(p)) - 1) | "
+            "CASE WHEN startNode(relationships(p)[i]) = nodes(p)[i] THEN 'out' ELSE 'in' END] AS rel_directions, "
+            "[rel IN relationships(p) | coalesce(rel.source_refs, [])] AS rel_source_refs "
             "LIMIT $path_limit"
         )
 
-    def _build_comparative_query(self, max_hops: int) -> str:
+    def _build_connecting_query(self, max_hops: int) -> str:
         hops = max(1, int(max_hops))
         return (
             "MATCH p=shortestPath((a:Entity {id: $entity_a})-[*1.."
@@ -200,13 +266,33 @@ class GraphRetriever:
             "$entity_a + '|' + $entity_b AS anchor_entity_id, "
             "[n IN nodes(p) | coalesce(n.name, n.id)] AS node_names, "
             "[rel IN relationships(p) | coalesce(rel.type, type(rel))] AS rel_types, "
-            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights "
+            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights, "
+            "[i IN range(0, size(relationships(p)) - 1) | "
+            "CASE WHEN startNode(relationships(p)[i]) = nodes(p)[i] THEN 'out' ELSE 'in' END] AS rel_directions, "
+            "[rel IN relationships(p) | coalesce(rel.source_refs, [])] AS rel_source_refs "
             "LIMIT $path_limit"
         )
 
     def _execute_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         self._assert_read_only(query)
         with self._driver.session() as session:
+            execute_read = getattr(session, "execute_read", None)
+            if callable(execute_read):
+                def run_in_transaction(tx):  # noqa: ANN001, ANN202
+                    query_value: Any = query
+                    try:
+                        from neo4j import Query
+
+                        query_value = Query(
+                            query,
+                            timeout=max(0.1, float(self.settings.query_graph_transaction_timeout_seconds)),
+                            metadata={"component": "graphrag_retrieval"},
+                        )
+                    except Exception:
+                        query_value = query
+                    return [dict(record) for record in tx.run(query_value, params)]
+
+                return list(execute_read(run_in_transaction))
             records = session.run(query, params)
             return [dict(record) for record in records]
 
@@ -307,10 +393,10 @@ class GraphRetriever:
         fallback_reason: str | None,
         planner_mode: str | None,
     ) -> RetrieverResult | None:
-        node_names, rel_types, rel_weights = self._extract_path_parts(row)
+        node_names, rel_types, rel_weights, rel_directions, rel_source_refs = self._extract_path_parts(row)
         if len(node_names) < 2 or not rel_types:
             return None
-        path = self._format_path(node_names, rel_types)
+        path = self._format_path(node_names, rel_types, rel_directions)
         score = self._score_path(rel_weights)
         if anchor_status == "ambiguous":
             penalty = max(0.0, min(1.0, float(self.settings.query_graph_ambiguous_score_penalty)))
@@ -325,6 +411,15 @@ class GraphRetriever:
             "hop_count": len(rel_types),
             "node_names": node_names,
             "rel_types": rel_types,
+            "rel_directions": rel_directions,
+            "source_refs": list(
+                dict.fromkeys(
+                    str(ref)
+                    for refs in rel_source_refs
+                    for ref in refs
+                    if str(ref).strip()
+                )
+            ),
             "query_mode": query_mode,
         }
         if fallback_reason:
@@ -340,30 +435,51 @@ class GraphRetriever:
             provenance=provenance,
         )
 
-    def _extract_path_parts(self, row: dict[str, Any]) -> tuple[list[str], list[str], list[float]]:
+    def _extract_path_parts(
+        self,
+        row: dict[str, Any],
+    ) -> tuple[list[str], list[str], list[float], list[str], list[list[str]]]:
         node_names = row.get("node_names")
         rel_types = row.get("rel_types")
         rel_weights = row.get("rel_weights")
+        rel_directions = row.get("rel_directions")
+        rel_source_refs = row.get("rel_source_refs")
         if isinstance(node_names, list) and isinstance(rel_types, list):
             safe_nodes = [str(item) for item in node_names]
             safe_rels = [str(item) for item in rel_types]
             safe_weights = [float(item) for item in rel_weights] if isinstance(rel_weights, list) else []
-            return safe_nodes, safe_rels, safe_weights
+            safe_directions = (
+                ["in" if str(item).lower() == "in" else "out" for item in rel_directions]
+                if isinstance(rel_directions, list)
+                else ["out"] * len(safe_rels)
+            )
+            safe_source_refs = []
+            if isinstance(rel_source_refs, list):
+                for item in rel_source_refs:
+                    safe_source_refs.append([str(ref) for ref in item] if isinstance(item, list) else [])
+            while len(safe_source_refs) < len(safe_rels):
+                safe_source_refs.append([])
+            return safe_nodes, safe_rels, safe_weights, safe_directions, safe_source_refs
 
         path = row.get("p")
         if path is None:
-            return [], [], []
+            return [], [], [], [], []
         nodes = getattr(path, "nodes", [])
         relationships = getattr(path, "relationships", [])
         safe_nodes = [str(node.get("name") or node.get("id") or "") for node in nodes]
         safe_rels = [str(rel.get("type") or getattr(rel, "type", "RELATED_TO")) for rel in relationships]
         safe_weights = [float(rel.get("weight") or 0.0) for rel in relationships]
-        return safe_nodes, safe_rels, safe_weights
+        safe_source_refs = [
+            [str(ref) for ref in (rel.get("source_refs") or [])]
+            for rel in relationships
+        ]
+        return safe_nodes, safe_rels, safe_weights, ["out"] * len(safe_rels), safe_source_refs
 
-    def _format_path(self, node_names: list[str], rel_types: list[str]) -> str:
+    def _format_path(self, node_names: list[str], rel_types: list[str], rel_directions: list[str]) -> str:
         parts: list[str] = [node_names[0]]
-        for relation, tail in zip(rel_types, node_names[1:]):
-            parts.append(f"-[{relation}]->")
+        for index, (relation, tail) in enumerate(zip(rel_types, node_names[1:])):
+            direction = rel_directions[index] if index < len(rel_directions) else "out"
+            parts.append(f"<-[{relation}]-" if direction == "in" else f"-[{relation}]->")
             parts.append(tail)
         return " ".join(parts)
 

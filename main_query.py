@@ -14,7 +14,7 @@ from retrieval.query_orchestrator import QueryOrchestrator
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="GraphRAG Phase 4 query pipeline")
+    parser = argparse.ArgumentParser(description="GraphRAG query pipeline")
     parser.add_argument("--query", required=True, help="User question to answer")
     parser.add_argument(
         "--session-id",
@@ -52,4 +52,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -50,6 +50,9 @@ class Section:
     page: int | None = None
     table_headers: list[str] | None = None
     table_row: list[str] | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -66,6 +69,12 @@ class Section:
             payload["table_headers"] = self.table_headers
         if self.table_row is not None:
             payload["table_row"] = self.table_row
+        if self.char_start is not None:
+            payload["char_start"] = self.char_start
+        if self.char_end is not None:
+            payload["char_end"] = self.char_end
+        if self.bbox is not None:
+            payload["bbox"] = list(self.bbox)
         return payload
 
 
@@ -191,4 +200,3 @@ class IngestionRunSummary:
             "failed": self.failed,
             "results": [result.to_dict() for result in self.results],
         }
-

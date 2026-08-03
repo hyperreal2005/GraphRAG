@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -11,17 +12,35 @@ from models.ingestion import Chunk, ParsedDocument, Section, SectionType
 
 
 SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|$)", re.MULTILINE)
+CHUNK_FINGERPRINT_VERSION = "v2"
 
 
 def normalize_for_hash(text: str) -> str:
-    """Canonicalize chunk text before hashing."""
-    return re.sub(r"\s+", " ", text).strip().lower()
+    """Normalize insignificant whitespace without changing semantic case."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def chunk_hash(text: str) -> str:
-    """Compute stable SHA-256 for chunk text."""
-    canonical_text = normalize_for_hash(text)
-    return hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+def chunk_hash(
+    text: str,
+    *,
+    section_heading: str | None = None,
+    page_number: int | None = None,
+    position: int | None = None,
+    char_start: int | None = None,
+    char_end: int | None = None,
+) -> str:
+    """Compute an occurrence-aware fingerprint for extraction/index deltas."""
+    payload = {
+        "version": CHUNK_FINGERPRINT_VERSION,
+        "text": normalize_for_hash(text),
+        "section_heading": normalize_for_hash(section_heading or ""),
+        "page_number": page_number,
+        "position": position,
+        "char_start": char_start,
+        "char_end": char_end,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def token_count(text: str) -> int:
@@ -41,8 +60,14 @@ class SemanticChunker:
     """Chunk text with sentence boundaries and token overlap."""
 
     def __init__(self, target_tokens: int = 700, max_tokens: int = 800, overlap_tokens: int = 100) -> None:
+        if target_tokens <= 0 or max_tokens <= 0:
+            raise ValueError("target_tokens and max_tokens must be positive")
         if target_tokens > max_tokens:
             raise ValueError("target_tokens cannot exceed max_tokens")
+        if overlap_tokens < 0:
+            raise ValueError("overlap_tokens cannot be negative")
+        if overlap_tokens >= max_tokens:
+            raise ValueError("overlap_tokens must be smaller than max_tokens")
         self.target_tokens = target_tokens
         self.max_tokens = max_tokens
         self.overlap_tokens = overlap_tokens
@@ -54,10 +79,9 @@ class SemanticChunker:
 
         for section in document.sections:
             if section.section_type is SectionType.TABLE_ROW:
-                chunk = self._chunk_table_row(document.doc_id, section, position)
-                if chunk is not None:
-                    chunks.append(chunk)
-                    position += 1
+                table_chunks = self._chunk_table_row(document.doc_id, section, position)
+                chunks.extend(table_chunks)
+                position += len(table_chunks)
                 continue
 
             if section.section_type is SectionType.TEXT:
@@ -67,26 +91,38 @@ class SemanticChunker:
 
         return chunks
 
-    def _chunk_table_row(self, doc_id: str, section: Section, position: int) -> Chunk | None:
+    def _chunk_table_row(self, doc_id: str, section: Section, position: int) -> list[Chunk]:
         headers = section.table_headers or []
         row_values = section.table_row or []
         if not headers and not row_values:
-            return None
+            return []
 
         rendered = " | ".join(f"{header}: {value}" for header, value in zip(headers, row_values))
-        digest = chunk_hash(rendered)
-        return Chunk(
-            doc_id=doc_id,
-            chunk_id=str(uuid.uuid4()),
-            position=position,
-            section_heading=section.heading,
-            page_number=section.page,
-            text=rendered,
-            token_count=token_count(rendered),
-            char_start=None,
-            char_end=None,
-            chunk_hash=digest,
-        )
+        segments = self._split_oversized_text(rendered)
+        chunks: list[Chunk] = []
+        for offset, segment in enumerate(segments):
+            chunk_position = position + offset
+            digest = chunk_hash(
+                segment,
+                section_heading=section.heading,
+                page_number=section.page,
+                position=chunk_position,
+            )
+            chunks.append(
+                Chunk(
+                    doc_id=doc_id,
+                    chunk_id=str(uuid.uuid4()),
+                    position=chunk_position,
+                    section_heading=section.heading,
+                    page_number=section.page,
+                    text=segment,
+                    token_count=token_count(segment),
+                    char_start=None,
+                    char_end=None,
+                    chunk_hash=digest,
+                )
+            )
+        return chunks
 
     def _chunk_text_section(self, doc_id: str, section: Section, base_position: int) -> list[Chunk]:
         text = (section.text or "").strip()
@@ -95,7 +131,16 @@ class SemanticChunker:
 
         spans = self._sentence_spans(text)
         if not spans:
-            digest = chunk_hash(text)
+            absolute_start = section.char_start if section.char_start is not None else 0
+            absolute_end = absolute_start + len(text)
+            digest = chunk_hash(
+                text,
+                section_heading=section.heading,
+                page_number=section.page,
+                position=base_position,
+                char_start=absolute_start,
+                char_end=absolute_end,
+            )
             return [
                 Chunk(
                     doc_id=doc_id,
@@ -105,8 +150,8 @@ class SemanticChunker:
                     page_number=section.page,
                     text=text,
                     token_count=token_count(text),
-                    char_start=0,
-                    char_end=len(text),
+                    char_start=absolute_start,
+                    char_end=absolute_end,
                     chunk_hash=digest,
                 )
             ]
@@ -128,10 +173,7 @@ class SemanticChunker:
                     break
 
                 if not current and sentence_tokens > self.max_tokens:
-                    current.append(sentence)
-                    running_tokens += sentence_tokens
-                    cursor += 1
-                    break
+                    raise RuntimeError("Oversized sentence was not split before chunk assembly.")
 
                 current.append(sentence)
                 running_tokens += sentence_tokens
@@ -144,18 +186,29 @@ class SemanticChunker:
                 break
 
             chunk_text = " ".join(span.text for span in current).strip()
-            digest = chunk_hash(chunk_text)
+            chunk_position = base_position + local_position
+            section_offset = section.char_start if section.char_start is not None else 0
+            absolute_start = section_offset + current[0].start
+            absolute_end = section_offset + current[-1].end
+            digest = chunk_hash(
+                chunk_text,
+                section_heading=section.heading,
+                page_number=section.page,
+                position=chunk_position,
+                char_start=absolute_start,
+                char_end=absolute_end,
+            )
             chunks.append(
                 Chunk(
                     doc_id=doc_id,
                     chunk_id=str(uuid.uuid4()),
-                    position=base_position + local_position,
+                    position=chunk_position,
                     section_heading=section.heading,
                     page_number=section.page,
                     text=chunk_text,
                     token_count=running_tokens,
-                    char_start=current[0].start,
-                    char_end=current[-1].end,
+                    char_start=absolute_start,
+                    char_end=absolute_end,
                     chunk_hash=digest,
                 )
             )
@@ -175,10 +228,10 @@ class SemanticChunker:
                 if overlap_running >= self.overlap_tokens:
                     break
 
-            if overlap_start == start_index and cursor == start_index + 1:
-                start_index = cursor
-            else:
-                start_index = overlap_start
+            # Overlap must never prevent forward progress. This invariant also
+            # protects against a short overlapped prefix followed by a sentence
+            # that exactly fills or exceeds the remaining token budget.
+            start_index = max(overlap_start, start_index + 1)
 
         return chunks
 
@@ -188,12 +241,34 @@ class SemanticChunker:
             sentence_text = re.sub(r"\s+", " ", match.group(0)).strip()
             if not sentence_text:
                 continue
-            spans.append(
-                SentenceSpan(
-                    text=sentence_text,
-                    start=match.start(),
-                    end=match.end(),
-                    tokens=token_count(sentence_text),
+            sentence_tokens = token_count(sentence_text)
+            if sentence_tokens <= self.max_tokens:
+                spans.append(
+                    SentenceSpan(
+                        text=sentence_text,
+                        start=match.start(),
+                        end=match.end(),
+                        tokens=sentence_tokens,
+                    )
                 )
-            )
+                continue
+
+            token_matches = list(re.finditer(r"\S+", match.group(0)))
+            for offset in range(0, len(token_matches), self.max_tokens):
+                token_group = token_matches[offset : offset + self.max_tokens]
+                segment = " ".join(item.group(0) for item in token_group)
+                spans.append(
+                    SentenceSpan(
+                        text=segment,
+                        start=match.start() + token_group[0].start(),
+                        end=match.start() + token_group[-1].end(),
+                        tokens=len(token_group),
+                    )
+                )
         return spans
+
+    def _split_oversized_text(self, text: str) -> list[str]:
+        tokens = re.findall(r"\S+", text)
+        if not tokens:
+            return []
+        return [" ".join(tokens[index : index + self.max_tokens]) for index in range(0, len(tokens), self.max_tokens)]

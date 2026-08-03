@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import Settings
-from ingestion.chunker import SemanticChunker
+from ingestion.chunker import CHUNK_FINGERPRINT_VERSION, SemanticChunker
 from ingestion.coref import CoreferenceResolver
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
 from ingestion.relation_normalizer import canonicalize_relation
@@ -28,6 +29,10 @@ from models.ingestion import (
 def utc_now_iso() -> str:
     """Current UTC timestamp as ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+INGESTION_PIPELINE_VERSION = "phase0-stabilization-v2"
+STAGE_ORDER = {"PARSING": 1, "EXTRACTED": 2, "GRAPH_WRITTEN": 3, "VECTORS_WRITTEN": 4, "DONE": 5}
 
 
 class PhaseOnePipeline:
@@ -75,6 +80,22 @@ class PhaseOnePipeline:
             summary.add(self.ingest_file(file_path))
         return summary
 
+    def close(self) -> None:
+        """Close external clients owned by this pipeline."""
+        resources = [
+            self.graph_writer,
+            getattr(self.vector_indexer, "_client", None),
+            getattr(self.cross_doc_merger, "_qdrant_client", None),
+        ]
+        seen: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+
     def ingest_file(self, source_path: Path) -> FileIngestionResult:
         """Ingest a single file from Stage 1 through Stage 7."""
         started_at = utc_now_iso()
@@ -85,8 +106,15 @@ class PhaseOnePipeline:
         doc_format = detect_format(absolute_path)
         checksum = compute_sha256(absolute_path)
         existing_row = self.store.get_document_by_source(source_key)
+        target_stage = "DONE" if self.settings.enable_graph else "PARSING"
+        pipeline_fingerprint = self._pipeline_fingerprint(target_stage)
 
-        if existing_row is not None and str(existing_row["checksum"]) == checksum:
+        if existing_row is not None and self._is_active_generation_current(
+            existing_row,
+            checksum=checksum,
+            target_stage=target_stage,
+            pipeline_fingerprint=pipeline_fingerprint,
+        ):
             doc_id = str(existing_row["doc_id"])
             result = FileIngestionResult(
                 source_path=source_key,
@@ -105,9 +133,18 @@ class PhaseOnePipeline:
 
         action = IngestionAction.NEW if existing_row is None else IngestionAction.CHANGED
         doc_id = str(uuid.uuid4()) if existing_row is None else str(existing_row["doc_id"])
-        self.store.start_document(doc_id, source_key, doc_format, checksum)
+        force_full_reprocess = self._needs_full_reprocess(existing_row, checksum, pipeline_fingerprint)
 
         try:
+            self.store.start_document(
+                doc_id,
+                source_key,
+                doc_format,
+                checksum,
+                target_stage=target_stage,
+                pipeline_fingerprint=pipeline_fingerprint,
+                run_id=run_id,
+            )
             parsed = self.parser.parse_document(
                 source_path=absolute_path,
                 doc_id=doc_id,
@@ -117,6 +154,7 @@ class PhaseOnePipeline:
             chunks = self.chunker.chunk_document(resolved)
 
             old_hash_to_chunk_id = self.store.get_chunk_ids_by_hash(doc_id)
+            all_old_chunk_ids = sorted(set(old_hash_to_chunk_id.values()))
             for index, chunk in enumerate(chunks):
                 old_chunk_id = old_hash_to_chunk_id.get(chunk.chunk_hash)
                 if old_chunk_id:
@@ -130,7 +168,7 @@ class PhaseOnePipeline:
 
             self.store.delete_chunks_by_hashes(doc_id, removed)
             self.store.upsert_chunks(chunks)
-            self.store.finish_document(doc_id, resolved.metadata.word_count, "PARSING")
+            self.store.update_pipeline_stage(doc_id, "PARSING", word_count=resolved.metadata.word_count)
 
             delta = DeltaSummary(
                 added_chunk_hashes=added,
@@ -151,23 +189,33 @@ class PhaseOnePipeline:
                 ):
                     raise RuntimeError("Extraction components are not initialized.")
 
-                removed_chunk_ids = [old_hash_to_chunk_id[h] for h in removed if h in old_hash_to_chunk_id]
+                removed_chunk_ids = (
+                    all_old_chunk_ids
+                    if force_full_reprocess
+                    else [old_hash_to_chunk_id[h] for h in removed if h in old_hash_to_chunk_id]
+                )
                 entity_ids_to_retract: set[str] = set()
                 if removed_chunk_ids:
                     entity_ids_removed = self.store.get_entity_ids_for_chunks(doc_id, removed_chunk_ids)
+                    if force_full_reprocess:
+                        entity_ids_removed.update(
+                            str(entity["entity_id"])
+                            for entity in self.store.get_doc_entities(doc_id)
+                            if str(entity.get("entity_id") or "").strip()
+                        )
                     self.store.delete_entity_mentions_for_chunks(doc_id, removed_chunk_ids)
                     remaining_entities = self.store.get_entity_ids_with_mentions(doc_id)
                     entity_ids_to_retract = entity_ids_removed - remaining_entities
                     self.graph_writer.retract_chunks(doc_id, removed_chunk_ids)
-                    self.graph_writer.retract_entities(doc_id, entity_ids_to_retract)
+                    deleted_entity_ids = self.graph_writer.retract_entities(doc_id, entity_ids_to_retract) or set()
                     self.store.delete_doc_entities(doc_id, list(entity_ids_to_retract))
                     self.vector_indexer.delete_chunk_vectors(removed_chunk_ids)
-                    self.vector_indexer.delete_entity_vectors(list(entity_ids_to_retract))
+                    self.vector_indexer.delete_entity_vectors(sorted(deleted_entity_ids))
 
                 chunks_to_process = (
-                    [chunk for chunk in chunks if chunk.chunk_hash in added]
-                    if action is IngestionAction.CHANGED
-                    else chunks
+                    chunks
+                    if action is IngestionAction.NEW or force_full_reprocess
+                    else [chunk for chunk in chunks if chunk.chunk_hash in added]
                 )
 
                 extraction_entities = []
@@ -175,18 +223,22 @@ class PhaseOnePipeline:
                 entity_mentions: list[tuple[str, str, str, float]] = []
 
                 def run_extract(chunk):
-                    return chunk, self.extractor.extract(chunk.text, doc_format)
+                    raw_result = self.extractor.extract(chunk.text, doc_format)
+                    return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
 
                 max_workers = max(1, int(self.settings.gemini_max_workers))
                 if max_workers == 1 or len(chunks_to_process) <= 1:
-                    results_iter = (run_extract(chunk) for chunk in chunks_to_process)
+                    extraction_results = [run_extract(chunk) for chunk in chunks_to_process]
                 else:
                     workers = min(max_workers, len(chunks_to_process))
                     with ThreadPoolExecutor(max_workers=workers) as executor:
                         futures = [executor.submit(run_extract, chunk) for chunk in chunks_to_process]
-                        results_iter = (future.result() for future in as_completed(futures))
+                        extraction_results = [future.result() for future in as_completed(futures)]
 
-                for chunk, result in results_iter:
+                # Model calls may complete out of order. Downstream clustering
+                # and property conflict handling must remain deterministic.
+                extraction_results.sort(key=lambda item: (item[0].position, item[0].chunk_id))
+                for chunk, result in extraction_results:
                     extraction_entities.extend(result.entities)
                     extraction_relations.extend(
                         [
@@ -207,7 +259,7 @@ class PhaseOnePipeline:
                     for entity in result.entities:
                         entity_mentions.append((entity.entity_id, chunk.chunk_id, doc_id, 1.0))
 
-                existing_doc_entities = self.store.get_doc_entities(doc_id)
+                existing_doc_entities = [] if force_full_reprocess else self.store.get_doc_entities(doc_id)
                 disamb = self.disambiguator.disambiguate(extraction_entities, existing_doc_entities)
 
                 canonical_nodes = {}
@@ -318,18 +370,20 @@ class PhaseOnePipeline:
                     )
                     for chunk in chunks_to_process
                 ]
+                authoritative_entity_rows = self.graph_writer.get_entities_for_doc(doc_id)
                 entity_vector_inputs = [
                     EntityVectorInput(
-                        neo4j_node_id=node["id"],
-                        name=node["name"],
-                        entity_type=node["type"],
+                        neo4j_node_id=str(node.get("id") or ""),
+                        name=str(node.get("name") or ""),
+                        entity_type=str(node.get("type") or "Entity"),
                         summary=build_entity_summary(
-                            name=str(node["name"]),
-                            entity_type=str(node["type"]),
+                            name=str(node.get("name") or ""),
+                            entity_type=str(node.get("type") or "Entity"),
                             properties=node.get("properties", {}),
                         ),
                     )
-                    for node in canonical_nodes.values()
+                    for node in authoritative_entity_rows
+                    if str(node.get("id") or "").strip()
                 ]
                 self.vector_indexer.upsert_chunk_vectors(chunk_vector_inputs)
                 self.vector_indexer.upsert_entity_vectors(entity_vector_inputs)
@@ -341,7 +395,6 @@ class PhaseOnePipeline:
 
                 entities_created = merge_result.new_nodes
                 relations_created = len(mapped_edges)
-                self.store.finish_document(doc_id, resolved.metadata.word_count, "DONE")
 
             self._write_artifacts(
                 run_id=run_id,
@@ -350,6 +403,7 @@ class PhaseOnePipeline:
                 action=action,
                 delta=delta,
             )
+            self.store.finish_document(doc_id, resolved.metadata.word_count, target_stage)
             self.store.log_ingestion_run(
                 run_id=run_id,
                 doc_id=doc_id,
@@ -384,6 +438,89 @@ class PhaseOnePipeline:
                 skipped=False,
                 error=str(exc),
             )
+
+    def _pipeline_fingerprint(self, target_stage: str) -> str:
+        payload = {
+            "pipeline_version": INGESTION_PIPELINE_VERSION,
+            "chunk_fingerprint_version": CHUNK_FINGERPRINT_VERSION,
+            "target_stage": target_stage,
+            "coref_profile": self.settings.coref_profile,
+            "strict_coref": self.settings.strict_coref,
+            "chunk_target_tokens": self.settings.chunk_target_tokens,
+            "chunk_max_tokens": self.settings.chunk_max_tokens,
+            "chunk_overlap_tokens": self.settings.chunk_overlap_tokens,
+            "gemini_model": self.settings.gemini_model if self.settings.enable_graph else None,
+            "disamb_model": self.settings.disamb_model if self.settings.enable_graph else None,
+            "disamb_threshold": self.settings.disamb_threshold if self.settings.enable_graph else None,
+            "embedding_model_id": self.settings.embedding_model_id if self.settings.enable_graph else None,
+            "embedding_version": self.settings.embedding_version if self.settings.enable_graph else None,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _is_active_generation_current(
+        row,  # noqa: ANN001
+        *,
+        checksum: str,
+        target_stage: str,
+        pipeline_fingerprint: str,
+    ) -> bool:
+        active_checksum = str(row["active_checksum"] or row["checksum"] or "")
+        active_fingerprint = str(row["active_pipeline_fingerprint"] or "")
+        completed_stage = str(row["last_completed_stage"] or row["pipeline_stage"] or "")
+        return (
+            str(row["status"] or "") == "complete"
+            and active_checksum == checksum
+            and active_fingerprint == pipeline_fingerprint
+            and STAGE_ORDER.get(completed_stage, 0) >= STAGE_ORDER[target_stage]
+        )
+
+    @staticmethod
+    def _needs_full_reprocess(row, checksum: str, pipeline_fingerprint: str) -> bool:  # noqa: ANN001
+        if row is None:
+            return False
+        active_checksum = str(row["active_checksum"] or row["checksum"] or "")
+        desired_checksum = str(row["desired_checksum"] or "")
+        active_fingerprint = str(row["active_pipeline_fingerprint"] or "")
+        same_attempted_content = checksum in {active_checksum, desired_checksum}
+        return same_attempted_content and (
+            str(row["status"] or "") != "complete" or active_fingerprint != pipeline_fingerprint
+        )
+
+    @staticmethod
+    def _scope_extraction_result(chunk_id: str, result):  # noqa: ANN001, ANN205
+        """Namespace model-local entity IDs and validate relation endpoints."""
+        raw_to_scoped: dict[str, str] = {}
+        scoped_entities = []
+        for entity in result.entities:
+            raw_id = str(entity.entity_id or "").strip()
+            if not raw_id:
+                raise ValueError(f"Extraction returned an entity without an ID for chunk {chunk_id}.")
+            if raw_id in raw_to_scoped:
+                raise ValueError(f"Extraction returned duplicate entity ID {raw_id!r} for chunk {chunk_id}.")
+            scoped_id = f"{chunk_id}::{raw_id}"
+            raw_to_scoped[raw_id] = scoped_id
+            scoped_entities.append(replace(entity, entity_id=scoped_id))
+
+        scoped_relations = []
+        for relation in result.relations:
+            raw_head = str(relation.head_id or "").strip()
+            raw_tail = str(relation.tail_id or "").strip()
+            if raw_head not in raw_to_scoped or raw_tail not in raw_to_scoped:
+                raise ValueError(
+                    "Extraction relation references an entity outside its chunk: "
+                    f"{raw_head!r} -> {raw_tail!r} in chunk {chunk_id}."
+                )
+            scoped_relations.append(
+                replace(
+                    relation,
+                    head_id=raw_to_scoped[raw_head],
+                    tail_id=raw_to_scoped[raw_tail],
+                )
+            )
+
+        return replace(result, entities=scoped_entities, relations=scoped_relations)
 
     def _discover_files(self, input_path: Path, recursive: bool) -> list[Path]:
         if not input_path.exists():

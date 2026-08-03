@@ -153,6 +153,9 @@ class GraphRAGResponse:
     confidence: float = 0.0
     query_type: str = QueryType.LOCAL.value
     retrieval_sources: list[str] = field(default_factory=list)
+    degraded: bool = False
+    warnings: list[str] = field(default_factory=list)
+    confidence_kind: str = "retrieval_score"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,6 +165,9 @@ class GraphRAGResponse:
             "confidence": float(self.confidence),
             "query_type": self.query_type,
             "retrieval_sources": list(self.retrieval_sources),
+            "degraded": bool(self.degraded),
+            "warnings": list(self.warnings),
+            "confidence_kind": self.confidence_kind,
         }
 
     @classmethod
@@ -184,4 +190,7 @@ class GraphRAGResponse:
             confidence=float(payload.get("confidence") or 0.0),
             query_type=str(payload.get("query_type") or QueryType.LOCAL.value),
             retrieval_sources=[str(item) for item in payload.get("retrieval_sources", [])],
+            degraded=bool(payload.get("degraded", False)),
+            warnings=[str(item) for item in payload.get("warnings", [])],
+            confidence_kind=str(payload.get("confidence_kind") or "retrieval_score"),
         )
