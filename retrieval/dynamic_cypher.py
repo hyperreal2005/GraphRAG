@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config import Settings
+from generation.model_adapter import build_generate_config
 from models.query import LinkedEntity, QueryAnalysis, QueryType
 
 
@@ -147,12 +148,14 @@ class DynamicCypherPlanner:
             )
             rel_types = self._safe_list(
                 session.run(
-                    "MATCH ()-[r]->() RETURN collect(DISTINCT coalesce(type(r), 'RELATED_TO')) AS values"
+                    "MATCH (a:Assertion {active: true}) "
+                    "RETURN collect(DISTINCT coalesce(a.predicate_normalized, 'RELATED_TO')) AS values"
                 ).single()
             )
             rel_keys = self._safe_list(
                 session.run(
-                    "MATCH ()-[r]->() UNWIND keys(r) AS key RETURN collect(DISTINCT key) AS values"
+                    "MATCH (a:Assertion {active: true}) UNWIND keys(a) AS key "
+                    "RETURN collect(DISTINCT key) AS values"
                 ).single()
             )
 
@@ -272,7 +275,10 @@ class DynamicCypherPlanner:
     def _generate_payload(self, prompt: str) -> str:
         config = None
         if self._types is not None:
-            config = self._types.GenerateContentConfig(
+            model_id = str(self.settings.query_graph_dynamic_model or self.settings.gemini_model)
+            config = build_generate_config(
+                self._types,
+                model_id,
                 temperature=float(self.settings.query_graph_dynamic_temperature),
                 response_mime_type="application/json",
             )

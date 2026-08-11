@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +20,8 @@ class ChunkVectorInput:
     section_heading: str | None
     page: int | None
     entity_ids_mentioned: list[str] = field(default_factory=list)
+    document_version_id: str | None = None
+    active: bool = True
 
 
 @dataclass
@@ -26,6 +30,9 @@ class EntityVectorInput:
     name: str
     entity_type: str
     summary: str
+    document_version_id: str | None = None
+    doc_id: str | None = None
+    active: bool = True
 
 
 def _coerce_properties(value: Any) -> dict[str, Any]:
@@ -108,6 +115,14 @@ class QdrantVectorIndexer:
                         "section_heading": item.section_heading,
                         "page": item.page,
                         "entity_ids_mentioned": sorted(set(item.entity_ids_mentioned)),
+                        "document_version_id": item.document_version_id,
+                        "active": bool(item.active),
+                        "embedding_model_id": self.settings.embedding_model_id,
+                        "embedding_dimension": int(self.settings.embedding_dim),
+                        "embedding_normalization_policy": self.settings.embedding_normalization_policy,
+                        "embedding_prompt_version": self.settings.embedding_prompt_version,
+                        "embedding_schema_version": self.settings.embedding_version,
+                        "content_sha256": hashlib.sha256(item.text.encode("utf-8")).hexdigest(),
                     },
                 }
             )
@@ -129,13 +144,21 @@ class QdrantVectorIndexer:
         for item, vector in zip(inputs, vectors):
             points.append(
                 {
-                    "id": item.neo4j_node_id,
+                    "id": self._entity_point_id(item),
                     "vector": vector,
                     "payload": {
                         "neo4j_node_id": item.neo4j_node_id,
                         "name": item.name,
                         "type": item.entity_type,
                         "summary": item.summary,
+                        "doc_id": item.doc_id,
+                        "document_version_id": item.document_version_id,
+                        "active": bool(item.active),
+                        "embedding_model_id": self.settings.embedding_model_id,
+                        "embedding_dimension": int(self.settings.embedding_dim),
+                        "embedding_normalization_policy": self.settings.embedding_normalization_policy,
+                        "embedding_prompt_version": self.settings.embedding_prompt_version,
+                        "embedding_schema_version": self.settings.embedding_version,
                     },
                 }
             )
@@ -152,6 +175,94 @@ class QdrantVectorIndexer:
     def delete_entity_vectors(self, entity_ids: list[str]) -> None:
         """Delete stale entity vector points by entity IDs."""
         self._delete_points(self.settings.qdrant_entities_collection, entity_ids)
+
+    def delete_version_entity_vectors(
+        self,
+        document_version_id: str,
+        entity_ids: list[str],
+    ) -> None:
+        """Delete selected entity points within exactly one document version."""
+        point_ids = [
+            str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"graphrag:entity-vector:{document_version_id}:{entity_id}",
+                )
+            )
+            for entity_id in sorted(set(entity_ids))
+            if entity_id
+        ]
+        self._delete_points(self.settings.qdrant_entities_collection, point_ids)
+
+    def set_document_version_active(self, document_version_id: str, active: bool) -> None:
+        """Flip one staged version in both authoritative vector collections."""
+        payload = {"active": bool(active)}
+        for collection in (
+            self.settings.qdrant_chunks_collection,
+            self.settings.qdrant_entities_collection,
+        ):
+            self._client.set_payload(
+                collection_name=collection,
+                payload=payload,
+                points=self._version_filter(document_version_id),
+                wait=True,
+            )
+
+    def delete_document_version(self, document_version_id: str) -> None:
+        """Delete vector points owned by exactly one immutable document version."""
+        selector = self._version_filter(document_version_id)
+        for collection in (
+            self.settings.qdrant_chunks_collection,
+            self.settings.qdrant_entities_collection,
+        ):
+            self._client.delete(
+                collection_name=collection,
+                points_selector=selector,
+                wait=True,
+            )
+
+    def count_document_version(self, document_version_id: str) -> dict[str, int]:
+        """Return exact staged counts for activation integrity checks."""
+        return {
+            "chunks": self._count(self.settings.qdrant_chunks_collection, document_version_id),
+            "entities": self._count(self.settings.qdrant_entities_collection, document_version_id),
+        }
+
+    def _count(self, collection_name: str, document_version_id: str) -> int:
+        response = self._client.count(
+            collection_name=collection_name,
+            count_filter=self._version_filter(document_version_id),
+            exact=True,
+        )
+        if isinstance(response, dict):
+            return int(response.get("count") or 0)
+        return int(getattr(response, "count", 0) or 0)
+
+    def _entity_point_id(self, item: EntityVectorInput) -> str:
+        if not item.document_version_id:
+            return item.neo4j_node_id
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"graphrag:entity-vector:{item.document_version_id}:{item.neo4j_node_id}",
+            )
+        )
+
+    def _version_filter(self, document_version_id: str) -> Any:
+        if self._models is not None:
+            return self._models.Filter(
+                must=[
+                    self._models.FieldCondition(
+                        key="document_version_id",
+                        match=self._models.MatchValue(value=document_version_id),
+                    )
+                ]
+            )
+        return {
+            "must": [
+                {"key": "document_version_id", "match": {"value": document_version_id}}
+            ]
+        }
 
     def _delete_points(self, collection_name: str, point_ids: list[str]) -> None:
         if not point_ids:
@@ -178,6 +289,11 @@ class QdrantVectorIndexer:
         if size is not None and int(size) != int(self.settings.embedding_dim):
             raise RuntimeError(
                 f"Qdrant collection '{name}' has vector size {size}, expected {self.settings.embedding_dim}."
+            )
+        distance = self._extract_vector_distance(info)
+        if distance is not None and str(distance).lower().split(".")[-1] != "cosine":
+            raise RuntimeError(
+                f"Qdrant collection '{name}' uses distance {distance}, expected cosine."
             )
 
     def _create_collection(self, name: str) -> None:
@@ -210,4 +326,22 @@ class QdrantVectorIndexer:
             default_size = getattr(default, "size", None)
             if default_size is not None:
                 return int(default_size)
+        return None
+
+    def _extract_vector_distance(self, info: Any) -> str | None:
+        config = getattr(info, "config", None)
+        params = getattr(config, "params", None)
+        vectors = getattr(params, "vectors", None)
+        if vectors is None:
+            return None
+        distance = getattr(vectors, "distance", None)
+        if distance is not None:
+            return str(distance)
+        if isinstance(vectors, dict):
+            default = vectors.get("")
+            if isinstance(default, dict) and default.get("distance") is not None:
+                return str(default["distance"])
+            nested = getattr(default, "distance", None)
+            if nested is not None:
+                return str(nested)
         return None

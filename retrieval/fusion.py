@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 from pathlib import Path
 from typing import Iterable
@@ -63,6 +64,7 @@ class FusionEngine:
         merged.extend(graph_results)
         merged.extend(vector_results)
         merged.extend(community_results)
+        self._ensure_evidence_ids(merged)
 
         deduped = self._dedupe_and_score(merged)
         ranked = sorted(deduped.values(), key=self._ranking_score, reverse=True)
@@ -76,7 +78,11 @@ class FusionEngine:
         packed_items, context_text = self._pack_context(prioritized)
         top_scores = [self._confidence_score(item) for item in packed_items[:3]]
         citations = self._build_citations(packed_items)
-        graph_paths = [item.text_or_path for item in packed_items if item.source_type == "graph" and item.text_or_path]
+        graph_paths = [
+            str(item.provenance.get("graph_path") or item.text_or_path)
+            for item in packed_items
+            if item.source_type == "graph" and item.text_or_path
+        ]
         retrieval_sources = list(dict.fromkeys(item.source_type for item in packed_items))
         logger.info(
             "fusion_rerank mode=%s merged=%d deduped=%d selected=%d",
@@ -163,31 +169,59 @@ class FusionEngine:
         return max(0.0, min(1.0, score))
 
     def _build_citations(self, results: list[RetrieverResult]) -> list[Citation]:
-        vector_items = [item for item in results if item.source_type == "vector"]
-        doc_name_map = self._build_doc_name_map(vector_items)
+        citable_items = [item for item in results if item.provenance.get("chunk_id")]
+        doc_name_map = self._build_doc_name_map(citable_items)
         citations: list[Citation] = []
-        seen_chunks: set[str] = set()
+        by_chunk: dict[str, Citation] = {}
         max_citations = max(1, int(self.settings.query_citation_max))
 
-        for item in vector_items:
-            if len(citations) >= max_citations:
-                break
+        for item in citable_items:
             chunk_id = str(item.provenance.get("chunk_id") or item.source_id or "")
-            if not chunk_id or chunk_id in seen_chunks:
+            if not chunk_id:
                 continue
-            seen_chunks.add(chunk_id)
+            evidence_id = str(item.provenance.get("evidence_id") or "")
+            assertion_id = str(item.provenance.get("assertion_id") or "")
+            existing = by_chunk.get(chunk_id)
+            if existing is not None:
+                if evidence_id and evidence_id not in existing.evidence_ids:
+                    existing.evidence_ids.append(evidence_id)
+                if assertion_id and assertion_id not in existing.assertion_ids:
+                    existing.assertion_ids.append(assertion_id)
+                continue
+            if len(citations) >= max_citations:
+                continue
             doc_id = item.provenance.get("doc_id")
             page = item.provenance.get("page")
-            citations.append(
-                Citation(
-                    chunk_id=chunk_id,
-                    doc_id=str(doc_id) if doc_id else None,
-                    doc_name=doc_name_map.get(str(doc_id), str(doc_id) if doc_id else None),
-                    page=int(page) if isinstance(page, int) or (isinstance(page, str) and page.isdigit()) else None,
-                    excerpt=self._trim_excerpt(item.text_or_path),
-                )
+            excerpt = str(item.provenance.get("evidence_text") or item.text_or_path)
+            citation = Citation(
+                citation_id=f"citation:{chunk_id}",
+                chunk_id=chunk_id,
+                doc_id=str(doc_id) if doc_id else None,
+                doc_name=doc_name_map.get(str(doc_id), str(doc_id) if doc_id else None),
+                page=int(page) if isinstance(page, int) or (isinstance(page, str) and page.isdigit()) else None,
+                excerpt=self._trim_excerpt(excerpt),
+                evidence_ids=[evidence_id] if evidence_id else [],
+                assertion_ids=[assertion_id] if assertion_id else [],
             )
+            citations.append(citation)
+            by_chunk[chunk_id] = citation
         return citations
+
+    def _ensure_evidence_ids(self, results: list[RetrieverResult]) -> None:
+        for item in results:
+            existing = item.provenance.get("evidence_id")
+            if isinstance(existing, str) and existing:
+                continue
+            if item.source_type == "vector":
+                chunk_id = str(item.provenance.get("chunk_id") or item.source_id)
+                item.provenance["evidence_id"] = f"chunk:{chunk_id}"
+            elif item.source_type == "graph" and item.provenance.get("assertion_id"):
+                item.provenance["evidence_id"] = f"assertion:{item.provenance['assertion_id']}"
+            else:
+                digest = hashlib.sha256(
+                    f"{item.source_type}|{item.source_id}|{item.text_or_path}".encode("utf-8")
+                ).hexdigest()[:20]
+                item.provenance["evidence_id"] = f"{item.source_type}:{digest}"
 
     def _is_boilerplate_chunk(self, text: str) -> bool:
         normalized = " ".join((text or "").lower().split())
@@ -256,13 +290,14 @@ class FusionEngine:
         return packed, "\n".join(lines)
 
     def _context_block(self, item: RetrieverResult) -> str:
+        evidence_id = str(item.provenance.get("evidence_id") or item.source_id)
         if item.source_type == "graph":
-            return f"[GRAPH PATH]\n{item.text_or_path}"
+            return f"[EVIDENCE id={evidence_id} type=graph_assertion]\n{item.text_or_path}"
         if item.source_type == "community":
-            return f"[COMMUNITY SUMMARY]\n{item.text_or_path}"
+            return f"[EVIDENCE id={evidence_id} type=community]\n{item.text_or_path}"
         chunk_id = str(item.provenance.get("chunk_id") or item.source_id)
         doc_id = item.provenance.get("doc_id")
         section = item.provenance.get("section_heading")
         page = item.provenance.get("page")
         source_line = f"Source: doc_id={doc_id}, chunk_id={chunk_id}, section={section}, page={page}"
-        return f"[DOCUMENT CHUNK]\n{source_line}\nText: {item.text_or_path}"
+        return f"[EVIDENCE id={evidence_id} type=document_chunk]\n{source_line}\nText: {item.text_or_path}"

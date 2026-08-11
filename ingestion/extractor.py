@@ -3,38 +3,18 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from config import Settings
+from generation.model_adapter import build_generate_config
 from models.extraction import ExtractedEntity, ExtractionResult
 
 
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
-
-CANONICAL_RELATION_LABELS = (
-    "USES",
-    "PROVIDES",
-    "IMPROVES",
-    "SUPPORTS",
-    "REQUIRES",
-    "INCLUDES",
-    "INTEGRATES",
-    "STORES",
-    "PROCESSES",
-    "ACCESSES",
-    "ANALYZES",
-    "TARGETS",
-    "PART_OF",
-    "TYPE_OF",
-    "DEVELOPED_BY",
-    "EVALUATED_WITH",
-    "PUBLISHED_IN",
-    "LOCATED_IN",
-    "RELATED_TO",
-)
-
 
 @dataclass
 class ExtractorStats:
@@ -73,15 +53,58 @@ class GeminiExtractor:
             entities = None
             prompt = self._prompt_full(chunk_text)
 
-        try:
-            parsed = self._generate(prompt)
-        except RuntimeError:
-            parsed = self._generate(self._repair_prompt(prompt))
-        result = ExtractionResult.from_dict(parsed)
+        attempts = max(1, int(self.settings.extraction_max_attempts))
+        current_prompt = prompt
+        last_error: Exception | None = None
+        result: ExtractionResult | None = None
+        for attempt in range(attempts):
+            try:
+                result = ExtractionResult.from_dict(self._generate(current_prompt))
+                if entities is not None and entities:
+                    result.entities = entities
+                self._validate_result_integrity(result)
+                break
+            except Exception as exc:
+                last_error = exc
+                result = None
+                if attempt + 1 >= attempts:
+                    break
+                current_prompt = self._repair_prompt(prompt, str(exc))
+                base = max(0.0, float(self.settings.extraction_retry_base_seconds))
+                delay = base * (2**attempt) + random.uniform(0.0, min(0.25, base))
+                if delay > 0:
+                    time.sleep(delay)
+        if result is None:
+            raise RuntimeError(f"Extraction failed after {attempts} attempts: {last_error}") from last_error
 
-        if entities is not None and entities:
-            result.entities = entities
         return result
+
+    @staticmethod
+    def _validate_result_integrity(result: ExtractionResult) -> None:
+        entity_ids = [entity.entity_id for entity in result.entities]
+        duplicate_ids = sorted(
+            entity_id for entity_id in set(entity_ids) if entity_ids.count(entity_id) > 1
+        )
+        if duplicate_ids:
+            raise ValueError(
+                "Entity IDs must be unique within the entities array; "
+                f"duplicate IDs: {', '.join(duplicate_ids[:5])}."
+            )
+        GeminiExtractor._validate_relation_endpoints(result)
+
+    @staticmethod
+    def _validate_relation_endpoints(result: ExtractionResult) -> None:
+        entity_ids = {entity.entity_id for entity in result.entities}
+        invalid = [
+            f"{relation.head_id!r}->{relation.tail_id!r}"
+            for relation in result.relations
+            if relation.head_id not in entity_ids or relation.tail_id not in entity_ids
+        ]
+        if invalid:
+            raise ValueError(
+                "Relation endpoints must exactly match IDs from the entities array; "
+                f"invalid endpoints: {', '.join(invalid[:5])}."
+            )
 
     def _build_response_schema(self) -> Any:
         properties_schema = self._genai_types.Schema(type="OBJECT")
@@ -93,6 +116,7 @@ class GeminiExtractor:
                 "name": self._genai_types.Schema(type="STRING", min_length=1),
                 "type": self._genai_types.Schema(type="STRING", min_length=1),
                 "properties": properties_schema,
+                "confidence": self._genai_types.Schema(type="NUMBER", minimum=0.0, maximum=1.0),
             },
         )
         relation_schema = self._genai_types.Schema(
@@ -115,13 +139,14 @@ class GeminiExtractor:
                     min_length=1,
                     max_length=64,
                     pattern=r"^[A-Z][A-Z0-9_]*$",
-                    enum=list(CANONICAL_RELATION_LABELS),
                 ),
                 "raw_relation": self._genai_types.Schema(type="STRING", min_length=1, max_length=128),
                 "tail": self._genai_types.Schema(type="STRING", min_length=1),
                 "tail_type": self._genai_types.Schema(type="STRING", min_length=1),
                 "properties": properties_schema,
                 "confidence": self._genai_types.Schema(type="NUMBER", minimum=0.0, maximum=1.0),
+                "valid_from": self._genai_types.Schema(type="STRING"),
+                "valid_until": self._genai_types.Schema(type="STRING"),
             },
         )
         return self._genai_types.Schema(
@@ -137,7 +162,9 @@ class GeminiExtractor:
         response = self._client.models.generate_content(
             model=self.settings.gemini_model,
             contents=prompt,
-            config=self._genai_types.GenerateContentConfig(
+            config=build_generate_config(
+                self._genai_types,
+                self.settings.gemini_model,
                 response_mime_type="application/json",
                 response_schema=self._response_schema,
             ),
@@ -172,14 +199,14 @@ class GeminiExtractor:
             "  header/footer metadata (ISSN, copyright lines, repeated page header text),\n"
             "  unless central to the chunk's main claim.\n"
             "- Infer entity types and relation types from the text itself.\n"
-            "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
+            "- Infer relation labels from the evidence without using a predefined ontology.\n"
+            "- Relation labels must be concise uppercase SNAKE_CASE base verbs.\n"
             "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
             "  Example: \"is designed to improve\" -> \"IMPROVES\".\n"
-            "- relation must be chosen from this canonical set:\n"
-            f"  {', '.join(CANONICAL_RELATION_LABELS)}.\n"
-            "- If none clearly fits, use RELATED_TO.\n"
             "- raw_relation must preserve the exact surface phrasing from the chunk\n"
             "  before canonical mapping (e.g. \"is designed to improve\").\n"
+            "- valid_from and valid_until are optional. Populate them only when the\n"
+            "  text explicitly states a validity interval; otherwise omit them.\n"
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
             "- Keep extraction concise. Output zero entities/relations when the chunk\n"
             "  lacks meaningful graph facts.\n"
@@ -188,7 +215,7 @@ class GeminiExtractor:
             "Output format:\n"
             "{\n"
             "\"entities\": [\n"
-            "{\"id\": \"e1\", \"name\": \"...\", \"type\": \"...\", \"properties\": {...}}\n"
+            "{\"id\": \"e1\", \"name\": \"...\", \"type\": \"...\", \"properties\": {...}, \"confidence\": 0.9}\n"
             "],\n"
             "\"relations\": [\n"
             "{\n"
@@ -199,7 +226,9 @@ class GeminiExtractor:
             "\"tail\": \"e2\",\n"
             "\"tail_type\": \"Organisation\",\n"
             "\"properties\": {\"year\": 2003},\n"
-            "\"confidence\": 0.95\n"
+            "\"confidence\": 0.95,\n"
+            "\"valid_from\": \"2003\",\n"
+            "\"valid_until\": \"2019\"\n"
             "}\n"
             "]\n"
             "}\n"
@@ -219,13 +248,12 @@ class GeminiExtractor:
             "- Use ONLY the provided entities. Do not invent new entities.\n"
             "- Extract ONLY explicit, meaningful relationships.\n"
             "- Ignore bibliography/reference style statements and boilerplate metadata.\n"
-            "- Relation labels must be 1-3 words, uppercase SNAKE_CASE, base verb.\n"
+            "- Infer relation labels from the evidence without using a predefined ontology.\n"
+            "- Relation labels must be concise uppercase SNAKE_CASE base verbs.\n"
             "  Drop auxiliaries like CAN, ABLE_TO, DESIGNED_TO, AIMS_TO.\n"
-            "- relation must be chosen from this canonical set:\n"
-            f"  {', '.join(CANONICAL_RELATION_LABELS)}.\n"
-            "- If none clearly fits, use RELATED_TO.\n"
             "- raw_relation must preserve the exact surface phrasing from the chunk\n"
             "  before canonical mapping.\n"
+            "- valid_from and valid_until are optional and must be evidence-explicit.\n"
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
             "- Prefer precision over recall; omit uncertain relations.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
@@ -279,13 +307,17 @@ class GeminiExtractor:
         sanitized = re.sub(r",\s*([}\]])", r"\1", sanitized)
         return sanitized.strip()
 
-    def _repair_prompt(self, previous_prompt: str) -> str:
+    def _repair_prompt(self, previous_prompt: str, validation_error: str = "") -> str:
         return (
             "SYSTEM:\n"
             "Re-run the extraction task below and return ONLY strict JSON with keys\n"
             "\"entities\" and \"relations\". Do not include any markdown or explanation.\n"
             "Each relation must include head, head_type, relation, raw_relation, tail,\n"
             "tail_type, properties, and confidence.\n"
+            "CRITICAL: every entity id must be non-empty and unique within the entities array.\n"
+            "CRITICAL: relation head and tail values must be exact entity id values\n"
+            "from the entities array (for example e1), never entity names.\n"
+            f"Previous validation error: {validation_error}\n"
             "If nothing can be extracted, return {\"entities\": [], \"relations\": []}.\n"
             f"TASK:\n{previous_prompt}\n"
         )

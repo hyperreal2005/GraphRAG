@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from config import Settings
@@ -23,13 +24,19 @@ class EntityLinker:
 
         if client is not None:
             self._client = client
+            self._async_client = None
             return
         try:
-            from qdrant_client import QdrantClient
+            from qdrant_client import AsyncQdrantClient, QdrantClient
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("qdrant-client package is required for entity linking.") from exc
 
         self._client = QdrantClient(
+            url=self.settings.qdrant_url,
+            api_key=self.settings.qdrant_api_key,
+            timeout=self.settings.qdrant_timeout_seconds,
+        )
+        self._async_client = AsyncQdrantClient(
             url=self.settings.qdrant_url,
             api_key=self.settings.qdrant_api_key,
             timeout=self.settings.qdrant_timeout_seconds,
@@ -39,20 +46,30 @@ class EntityLinker:
         """Resolve mention strings to graph entity IDs with thresholded decisions."""
         if not mentions:
             return []
-        results: list[LinkedEntity] = []
-        for mention in mentions:
-            mention_text = mention.strip()
-            if not mention_text:
-                continue
-            results.append(self._link_single_mention(mention_text))
-        return results
-
-    def _link_single_mention(self, mention: str) -> LinkedEntity:
-        query_vector = self.embedder.embed_texts(
-            [mention],
+        clean_mentions = [mention.strip() for mention in mentions if mention.strip()]
+        if not clean_mentions:
+            return []
+        vectors = self.embedder.embed_texts(
+            clean_mentions,
             task_type=self.settings.query_embedding_task_type,
-        )[0]
+        )
+        if len(vectors) != len(clean_mentions):
+            raise RuntimeError("Entity-link embedding output length mismatch.")
+        return [
+            self._link_single_mention(mention, vector)
+            for mention, vector in zip(clean_mentions, vectors)
+        ]
+
+    def _link_single_mention(self, mention: str, query_vector: list[float]) -> LinkedEntity:
         points = self._search_entities(query_vector, limit=3)
+        return self._link_from_points(mention, points)
+
+    def _link_from_points(self, mention: str, points: list[Any]) -> LinkedEntity:
+        points = [
+            point
+            for point in points
+            if self._embedding_payload_matches(self._extract_payload(point))
+        ]
         if not points:
             return LinkedEntity(mention=mention, status="unresolved", similarity=0.0)
 
@@ -65,8 +82,13 @@ class EntityLinker:
             for point in points
         ]
         candidate_ids = [item for item in candidate_ids if item]
+        second_score = float(self._extract_score(points[1])) if len(points) > 1 else 0.0
+        score_margin = best_score - second_score
 
-        if best_score >= float(self.settings.entity_link_resolve_threshold):
+        if (
+            best_score >= float(self.settings.entity_link_resolve_threshold)
+            and score_margin >= float(self.settings.entity_link_resolve_margin)
+        ):
             return LinkedEntity(
                 mention=mention,
                 status="resolved",
@@ -93,17 +115,70 @@ class EntityLinker:
             candidate_ids=candidate_ids[:3],
         )
 
+    async def alink_entities(self, mentions: list[str]) -> list[LinkedEntity]:
+        """Link mentions through Gemini/Qdrant async clients when available."""
+        if self._async_client is None:
+            return await asyncio.to_thread(self.link_entities, mentions)
+        clean_mentions = [mention.strip() for mention in mentions if mention.strip()]
+        if not clean_mentions:
+            return []
+        async_embed = getattr(self.embedder, "aembed_texts", None)
+        if callable(async_embed):
+            vectors = await async_embed(
+                clean_mentions,
+                task_type=self.settings.query_embedding_task_type,
+            )
+        else:
+            vectors = await asyncio.to_thread(
+                self.embedder.embed_texts,
+                clean_mentions,
+                self.settings.query_embedding_task_type,
+            )
+        point_groups = await asyncio.gather(
+            *(self._asearch_entities(vector, limit=3) for vector in vectors)
+        )
+        return [
+            self._link_from_points(mention, points)
+            for mention, points in zip(clean_mentions, point_groups)
+        ]
+
+    async def _asearch_entities(self, query_vector: list[float], limit: int) -> list[Any]:
+        response = await self._async_client.query_points(
+            collection_name=self.settings.qdrant_entities_collection,
+            query=query_vector,
+            query_filter=self._active_filter(),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return self._extract_points(response)
+
+    async def aclose(self) -> None:
+        if self._async_client is not None:
+            await self._async_client.close()
+
     def _search_entities(self, query_vector: list[float], limit: int) -> list[Any]:
+        query_filter = self._active_filter()
         query_points_error: Exception | None = None
         if hasattr(self._client, "query_points"):
             try:
-                response = self._client.query_points(
-                    collection_name=self.settings.qdrant_entities_collection,
-                    query=query_vector,
-                    limit=limit,
-                    with_payload=True,
-                    with_vectors=False,
-                )
+                try:
+                    response = self._client.query_points(
+                        collection_name=self.settings.qdrant_entities_collection,
+                        query=query_vector,
+                        query_filter=query_filter,
+                        limit=limit,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                except TypeError:
+                    response = self._client.query_points(
+                        collection_name=self.settings.qdrant_entities_collection,
+                        query=query_vector,
+                        limit=limit,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
                 # An empty result is a successful query, not a signal to call
                 # legacy methods that may not exist on modern clients.
                 return self._extract_points(response)
@@ -114,6 +189,7 @@ class EntityLinker:
             response = self._client.search(
                 collection_name=self.settings.qdrant_entities_collection,
                 query_vector=query_vector,
+                query_filter=query_filter,
                 limit=limit,
                 with_payload=True,
             )
@@ -123,6 +199,7 @@ class EntityLinker:
             response = self._client.search_points(
                 collection_name=self.settings.qdrant_entities_collection,
                 query_vector=query_vector,
+                query_filter=query_filter,
                 limit=limit,
                 with_payload=True,
             )
@@ -168,3 +245,29 @@ class EntityLinker:
         if candidate is None:
             return None
         return str(candidate)
+
+    def _embedding_payload_matches(self, payload: dict[str, Any]) -> bool:
+        if not self.settings.enforce_embedding_metadata:
+            return True
+        return (
+            payload.get("embedding_model_id") == self.settings.embedding_model_id
+            and int(payload.get("embedding_dimension") or 0) == int(self.settings.embedding_dim)
+            and payload.get("embedding_prompt_version") == self.settings.embedding_prompt_version
+            and payload.get("embedding_schema_version") == self.settings.embedding_version
+            and payload.get("active") is True
+        )
+
+    @staticmethod
+    def _active_filter() -> Any:
+        try:
+            from qdrant_client.http import models
+        except Exception:
+            return {"must": [{"key": "active", "match": {"value": True}}]}
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="active",
+                    match=models.MatchValue(value=True),
+                )
+            ]
+        )

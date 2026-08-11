@@ -21,7 +21,7 @@ class Settings:
     strict_coref: bool = True
     enable_graph: bool = True
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.1-flash-lite"
+    gemini_model: str = "gemini-3.5-flash-lite"
     gemini_max_workers: int = 2
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
@@ -47,15 +47,21 @@ class Settings:
     )
     disamb_model: str = "all-MiniLM-L6-v2"
     disamb_threshold: float = 0.92
-    cross_doc_auto_merge_threshold: float = 0.90
-    cross_doc_llm_min_threshold: float = 0.75
-    cross_doc_llm_max_threshold: float = 0.90
+    cross_doc_auto_merge_threshold: float = 0.95
+    cross_doc_llm_min_threshold: float = 0.80
+    cross_doc_llm_max_threshold: float = 0.95
     cross_doc_candidate_k: int = 5
+    cross_doc_auto_merge_margin: float = 0.05
+    cross_doc_llm_confidence_threshold: float = 0.90
     cross_doc_same_type_required_for_auto: bool = True
     cross_doc_llm_enabled: bool = True
-    embedding_model_id: str = "gemini-embedding-001"
+    embedding_model_id: str = "gemini-embedding-2"
     embedding_dim: int = 3072
-    embedding_version: str = "v1"
+    embedding_version: str = "embedding2-3072-r1"
+    embedding_prompt_version: str = "embedding2-r1-v1"
+    embedding_normalization_policy: str = "provider-default"
+    embedding_document_prefix: str = "task: search result | title: {title} | text: "
+    embedding_query_prefix: str = "task: search result | query: "
     gemini_embedding_task_type: str = "RETRIEVAL_DOCUMENT"
     embedding_batch_size: int = 32
     qdrant_url: str = "http://localhost:6333"
@@ -65,9 +71,19 @@ class Settings:
     qdrant_entities_collection: str = "entities"
     qdrant_communities_collection: str = "communities"
     auto_backfill_vectors: bool = True
+    extraction_prompt_version: str = "assertion-r1-v1"
+    assertion_review_confidence_threshold: float = 0.50
+    extraction_max_attempts: int = 3
+    extraction_retry_base_seconds: float = 1.0
+    graph_schema_version: int = 2
+    outbox_max_attempts: int = 5
+    outbox_retry_base_seconds: float = 1.0
+    outbox_lease_seconds: float = 60.0
     query_embedding_task_type: str = "RETRIEVAL_QUERY"
     entity_link_resolve_threshold: float = 0.85
     entity_link_ambiguous_threshold: float = 0.70
+    entity_link_resolve_margin: float = 0.05
+    enforce_embedding_metadata: bool = True
     query_vector_top_k: int = 15
     query_mmr_enabled: bool = True
     query_mmr_lambda: float = 0.65
@@ -75,6 +91,12 @@ class Settings:
     query_graph_local_hops: int = 3
     query_graph_multihop_hops: int = 4
     query_graph_path_limit: int = 25
+    query_analysis_timeout_seconds: float = 15.0
+    query_entity_link_timeout_seconds: float = 20.0
+    query_graph_timeout_seconds: float = 15.0
+    query_vector_timeout_seconds: float = 15.0
+    query_rerank_timeout_seconds: float = 15.0
+    query_generation_timeout_seconds: float = 45.0
     # Raw LLM-generated Cypher is intentionally opt-in. The default query path
     # uses application-owned, bounded Cypher templates.
     query_graph_dynamic_enabled: bool = False
@@ -142,6 +164,18 @@ class Settings:
             self.cross_doc_candidate_k = int(os.getenv("CROSS_DOC_CANDIDATE_K", self.cross_doc_candidate_k))
         except ValueError:
             self.cross_doc_candidate_k = self.cross_doc_candidate_k
+        try:
+            self.cross_doc_auto_merge_margin = float(
+                os.getenv("CROSS_DOC_AUTO_MERGE_MARGIN", self.cross_doc_auto_merge_margin)
+            )
+        except ValueError:
+            self.cross_doc_auto_merge_margin = self.cross_doc_auto_merge_margin
+        try:
+            self.cross_doc_llm_confidence_threshold = float(
+                os.getenv("CROSS_DOC_LLM_CONFIDENCE_THRESHOLD", self.cross_doc_llm_confidence_threshold)
+            )
+        except ValueError:
+            self.cross_doc_llm_confidence_threshold = self.cross_doc_llm_confidence_threshold
         try:
             self.qdrant_timeout_seconds = float(os.getenv("QDRANT_TIMEOUT_SECONDS", self.qdrant_timeout_seconds))
         except ValueError:
@@ -229,6 +263,12 @@ class Settings:
         except ValueError:
             self.entity_link_ambiguous_threshold = self.entity_link_ambiguous_threshold
         try:
+            self.entity_link_resolve_margin = float(
+                os.getenv("ENTITY_LINK_RESOLVE_MARGIN", self.entity_link_resolve_margin)
+            )
+        except ValueError:
+            pass
+        try:
             self.query_temperature_local = float(os.getenv("QUERY_TEMP_LOCAL", self.query_temperature_local))
         except ValueError:
             self.query_temperature_local = self.query_temperature_local
@@ -276,6 +316,51 @@ class Settings:
             self.qdrant_communities_collection,
         )
         self.embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", self.embedding_model_id)
+        self.embedding_version = os.getenv("EMBEDDING_VERSION", self.embedding_version)
+        self.embedding_prompt_version = os.getenv(
+            "EMBEDDING_PROMPT_VERSION",
+            self.embedding_prompt_version,
+        )
+        self.embedding_normalization_policy = os.getenv(
+            "EMBEDDING_NORMALIZATION_POLICY",
+            self.embedding_normalization_policy,
+        )
+        self.embedding_document_prefix = os.getenv(
+            "EMBEDDING_DOCUMENT_PREFIX",
+            self.embedding_document_prefix,
+        )
+        self.embedding_query_prefix = os.getenv("EMBEDDING_QUERY_PREFIX", self.embedding_query_prefix)
+        self.extraction_prompt_version = os.getenv(
+            "EXTRACTION_PROMPT_VERSION",
+            self.extraction_prompt_version,
+        )
+        try:
+            self.assertion_review_confidence_threshold = float(
+                os.getenv(
+                    "ASSERTION_REVIEW_CONFIDENCE_THRESHOLD",
+                    self.assertion_review_confidence_threshold,
+                )
+            )
+        except ValueError:
+            self.assertion_review_confidence_threshold = self.assertion_review_confidence_threshold
+        try:
+            self.extraction_max_attempts = int(
+                os.getenv("EXTRACTION_MAX_ATTEMPTS", self.extraction_max_attempts)
+            )
+        except ValueError:
+            self.extraction_max_attempts = self.extraction_max_attempts
+        try:
+            self.outbox_lease_seconds = float(
+                os.getenv("OUTBOX_LEASE_SECONDS", self.outbox_lease_seconds)
+            )
+        except ValueError:
+            self.outbox_lease_seconds = self.outbox_lease_seconds
+        try:
+            self.extraction_retry_base_seconds = float(
+                os.getenv("EXTRACTION_RETRY_BASE_SECONDS", self.extraction_retry_base_seconds)
+            )
+        except ValueError:
+            self.extraction_retry_base_seconds = self.extraction_retry_base_seconds
         self.query_rerank_model = os.getenv("QUERY_RERANK_MODEL", self.query_rerank_model)
         dynamic_model = os.getenv("QUERY_GRAPH_DYNAMIC_MODEL")
         if dynamic_model is not None and dynamic_model.strip():
@@ -289,6 +374,19 @@ class Settings:
             )
         except ValueError:
             self.query_graph_transaction_timeout_seconds = 5.0
+        timeout_fields = {
+            "query_analysis_timeout_seconds": "QUERY_ANALYSIS_TIMEOUT_SECONDS",
+            "query_entity_link_timeout_seconds": "QUERY_ENTITY_LINK_TIMEOUT_SECONDS",
+            "query_graph_timeout_seconds": "QUERY_GRAPH_TIMEOUT_SECONDS",
+            "query_vector_timeout_seconds": "QUERY_VECTOR_TIMEOUT_SECONDS",
+            "query_rerank_timeout_seconds": "QUERY_RERANK_TIMEOUT_SECONDS",
+            "query_generation_timeout_seconds": "QUERY_GENERATION_TIMEOUT_SECONDS",
+        }
+        for attribute, environment_name in timeout_fields.items():
+            try:
+                setattr(self, attribute, float(os.getenv(environment_name, getattr(self, attribute))))
+            except ValueError:
+                pass
         self.gemini_embedding_task_type = os.getenv(
             "GEMINI_EMBED_TASK_TYPE",
             self.gemini_embedding_task_type,
@@ -298,6 +396,20 @@ class Settings:
             self.embedding_dim = int(os.getenv("EMBEDDING_DIM", self.embedding_dim))
         except ValueError:
             self.embedding_dim = self.embedding_dim
+        try:
+            self.graph_schema_version = int(os.getenv("GRAPH_SCHEMA_VERSION", self.graph_schema_version))
+        except ValueError:
+            self.graph_schema_version = self.graph_schema_version
+        try:
+            self.outbox_max_attempts = int(os.getenv("OUTBOX_MAX_ATTEMPTS", self.outbox_max_attempts))
+        except ValueError:
+            self.outbox_max_attempts = self.outbox_max_attempts
+        try:
+            self.outbox_retry_base_seconds = float(
+                os.getenv("OUTBOX_RETRY_BASE_SECONDS", self.outbox_retry_base_seconds)
+            )
+        except ValueError:
+            self.outbox_retry_base_seconds = self.outbox_retry_base_seconds
         cache_enabled_env = os.getenv("QUERY_CACHE_ENABLED")
         if cache_enabled_env is not None:
             self.query_cache_enabled = cache_enabled_env.strip().lower() not in {"0", "false", "no"}
@@ -327,6 +439,13 @@ class Settings:
         filter_boilerplate_env = os.getenv("QUERY_FILTER_BOILERPLATE_CHUNKS")
         if filter_boilerplate_env is not None:
             self.query_filter_boilerplate_chunks = filter_boilerplate_env.strip().lower() not in {"0", "false", "no"}
+        embedding_metadata_env = os.getenv("ENFORCE_EMBEDDING_METADATA")
+        if embedding_metadata_env is not None:
+            self.enforce_embedding_metadata = embedding_metadata_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
         cross_doc_same_type_env = os.getenv("CROSS_DOC_SAME_TYPE_REQUIRED_FOR_AUTO")
         if cross_doc_same_type_env is not None:
             self.cross_doc_same_type_required_for_auto = cross_doc_same_type_env.strip().lower() not in {

@@ -30,8 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _run_query(orchestrator: QueryOrchestrator, query: str, session_id: str) -> dict[str, object]:
-    response = await orchestrator.query(user_query=query, session_id=session_id)
-    return response.to_dict()
+    try:
+        response = await orchestrator.query(user_query=query, session_id=session_id)
+        return response.to_dict()
+    finally:
+        await orchestrator.aclose()
 
 
 def main() -> int:
@@ -41,10 +44,7 @@ def main() -> int:
 
     settings = Settings(metadata_db_path=Path(args.metadata_db))
     orchestrator = QueryOrchestrator(settings=settings)
-    try:
-        payload = asyncio.run(_run_query(orchestrator, query=args.query, session_id=args.session_id))
-    finally:
-        orchestrator.close()
+    payload = asyncio.run(_run_query(orchestrator, query=args.query, session_id=args.session_id))
 
     print(json.dumps(payload, indent=2))
     return 0

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 from typing import Any
 
 from config import Settings
 from generation.generator import AnswerGenerator
-from models.query import GraphRAGResponse, RetrieverResult
+from ingestion.state_store import MetadataStore
+from models.query import FusionOutput, GraphRAGResponse, RetrieverResult
 from retrieval.analyzer import QueryAnalyzer
 from retrieval.cache import NoOpCache
 from retrieval.community_retriever import CommunityRetriever
@@ -36,15 +38,19 @@ class QueryOrchestrator:
         community_retriever: CommunityRetriever | None = None,
         fusion_engine: FusionEngine | None = None,
         generator: AnswerGenerator | None = None,
+        store: MetadataStore | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache or NoOpCache()
+        self.store = store
+        if self.store is None and (graph_retriever is None or fusion_engine is None):
+            self.store = MetadataStore(settings.metadata_db_path)
         self.analyzer = analyzer or QueryAnalyzer(settings)
         self.entity_linker = entity_linker or EntityLinker(settings)
-        self.graph_retriever = graph_retriever or GraphRetriever(settings)
+        self.graph_retriever = graph_retriever or GraphRetriever(settings, store=self.store)
         self.vector_retriever = vector_retriever or VectorRetriever(settings)
         self.community_retriever = community_retriever or CommunityRetriever(settings)
-        self.fusion_engine = fusion_engine or FusionEngine(settings)
+        self.fusion_engine = fusion_engine or FusionEngine(settings, store=self.store)
         self.generator = generator or AnswerGenerator(settings)
 
     async def query(self, user_query: str, session_id: str = "default") -> GraphRAGResponse:
@@ -55,10 +61,36 @@ class QueryOrchestrator:
             if isinstance(cached_payload, dict):
                 return GraphRAGResponse.from_dict(cached_payload)
 
-        analysis = await asyncio.to_thread(self.analyzer.analyze, user_query)
         warnings: list[str] = []
+        if self.store is not None and self.store.has_pending_corpus_update():
+            warnings.append("corpus_update_in_progress")
         try:
-            linked_entities = await asyncio.to_thread(self.entity_linker.link_entities, analysis.mentioned_entities)
+            analysis = await asyncio.wait_for(
+                asyncio.to_thread(self.analyzer.analyze, user_query),
+                timeout=max(0.1, float(self.settings.query_analysis_timeout_seconds)),
+            )
+        except Exception as exc:
+            logger.warning("query_analysis_failed error_type=%s", type(exc).__name__)
+            return GraphRAGResponse(
+                answer="I could not safely analyze this question within the configured limits.",
+                confidence=0.0,
+                degraded=True,
+                warnings=[*warnings, f"query_analysis_failed:{type(exc).__name__}"],
+            )
+        try:
+            async_link = getattr(self.entity_linker, "alink_entities", None)
+            link_operation = (
+                async_link(analysis.mentioned_entities)
+                if callable(async_link)
+                else asyncio.to_thread(
+                    self.entity_linker.link_entities,
+                    analysis.mentioned_entities,
+                )
+            )
+            linked_entities = await asyncio.wait_for(
+                link_operation,
+                timeout=max(0.1, float(self.settings.query_entity_link_timeout_seconds)),
+            )
         except Exception as exc:
             logger.warning("entity_linking_failed error_type=%s", type(exc).__name__)
             warnings.append(f"entity_linking_failed:{type(exc).__name__}")
@@ -67,23 +99,30 @@ class QueryOrchestrator:
         graph_task = self._to_thread_or_empty(
             component="graph_retrieval",
             enabled=bool(analysis.retrieval_flags.get("graph")),
-            fn=self.graph_retriever.retrieve,
+            fn=getattr(self.graph_retriever, "aretrieve", self.graph_retriever.retrieve),
             analysis=analysis,
             linked_entities=linked_entities,
             user_query=user_query,
+            timeout_seconds=self.settings.query_graph_timeout_seconds,
         )
         vector_task = self._to_thread_or_empty(
             component="vector_retrieval",
             enabled=bool(analysis.retrieval_flags.get("vector", True)),
-            fn=self.vector_retriever.retrieve,
+            fn=(
+                self._aretrieve_vector_queries
+                if callable(getattr(self.vector_retriever, "aretrieve", None))
+                else self._retrieve_vector_queries
+            ),
             query=user_query,
-            top_k=int(self.settings.query_vector_top_k),
+            sub_queries=analysis.sub_queries,
+            timeout_seconds=self.settings.query_vector_timeout_seconds,
         )
         community_task = self._to_thread_or_empty(
             component="community_retrieval",
             enabled=bool(analysis.retrieval_flags.get("community")),
             fn=self.community_retriever.retrieve,
             query=user_query,
+            timeout_seconds=self.settings.query_vector_timeout_seconds,
         )
 
         graph_outcome, vector_outcome, community_outcome = await asyncio.gather(
@@ -101,20 +140,39 @@ class QueryOrchestrator:
         )
         community_fallback_used = bool(analysis.retrieval_flags.get("community")) and not community_results
 
-        fusion_output = await asyncio.to_thread(
-            self.fusion_engine.fuse,
-            graph_results,
-            vector_results,
-            community_results,
-            community_fallback_used,
-            user_query,
-        )
-        response = await asyncio.to_thread(
-            self.generator.generate,
-            user_query,
-            analysis,
-            fusion_output,
-        )
+        try:
+            fusion_output = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.fusion_engine.fuse,
+                    graph_results,
+                    vector_results,
+                    community_results,
+                    community_fallback_used,
+                    user_query,
+                ),
+                timeout=max(0.1, float(self.settings.query_rerank_timeout_seconds)),
+            )
+        except Exception as exc:
+            warnings.append(f"fusion_or_rerank_failed:{type(exc).__name__}")
+            fusion_output = FusionOutput()
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.generator.generate,
+                    user_query,
+                    analysis,
+                    fusion_output,
+                ),
+                timeout=max(0.1, float(self.settings.query_generation_timeout_seconds)),
+            )
+        except Exception as exc:
+            warnings.append(f"generation_failed:{type(exc).__name__}")
+            response = GraphRAGResponse(
+                answer="I could not produce a validated answer within the configured limits.",
+                query_type=analysis.query_type.value,
+                confidence=0.0,
+                degraded=True,
+            )
         if warnings:
             response.degraded = True
             response.warnings = list(dict.fromkeys([*response.warnings, *warnings]))
@@ -139,15 +197,66 @@ class QueryOrchestrator:
         component: str,
         enabled: bool,
         fn: Any,
+        timeout_seconds: float,
         **kwargs: Any,
     ) -> tuple[list[RetrieverResult], str | None]:
         if not enabled:
             return [], None
         try:
-            return await asyncio.to_thread(fn, **kwargs), None
+            if inspect.iscoroutinefunction(fn):
+                operation = fn(**kwargs)
+            else:
+                operation = asyncio.to_thread(fn, **kwargs)
+            return await asyncio.wait_for(
+                operation,
+                timeout=max(0.1, float(timeout_seconds)),
+            ), None
         except Exception as exc:
             logger.warning("%s_failed error_type=%s", component, type(exc).__name__)
             return [], f"{component}_failed:{type(exc).__name__}"
+
+    def _retrieve_vector_queries(self, query: str, sub_queries: list[str]) -> list[RetrieverResult]:
+        queries = list(dict.fromkeys([query, *sub_queries]))
+        results: list[RetrieverResult] = []
+        for index, value in enumerate(queries):
+            for item in self.vector_retriever.retrieve(
+                value,
+                top_k=int(self.settings.query_vector_top_k),
+            ):
+                item.provenance.setdefault("subquery", value)
+                item.provenance.setdefault("subquery_index", index)
+                results.append(item)
+        deduped: dict[str, RetrieverResult] = {}
+        for item in results:
+            key = item.dedupe_key()
+            if key not in deduped or item.score_raw > deduped[key].score_raw:
+                deduped[key] = item
+        return list(deduped.values())
+
+    async def _aretrieve_vector_queries(
+        self,
+        query: str,
+        sub_queries: list[str],
+    ) -> list[RetrieverResult]:
+        queries = list(dict.fromkeys([query, *sub_queries]))
+        groups = await asyncio.gather(
+            *(
+                self.vector_retriever.aretrieve(
+                    value,
+                    top_k=int(self.settings.query_vector_top_k),
+                )
+                for value in queries
+            )
+        )
+        deduped: dict[str, RetrieverResult] = {}
+        for index, (value, items) in enumerate(zip(queries, groups)):
+            for item in items:
+                item.provenance.setdefault("subquery", value)
+                item.provenance.setdefault("subquery_index", index)
+                key = item.dedupe_key()
+                if key not in deduped or item.score_raw > deduped[key].score_raw:
+                    deduped[key] = item
+        return list(deduped.values())
 
     def _build_cache_key(self, user_query: str, session_id: str) -> str:
         payload = f"{session_id}|{user_query.strip().lower()}"
@@ -167,3 +276,10 @@ class QueryOrchestrator:
             close = getattr(resource, "close", None)
             if callable(close):
                 close()
+
+    async def aclose(self) -> None:
+        for resource in (self.graph_retriever, self.entity_linker, self.vector_retriever):
+            async_close = getattr(resource, "aclose", None)
+            if callable(async_close):
+                await async_close()
+        self.close()

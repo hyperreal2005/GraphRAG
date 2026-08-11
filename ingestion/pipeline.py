@@ -14,7 +14,8 @@ from config import Settings
 from ingestion.chunker import CHUNK_FINGERPRINT_VERSION, SemanticChunker
 from ingestion.coref import CoreferenceResolver
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
-from ingestion.relation_normalizer import canonicalize_relation
+from ingestion.assertion_builder import AssertionBuilder
+from ingestion.outbox import IngestionOutboxProcessor
 from ingestion.state_store import MetadataStore
 from ingestion.vector_indexer import ChunkVectorInput, EntityVectorInput, QdrantVectorIndexer, build_entity_summary
 from models.ingestion import (
@@ -24,6 +25,7 @@ from models.ingestion import (
     IngestionRunSummary,
     ParsedDocument,
 )
+from models.refactor import DocumentVersion
 
 
 def utc_now_iso() -> str:
@@ -31,7 +33,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-INGESTION_PIPELINE_VERSION = "phase0-stabilization-v2"
+INGESTION_PIPELINE_VERSION = "refactor1-versioned-assertions-v1"
 STAGE_ORDER = {"PARSING": 1, "EXTRACTED": 2, "GRAPH_WRITTEN": 3, "VECTORS_WRITTEN": 4, "DONE": 5}
 
 
@@ -57,6 +59,8 @@ class PhaseOnePipeline:
         self.cross_doc_merger = None
         self.graph_writer = None
         self.vector_indexer = None
+        self.assertion_builder = None
+        self.outbox_processor = None
         if self.settings.enable_graph:
             from ingestion.cross_doc_merger import CrossDocumentMerger
             from ingestion.disambiguator import EntityDisambiguator
@@ -69,6 +73,13 @@ class PhaseOnePipeline:
             self.cross_doc_merger = CrossDocumentMerger(self.settings)
             self.graph_writer = GraphWriter(self.settings)
             self.vector_indexer = QdrantVectorIndexer(self.settings)
+            self.assertion_builder = AssertionBuilder(self.settings)
+            self.outbox_processor = IngestionOutboxProcessor(
+                settings=self.settings,
+                store=self.store,
+                graph_writer=self.graph_writer,
+                vector_indexer=self.vector_indexer,
+            )
 
     def ingest_path(self, input_path: Path, recursive: bool = True) -> IngestionRunSummary:
         """Ingest one file or directory."""
@@ -97,12 +108,11 @@ class PhaseOnePipeline:
                 close()
 
     def ingest_file(self, source_path: Path) -> FileIngestionResult:
-        """Ingest a single file from Stage 1 through Stage 7."""
+        """Ingest one file, preserving the last active version until activation succeeds."""
         started_at = utc_now_iso()
         run_id = str(uuid.uuid4())
         absolute_path = source_path.resolve()
         source_key = str(absolute_path)
-
         doc_format = detect_format(absolute_path)
         checksum = compute_sha256(absolute_path)
         existing_row = self.store.get_document_by_source(source_key)
@@ -116,24 +126,25 @@ class PhaseOnePipeline:
             pipeline_fingerprint=pipeline_fingerprint,
         ):
             doc_id = str(existing_row["doc_id"])
-            result = FileIngestionResult(
-                source_path=source_key,
-                action=IngestionAction.UNCHANGED,
-                doc_id=doc_id,
-                skipped=True,
-            )
+            active_version = self.store.get_active_document_version(doc_id)
             self.store.log_ingestion_run(
                 run_id=run_id,
                 doc_id=doc_id,
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="skipped",
+                document_version_id=active_version.version_id if active_version else None,
             )
-            return result
+            return FileIngestionResult(
+                source_path=source_key,
+                action=IngestionAction.UNCHANGED,
+                doc_id=doc_id,
+                skipped=True,
+            )
 
         action = IngestionAction.NEW if existing_row is None else IngestionAction.CHANGED
         doc_id = str(uuid.uuid4()) if existing_row is None else str(existing_row["doc_id"])
-        force_full_reprocess = self._needs_full_reprocess(existing_row, checksum, pipeline_fingerprint)
+        document_version_id: str | None = None
 
         try:
             self.store.start_document(
@@ -145,6 +156,27 @@ class PhaseOnePipeline:
                 pipeline_fingerprint=pipeline_fingerprint,
                 run_id=run_id,
             )
+            if self.settings.enable_graph:
+                document_version_id = str(uuid.uuid4())
+                self.store.create_document_version(
+                    DocumentVersion(
+                        version_id=document_version_id,
+                        doc_id=doc_id,
+                        checksum=checksum,
+                        pipeline_fingerprint=pipeline_fingerprint,
+                        generative_model=self.settings.gemini_model,
+                        embedding_model=self.settings.embedding_model_id,
+                        embedding_dim=self.settings.embedding_dim,
+                        embedding_prompt_version=self.settings.embedding_prompt_version,
+                        embedding_schema_version=self.settings.embedding_version,
+                        embedding_normalization_policy=self.settings.embedding_normalization_policy,
+                        document_embedding_instruction=self.settings.embedding_document_prefix,
+                        query_embedding_instruction=self.settings.embedding_query_prefix,
+                        extraction_prompt_version=self.settings.extraction_prompt_version,
+                        graph_schema_version=self.settings.graph_schema_version,
+                    )
+                )
+
             parsed = self.parser.parse_document(
                 source_path=absolute_path,
                 doc_id=doc_id,
@@ -152,250 +184,44 @@ class PhaseOnePipeline:
             )
             resolved = self.coref.resolve_document(parsed)
             chunks = self.chunker.chunk_document(resolved)
-
-            old_hash_to_chunk_id = self.store.get_chunk_ids_by_hash(doc_id)
-            all_old_chunk_ids = sorted(set(old_hash_to_chunk_id.values()))
-            for index, chunk in enumerate(chunks):
-                old_chunk_id = old_hash_to_chunk_id.get(chunk.chunk_hash)
-                if old_chunk_id:
-                    chunks[index] = replace(chunk, chunk_id=old_chunk_id)
-
-            new_hashes = {chunk.chunk_hash for chunk in chunks}
-            old_hashes = set(old_hash_to_chunk_id.keys())
-            added = sorted(new_hashes - old_hashes)
-            removed = sorted(old_hashes - new_hashes)
-            unchanged = sorted(new_hashes & old_hashes)
-
-            self.store.delete_chunks_by_hashes(doc_id, removed)
-            self.store.upsert_chunks(chunks)
-            self.store.update_pipeline_stage(doc_id, "PARSING", word_count=resolved.metadata.word_count)
-
-            delta = DeltaSummary(
-                added_chunk_hashes=added,
-                removed_chunk_hashes=removed,
-                unchanged_chunk_hashes=unchanged,
+            active_version = self.store.get_active_document_version(doc_id)
+            old_hash_to_chunk_id = self.store.get_chunk_ids_by_hash(
+                doc_id,
+                active_version.version_id if active_version else None,
+                active_only=active_version is not None,
             )
-            entities_created = 0
-            entities_merged = 0
-            relations_created = 0
 
-            if self.settings.enable_graph:
-                if (
-                    self.extractor is None
-                    or self.disambiguator is None
-                    or self.cross_doc_merger is None
-                    or self.graph_writer is None
-                    or self.vector_indexer is None
-                ):
-                    raise RuntimeError("Extraction components are not initialized.")
-
-                removed_chunk_ids = (
-                    all_old_chunk_ids
-                    if force_full_reprocess
-                    else [old_hash_to_chunk_id[h] for h in removed if h in old_hash_to_chunk_id]
-                )
-                entity_ids_to_retract: set[str] = set()
-                if removed_chunk_ids:
-                    entity_ids_removed = self.store.get_entity_ids_for_chunks(doc_id, removed_chunk_ids)
-                    if force_full_reprocess:
-                        entity_ids_removed.update(
-                            str(entity["entity_id"])
-                            for entity in self.store.get_doc_entities(doc_id)
-                            if str(entity.get("entity_id") or "").strip()
-                        )
-                    self.store.delete_entity_mentions_for_chunks(doc_id, removed_chunk_ids)
-                    remaining_entities = self.store.get_entity_ids_with_mentions(doc_id)
-                    entity_ids_to_retract = entity_ids_removed - remaining_entities
-                    self.graph_writer.retract_chunks(doc_id, removed_chunk_ids)
-                    deleted_entity_ids = self.graph_writer.retract_entities(doc_id, entity_ids_to_retract) or set()
-                    self.store.delete_doc_entities(doc_id, list(entity_ids_to_retract))
-                    self.vector_indexer.delete_chunk_vectors(removed_chunk_ids)
-                    self.vector_indexer.delete_entity_vectors(sorted(deleted_entity_ids))
-
-                chunks_to_process = (
-                    chunks
-                    if action is IngestionAction.NEW or force_full_reprocess
-                    else [chunk for chunk in chunks if chunk.chunk_hash in added]
-                )
-
-                extraction_entities = []
-                extraction_relations = []
-                entity_mentions: list[tuple[str, str, str, float]] = []
-
-                def run_extract(chunk):
-                    raw_result = self.extractor.extract(chunk.text, doc_format)
-                    return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
-
-                max_workers = max(1, int(self.settings.gemini_max_workers))
-                if max_workers == 1 or len(chunks_to_process) <= 1:
-                    extraction_results = [run_extract(chunk) for chunk in chunks_to_process]
-                else:
-                    workers = min(max_workers, len(chunks_to_process))
-                    with ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = [executor.submit(run_extract, chunk) for chunk in chunks_to_process]
-                        extraction_results = [future.result() for future in as_completed(futures)]
-
-                # Model calls may complete out of order. Downstream clustering
-                # and property conflict handling must remain deterministic.
-                extraction_results.sort(key=lambda item: (item[0].position, item[0].chunk_id))
-                for chunk, result in extraction_results:
-                    extraction_entities.extend(result.entities)
-                    extraction_relations.extend(
-                        [
-                            {
-                                "head_id": relation.head_id,
-                                "head_type": relation.head_type,
-                                "relation": relation.relation,
-                                "raw_relation": relation.raw_relation,
-                                "tail_id": relation.tail_id,
-                                "tail_type": relation.tail_type,
-                                "properties": relation.properties,
-                                "weight": relation.confidence,
-                                "source_chunk": chunk.chunk_id,
-                            }
-                            for relation in result.relations
-                        ]
-                    )
-                    for entity in result.entities:
-                        entity_mentions.append((entity.entity_id, chunk.chunk_id, doc_id, 1.0))
-
-                existing_doc_entities = [] if force_full_reprocess else self.store.get_doc_entities(doc_id)
-                disamb = self.disambiguator.disambiguate(extraction_entities, existing_doc_entities)
-
-                canonical_nodes = {}
-                entity_type_counts: dict[str, dict[str, int]] = {}
-                for cluster in disamb.canonical_entities:
-                    aliases = list(dict.fromkeys([cluster.canonical_name, *cluster.aliases]))
-                    canonical_nodes[cluster.entity_id] = {
-                        "id": cluster.entity_id,
-                        "name": cluster.canonical_name,
-                        "type": "Entity",
-                        "aliases": aliases,
-                        "properties": {},
-                        "confidence": 0.0,
-                    }
-                    entity_type_counts[cluster.entity_id] = {}
-
-                for entity in extraction_entities:
-                    canonical_id = disamb.entity_id_map.get(entity.entity_id)
-                    if not canonical_id or canonical_id not in canonical_nodes:
-                        continue
-                    entry = canonical_nodes[canonical_id]
-                    entry["properties"].update(entity.properties or {})
-                    if entity.name and entity.name not in entry["aliases"]:
-                        entry["aliases"].append(entity.name)
-                    if entity.entity_type:
-                        counts = entity_type_counts[canonical_id]
-                        counts[entity.entity_type] = counts.get(entity.entity_type, 0) + 1
-
-                for canonical_id, counts in entity_type_counts.items():
-                    if counts:
-                        canonical_nodes[canonical_id]["type"] = max(counts, key=counts.get)
-
-                merge_result = self.cross_doc_merger.resolve(list(canonical_nodes.values()))
-                local_to_final_map = {node_id: node_id for node_id in canonical_nodes.keys()}
-                local_to_final_map.update(merge_result.local_to_final_id)
-                canonical_nodes = self._remap_canonical_nodes(canonical_nodes, local_to_final_map)
-                entities_merged = merge_result.merged_total
-                raw_to_final_id_map = {
-                    raw_id: local_to_final_map.get(local_id, local_id)
-                    for raw_id, local_id in disamb.entity_id_map.items()
-                }
-
-                canonical_entities = [
-                    {
-                        "entity_id": node["id"],
-                        "canonical_name": node["name"],
-                        "aliases": node["aliases"],
-                    }
-                    for node in canonical_nodes.values()
-                ]
-                self.store.upsert_doc_entities(doc_id, canonical_entities)
-
-                self.store.delete_entity_mentions_for_chunks(doc_id, [chunk.chunk_id for chunk in chunks_to_process])
-                mapped_mentions = [
-                    (raw_to_final_id_map.get(entity_id, entity_id), chunk_id, doc_id, confidence)
-                    for entity_id, chunk_id, doc_id, confidence in entity_mentions
-                ]
-                self.store.upsert_entity_mentions(mapped_mentions)
-                mentions_by_chunk: dict[str, list[str]] = {}
-                for entity_id, chunk_id, _, _ in mapped_mentions:
-                    mentions_by_chunk.setdefault(chunk_id, []).append(entity_id)
-
-                mapped_edges = []
-                for edge in extraction_relations:
-                    head_id = raw_to_final_id_map.get(edge["head_id"], edge["head_id"])
-                    tail_id = raw_to_final_id_map.get(edge["tail_id"], edge["tail_id"])
-                    if head_id not in canonical_nodes or tail_id not in canonical_nodes:
-                        continue
-                    raw_relation = str(edge.get("raw_relation") or edge.get("relation") or "").strip()
-                    if not raw_relation:
-                        continue
-                    canonical_relation = canonicalize_relation(str(edge.get("relation") or raw_relation))
-                    mapped_edges.append(
-                        {
-                            "head_id": head_id,
-                            "tail_id": tail_id,
-                            "relation": canonical_relation,
-                            "raw_relation": raw_relation,
-                            "properties": edge["properties"],
-                            "weight": edge["weight"],
-                            "source_chunk": edge["source_chunk"],
-                        }
-                    )
-
-                node_confidence: dict[str, list[float]] = {node_id: [] for node_id in canonical_nodes}
-                for edge in mapped_edges:
-                    weight = float(edge.get("weight", 0.0))
-                    node_confidence[edge["head_id"]].append(weight)
-                    node_confidence[edge["tail_id"]].append(weight)
-
-                for node_id, weights in node_confidence.items():
-                    if weights:
-                        canonical_nodes[node_id]["confidence"] = sum(weights) / len(weights)
-
-                self.store.update_pipeline_stage(doc_id, "EXTRACTED")
-                self.graph_writer.write_nodes(doc_id, list(canonical_nodes.values()))
-                self.graph_writer.write_edges(doc_id, mapped_edges)
-                self.store.update_pipeline_stage(doc_id, "GRAPH_WRITTEN")
-
-                chunk_vector_inputs = [
-                    ChunkVectorInput(
-                        chunk_id=chunk.chunk_id,
-                        doc_id=doc_id,
-                        text=chunk.text,
-                        section_heading=chunk.section_heading,
-                        page=chunk.page_number,
-                        entity_ids_mentioned=mentions_by_chunk.get(chunk.chunk_id, []),
-                    )
-                    for chunk in chunks_to_process
-                ]
-                authoritative_entity_rows = self.graph_writer.get_entities_for_doc(doc_id)
-                entity_vector_inputs = [
-                    EntityVectorInput(
-                        neo4j_node_id=str(node.get("id") or ""),
-                        name=str(node.get("name") or ""),
-                        entity_type=str(node.get("type") or "Entity"),
-                        summary=build_entity_summary(
-                            name=str(node.get("name") or ""),
-                            entity_type=str(node.get("type") or "Entity"),
-                            properties=node.get("properties", {}),
+            if document_version_id:
+                chunks = [
+                    replace(
+                        chunk,
+                        chunk_id=str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"graphrag:{document_version_id}:{chunk.position}:{chunk.chunk_hash}",
+                            )
                         ),
                     )
-                    for node in authoritative_entity_rows
-                    if str(node.get("id") or "").strip()
+                    for chunk in chunks
                 ]
-                self.vector_indexer.upsert_chunk_vectors(chunk_vector_inputs)
-                self.vector_indexer.upsert_entity_vectors(entity_vector_inputs)
-                self.store.set_chunk_embedding_version(
-                    [item.chunk_id for item in chunk_vector_inputs],
-                    self.settings.embedding_version,
-                )
-                self.store.update_pipeline_stage(doc_id, "VECTORS_WRITTEN")
+            else:
+                chunks = [
+                    replace(chunk, chunk_id=old_hash_to_chunk_id.get(chunk.chunk_hash, chunk.chunk_id))
+                    for chunk in chunks
+                ]
 
-                entities_created = merge_result.new_nodes
-                relations_created = len(mapped_edges)
-
+            new_hashes = {chunk.chunk_hash for chunk in chunks}
+            old_hashes = set(old_hash_to_chunk_id)
+            delta = DeltaSummary(
+                added_chunk_hashes=sorted(new_hashes - old_hashes),
+                removed_chunk_hashes=sorted(old_hashes - new_hashes),
+                unchanged_chunk_hashes=sorted(new_hashes & old_hashes),
+            )
+            self.store.update_pipeline_stage(
+                doc_id,
+                "PARSING",
+                word_count=resolved.metadata.word_count,
+            )
             self._write_artifacts(
                 run_id=run_id,
                 parsed_document=resolved,
@@ -403,7 +229,33 @@ class PhaseOnePipeline:
                 action=action,
                 delta=delta,
             )
-            self.store.finish_document(doc_id, resolved.metadata.word_count, target_stage)
+
+            entities_created = 0
+            entities_merged = 0
+            relations_created = 0
+            if document_version_id:
+                entities_created, entities_merged, relations_created = self._stage_graph_generation(
+                    run_id=run_id,
+                    doc_id=doc_id,
+                    document_version_id=document_version_id,
+                    doc_format=doc_format,
+                    chunks=chunks,
+                    active_version_id=active_version.version_id if active_version else None,
+                )
+                current = self.store.get_active_document_version(doc_id)
+                if current is None or current.version_id != document_version_id:
+                    failed = self.store.get_document_version(document_version_id)
+                    detail = failed.last_error if failed else "candidate version disappeared"
+                    raise RuntimeError(f"Document version activation did not complete: {detail}")
+                self.store.set_chunk_embedding_version(
+                    [chunk.chunk_id for chunk in chunks],
+                    self.settings.embedding_version,
+                )
+            else:
+                self.store.delete_chunks_by_hashes(doc_id, delta.removed_chunk_hashes)
+                self.store.upsert_chunks(chunks)
+                self.store.finish_document(doc_id, resolved.metadata.word_count, target_stage)
+
             self.store.log_ingestion_run(
                 run_id=run_id,
                 doc_id=doc_id,
@@ -413,6 +265,7 @@ class PhaseOnePipeline:
                 entities_created=entities_created,
                 relations_created=relations_created,
                 entities_merged=entities_merged,
+                document_version_id=document_version_id,
             )
             return FileIngestionResult(
                 source_path=source_key,
@@ -423,6 +276,8 @@ class PhaseOnePipeline:
                 delta=delta,
             )
         except Exception as exc:
+            if document_version_id:
+                self.store.fail_document_version(document_version_id, str(exc))
             self.store.fail_document(doc_id=doc_id, error_message=str(exc))
             self.store.log_ingestion_run(
                 run_id=run_id,
@@ -430,6 +285,7 @@ class PhaseOnePipeline:
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 status="failed",
+                document_version_id=document_version_id,
             )
             return FileIngestionResult(
                 source_path=source_key,
@@ -438,6 +294,221 @@ class PhaseOnePipeline:
                 skipped=False,
                 error=str(exc),
             )
+
+    def _stage_graph_generation(
+        self,
+        *,
+        run_id: str,
+        doc_id: str,
+        document_version_id: str,
+        doc_format: str,
+        chunks: list,
+        active_version_id: str | None,
+    ) -> tuple[int, int, int]:
+        """Extract and durably stage a complete immutable graph/vector version."""
+        if any(
+            component is None
+            for component in (
+                self.extractor,
+                self.disambiguator,
+                self.cross_doc_merger,
+                self.assertion_builder,
+                self.outbox_processor,
+            )
+        ):
+            raise RuntimeError("Refactor 1 ingestion components are not initialized.")
+
+        def run_extract(chunk):  # noqa: ANN001, ANN202
+            raw_result = self.extractor.extract(chunk.text, doc_format)
+            return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
+
+        max_workers = max(1, int(self.settings.gemini_max_workers))
+        if max_workers == 1 or len(chunks) <= 1:
+            extraction_results = [run_extract(chunk) for chunk in chunks]
+        else:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as executor:
+                futures = [executor.submit(run_extract, chunk) for chunk in chunks]
+                extraction_results = [future.result() for future in as_completed(futures)]
+        extraction_results.sort(key=lambda item: (item[0].position, item[0].chunk_id))
+
+        extraction_entities = []
+        extraction_relations: list[dict[str, object]] = []
+        raw_entity_chunk_ids: dict[str, str] = {}
+        raw_mentions: list[tuple[str, str, str, float]] = []
+        for chunk, result in extraction_results:
+            extraction_entities.extend(result.entities)
+            for entity in result.entities:
+                raw_entity_chunk_ids[entity.entity_id] = chunk.chunk_id
+                raw_mentions.append((entity.entity_id, chunk.chunk_id, doc_id, entity.confidence))
+            for relation in result.relations:
+                extraction_relations.append(
+                    {
+                        "head_id": relation.head_id,
+                        "tail_id": relation.tail_id,
+                        "relation": relation.relation,
+                        "raw_relation": relation.raw_relation,
+                        "properties": relation.properties,
+                        "weight": relation.confidence,
+                        "source_chunk": chunk.chunk_id,
+                        "valid_from": relation.valid_from,
+                        "valid_until": relation.valid_until,
+                    }
+                )
+
+        existing_entities = self.store.get_doc_entities(
+            doc_id,
+            active_version_id,
+            active_only=active_version_id is not None,
+        )
+        disamb = self.disambiguator.disambiguate(extraction_entities, existing_entities)
+        canonical_nodes: dict[str, dict[str, object]] = {}
+        type_counts: dict[str, dict[str, int]] = {}
+        confidence_values: dict[str, list[float]] = {}
+        for cluster in disamb.canonical_entities:
+            aliases = list(dict.fromkeys([cluster.canonical_name, *cluster.aliases]))
+            canonical_nodes[cluster.entity_id] = {
+                "id": cluster.entity_id,
+                "name": cluster.canonical_name,
+                "type": "Entity",
+                "aliases": aliases,
+                "properties": {},
+                "confidence": 0.0,
+            }
+            type_counts[cluster.entity_id] = {}
+            confidence_values[cluster.entity_id] = []
+
+        for entity in extraction_entities:
+            local_id = disamb.entity_id_map.get(entity.entity_id)
+            if not local_id or local_id not in canonical_nodes:
+                continue
+            node = canonical_nodes[local_id]
+            display_properties = node.get("properties")
+            if isinstance(display_properties, dict):
+                for key, value in entity.properties.items():
+                    display_properties.setdefault(key, value)
+            aliases = node.get("aliases")
+            if isinstance(aliases, list) and entity.name not in aliases:
+                aliases.append(entity.name)
+            counts = type_counts[local_id]
+            counts[entity.entity_type] = counts.get(entity.entity_type, 0) + 1
+            confidence_values[local_id].append(entity.confidence)
+        for local_id, counts in type_counts.items():
+            if counts:
+                canonical_nodes[local_id]["type"] = max(counts, key=counts.get)
+            values = confidence_values[local_id]
+            if values:
+                canonical_nodes[local_id]["confidence"] = sum(values) / len(values)
+
+        merge_result = self.cross_doc_merger.resolve(
+            list(canonical_nodes.values()),
+            run_id=run_id,
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            store=self.store,
+        )
+        local_to_final = {node_id: node_id for node_id in canonical_nodes}
+        local_to_final.update(merge_result.local_to_final_id)
+        canonical_nodes = self._remap_canonical_nodes(canonical_nodes, local_to_final)
+        raw_to_final = {
+            raw_id: local_to_final.get(local_id, local_id)
+            for raw_id, local_id in disamb.entity_id_map.items()
+        }
+
+        mapped_mentions = sorted(
+            {
+                (
+                    raw_to_final.get(entity_id, entity_id),
+                    chunk_id,
+                    mention_doc_id,
+                    confidence,
+                    disamb.entity_id_map.get(entity_id, entity_id),
+                )
+                for entity_id, chunk_id, mention_doc_id, confidence in raw_mentions
+            }
+        )
+        mentions_by_chunk: dict[str, list[str]] = {}
+        for entity_id, chunk_id, _, _, _ in mapped_mentions:
+            mentions_by_chunk.setdefault(chunk_id, []).append(entity_id)
+
+        mapped_relations: list[dict[str, object]] = []
+        for relation in extraction_relations:
+            head_id = raw_to_final.get(str(relation["head_id"]), str(relation["head_id"]))
+            tail_id = raw_to_final.get(str(relation["tail_id"]), str(relation["tail_id"]))
+            if head_id not in canonical_nodes or tail_id not in canonical_nodes:
+                raise ValueError("Canonical relation endpoint is missing after cross-document resolution.")
+            raw_relation = str(relation.get("raw_relation") or relation.get("relation") or "").strip()
+            if not raw_relation:
+                raise ValueError("Extracted relation has an empty predicate.")
+            mapped_relations.append(
+                {
+                    **relation,
+                    "head_id": head_id,
+                    "tail_id": tail_id,
+                    "head_local_id": disamb.entity_id_map.get(str(relation["head_id"])),
+                    "tail_local_id": disamb.entity_id_map.get(str(relation["tail_id"])),
+                    "relation": str(relation.get("relation") or raw_relation),
+                    "raw_relation": raw_relation,
+                }
+            )
+
+        assertions = self.assertion_builder.build(
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            mapped_relations=mapped_relations,
+            extracted_entities=extraction_entities,
+            raw_to_final_entity_id=raw_to_final,
+            raw_to_local_entity_id=disamb.entity_id_map,
+            raw_entity_chunk_ids=raw_entity_chunk_ids,
+        )
+        node_rows = [canonical_nodes[key] for key in sorted(canonical_nodes)]
+        doc_entities = [
+            {
+                "doc_id": doc_id,
+                "entity_id": node["id"],
+                "canonical_name": node["name"],
+                "aliases": node.get("aliases", []),
+            }
+            for node in node_rows
+        ]
+        chunk_inputs = [
+            ChunkVectorInput(
+                chunk_id=chunk.chunk_id,
+                doc_id=doc_id,
+                text=chunk.text,
+                section_heading=chunk.section_heading,
+                page=chunk.page_number,
+                entity_ids_mentioned=mentions_by_chunk.get(chunk.chunk_id, []),
+                document_version_id=document_version_id,
+                active=False,
+            )
+            for chunk in chunks
+        ]
+        payload = self.outbox_processor.serialize_initial_payload(
+            nodes=node_rows,
+            assertions=assertions,
+            chunks=chunk_inputs,
+        )
+        initial_event = self.outbox_processor.make_event(
+            event_type="GRAPH_STAGE_VERSION",
+            run_id=run_id,
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            payload=payload,
+        )
+        self.store.stage_version_records(
+            document_version_id=document_version_id,
+            chunks=chunks,
+            mentions=mapped_mentions,
+            doc_entities=doc_entities,
+            initial_event=initial_event,
+        )
+        self.store.update_pipeline_stage(doc_id, "EXTRACTED")
+        self.outbox_processor.reconcile(
+            document_version_id=document_version_id,
+            wait_for_retries=True,
+            max_events=100,
+        )
+        return merge_result.new_nodes, merge_result.merged_total, len(assertions)
 
     def _pipeline_fingerprint(self, target_stage: str) -> str:
         payload = {
@@ -450,10 +521,19 @@ class PhaseOnePipeline:
             "chunk_max_tokens": self.settings.chunk_max_tokens,
             "chunk_overlap_tokens": self.settings.chunk_overlap_tokens,
             "gemini_model": self.settings.gemini_model if self.settings.enable_graph else None,
+            "extraction_prompt_version": self.settings.extraction_prompt_version if self.settings.enable_graph else None,
             "disamb_model": self.settings.disamb_model if self.settings.enable_graph else None,
             "disamb_threshold": self.settings.disamb_threshold if self.settings.enable_graph else None,
             "embedding_model_id": self.settings.embedding_model_id if self.settings.enable_graph else None,
             "embedding_version": self.settings.embedding_version if self.settings.enable_graph else None,
+            "embedding_prompt_version": self.settings.embedding_prompt_version if self.settings.enable_graph else None,
+            "embedding_normalization_policy": self.settings.embedding_normalization_policy if self.settings.enable_graph else None,
+            "embedding_document_prefix": self.settings.embedding_document_prefix if self.settings.enable_graph else None,
+            "embedding_query_prefix": self.settings.embedding_query_prefix if self.settings.enable_graph else None,
+            "graph_schema_version": self.settings.graph_schema_version if self.settings.enable_graph else None,
+            "cross_doc_auto_merge_threshold": self.settings.cross_doc_auto_merge_threshold if self.settings.enable_graph else None,
+            "cross_doc_auto_merge_margin": self.settings.cross_doc_auto_merge_margin if self.settings.enable_graph else None,
+            "cross_doc_llm_confidence_threshold": self.settings.cross_doc_llm_confidence_threshold if self.settings.enable_graph else None,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -501,7 +581,7 @@ class PhaseOnePipeline:
                 raise ValueError(f"Extraction returned duplicate entity ID {raw_id!r} for chunk {chunk_id}.")
             scoped_id = f"{chunk_id}::{raw_id}"
             raw_to_scoped[raw_id] = scoped_id
-            scoped_entities.append(replace(entity, entity_id=scoped_id))
+            scoped_entities.append(entity.model_copy(update={"entity_id": scoped_id}))
 
         scoped_relations = []
         for relation in result.relations:
@@ -513,14 +593,15 @@ class PhaseOnePipeline:
                     f"{raw_head!r} -> {raw_tail!r} in chunk {chunk_id}."
                 )
             scoped_relations.append(
-                replace(
-                    relation,
-                    head_id=raw_to_scoped[raw_head],
-                    tail_id=raw_to_scoped[raw_tail],
+                relation.model_copy(
+                    update={
+                        "head_id": raw_to_scoped[raw_head],
+                        "tail_id": raw_to_scoped[raw_tail],
+                    }
                 )
             )
 
-        return replace(result, entities=scoped_entities, relations=scoped_relations)
+        return result.model_copy(update={"entities": scoped_entities, "relations": scoped_relations})
 
     def _discover_files(self, input_path: Path, recursive: bool) -> list[Path]:
         if not input_path.exists():
@@ -626,20 +707,30 @@ class PhaseOnePipeline:
                 raise RuntimeError(f"Vector backfill failed for doc_id={doc_id}: {exc}") from exc
 
     def _ensure_embedding_metadata(self) -> None:
+        expected = {
+            "embedding_model_id": self.settings.embedding_model_id,
+            "embedding_dim": str(self.settings.embedding_dim),
+            "embedding_version": self.settings.embedding_version,
+            "embedding_prompt_version": self.settings.embedding_prompt_version,
+            "embedding_normalization_policy": self.settings.embedding_normalization_policy,
+            "embedding_document_prefix": self.settings.embedding_document_prefix,
+            "embedding_query_prefix": self.settings.embedding_query_prefix,
+        }
         stored_model = self.store.get_system_metadata("embedding_model_id")
-        stored_dim = self.store.get_system_metadata("embedding_dim")
-        stored_version = self.store.get_system_metadata("embedding_version")
         if stored_model is None:
-            self.store.set_system_metadata("embedding_model_id", self.settings.embedding_model_id)
-            self.store.set_system_metadata("embedding_dim", str(self.settings.embedding_dim))
-            self.store.set_system_metadata("embedding_version", self.settings.embedding_version)
+            for key, value in expected.items():
+                self.store.set_system_metadata(key, value)
             return
-        if stored_model != self.settings.embedding_model_id or stored_dim != str(self.settings.embedding_dim):
+        mismatches = {
+            key: (self.store.get_system_metadata(key), value)
+            for key, value in expected.items()
+            if self.store.get_system_metadata(key) != value
+        }
+        if mismatches:
             raise RuntimeError(
-                "Embedding model mismatch. Re-embed vectors or fix config before ingestion."
+                "Embedding corpus metadata mismatch. Rebuild vectors before ingestion: "
+                f"{mismatches}"
             )
-        if stored_version is None:
-            self.store.set_system_metadata("embedding_version", self.settings.embedding_version)
 
     def _remap_canonical_nodes(
         self,

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from config import Settings
+from generation.model_adapter import build_generate_config
 from models.query import QueryAnalysis, QueryType
 
 
@@ -124,7 +125,9 @@ class QueryAnalyzer:
         )
         config = None
         if self._types is not None:
-            config = self._types.GenerateContentConfig(
+            config = build_generate_config(
+                self._types,
+                self.settings.gemini_model,
                 temperature=0.0,
                 response_mime_type="application/json",
                 response_schema=self._schema,
@@ -296,4 +299,3 @@ class QueryAnalyzer:
         if not isinstance(decoded, dict):
             raise RuntimeError("Analyzer response JSON was not an object.")
         return decoded
-

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from typing import Any
@@ -26,12 +27,18 @@ class VectorRetriever:
         self.embedder = embedder or GeminiEmbedder(settings)
         if client is not None:
             self._client = client
+            self._async_client = None
             return
         try:
-            from qdrant_client import QdrantClient
+            from qdrant_client import AsyncQdrantClient, QdrantClient
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("qdrant-client package is required for vector retrieval.") from exc
         self._client = QdrantClient(
+            url=self.settings.qdrant_url,
+            api_key=self.settings.qdrant_api_key,
+            timeout=self.settings.qdrant_timeout_seconds,
+        )
+        self._async_client = AsyncQdrantClient(
             url=self.settings.qdrant_url,
             api_key=self.settings.qdrant_api_key,
             timeout=self.settings.qdrant_timeout_seconds,
@@ -58,9 +65,21 @@ class VectorRetriever:
             with_vectors=mmr_enabled,
         )
 
+        return self._rank_hits(query_vector, hits, limit=limit, mmr_enabled=mmr_enabled)
+
+    def _rank_hits(
+        self,
+        query_vector: list[float],
+        hits: list[Any],
+        *,
+        limit: int,
+        mmr_enabled: bool,
+    ) -> list[RetrieverResult]:
         candidates: list[tuple[RetrieverResult, list[float] | None]] = []
         for hit in hits:
             payload = self._extract_payload(hit)
+            if not self._embedding_payload_matches(payload):
+                continue
             point_id = self._extract_point_id(hit, payload)
             score = self._clamp01(self._extract_score(hit))
             text = str(payload.get("text") or "")
@@ -75,6 +94,8 @@ class VectorRetriever:
                     "section_heading": payload.get("section_heading"),
                     "page": payload.get("page"),
                     "query_similarity": score,
+                    "document_version_id": payload.get("document_version_id"),
+                    "evidence_id": f"chunk:{str(payload.get('chunk_id') or point_id)}",
                 },
             )
             candidates.append((result, self._extract_vector(hit)))
@@ -118,16 +139,73 @@ class VectorRetriever:
         )
         return selected_results
 
+    async def aretrieve(self, query: str, top_k: int | None = None) -> list[RetrieverResult]:
+        """Retrieve through async Gemini/Qdrant clients when available."""
+        if self._async_client is None:
+            return await asyncio.to_thread(self.retrieve, query, top_k)
+        clean_query = query.strip()
+        if not clean_query:
+            return []
+        limit = max(1, int(top_k or self.settings.query_vector_top_k))
+        mmr_enabled = bool(self.settings.query_mmr_enabled)
+        multiplier = max(1, int(self.settings.query_mmr_candidate_multiplier))
+        candidate_limit = limit * multiplier if mmr_enabled else limit
+        async_embed = getattr(self.embedder, "aembed_texts", None)
+        if callable(async_embed):
+            query_vector = (
+                await async_embed(
+                    [clean_query],
+                    task_type=self.settings.query_embedding_task_type,
+                )
+            )[0]
+        else:
+            query_vector = (
+                await asyncio.to_thread(
+                    self.embedder.embed_texts,
+                    [clean_query],
+                    self.settings.query_embedding_task_type,
+                )
+            )[0]
+        response = await self._async_client.query_points(
+            collection_name=self.settings.qdrant_chunks_collection,
+            query=query_vector,
+            query_filter=self._active_filter(),
+            limit=candidate_limit,
+            with_payload=True,
+            with_vectors=mmr_enabled,
+        )
+        return self._rank_hits(
+            query_vector,
+            self._extract_points(response),
+            limit=limit,
+            mmr_enabled=mmr_enabled,
+        )
+
+    async def aclose(self) -> None:
+        if self._async_client is not None:
+            await self._async_client.close()
+
     def _search_chunks(self, query_vector: list[float], limit: int, with_vectors: bool) -> list[Any]:
+        query_filter = self._active_filter()
         if hasattr(self._client, "query_points"):
             try:
-                response = self._client.query_points(
-                    collection_name=self.settings.qdrant_chunks_collection,
-                    query=query_vector,
-                    limit=limit,
-                    with_payload=True,
-                    with_vectors=with_vectors,
-                )
+                try:
+                    response = self._client.query_points(
+                        collection_name=self.settings.qdrant_chunks_collection,
+                        query=query_vector,
+                        query_filter=query_filter,
+                        limit=limit,
+                        with_payload=True,
+                        with_vectors=with_vectors,
+                    )
+                except TypeError:
+                    response = self._client.query_points(
+                        collection_name=self.settings.qdrant_chunks_collection,
+                        query=query_vector,
+                        limit=limit,
+                        with_payload=True,
+                        with_vectors=with_vectors,
+                    )
                 return self._extract_points(response)
             except Exception:
                 pass
@@ -137,6 +215,7 @@ class VectorRetriever:
                 response = self._client.search(
                     collection_name=self.settings.qdrant_chunks_collection,
                     query_vector=query_vector,
+                    query_filter=query_filter,
                     limit=limit,
                     with_payload=True,
                     with_vectors=with_vectors,
@@ -155,6 +234,7 @@ class VectorRetriever:
                 response = self._client.search_points(
                     collection_name=self.settings.qdrant_chunks_collection,
                     query_vector=query_vector,
+                    query_filter=query_filter,
                     limit=limit,
                     with_payload=True,
                     with_vectors=with_vectors,
@@ -312,3 +392,29 @@ class VectorRetriever:
 
     def _clamp01(self, value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    def _embedding_payload_matches(self, payload: dict[str, Any]) -> bool:
+        if not self.settings.enforce_embedding_metadata:
+            return True
+        return (
+            payload.get("embedding_model_id") == self.settings.embedding_model_id
+            and int(payload.get("embedding_dimension") or 0) == int(self.settings.embedding_dim)
+            and payload.get("embedding_prompt_version") == self.settings.embedding_prompt_version
+            and payload.get("embedding_schema_version") == self.settings.embedding_version
+            and payload.get("active") is True
+        )
+
+    @staticmethod
+    def _active_filter() -> Any:
+        try:
+            from qdrant_client.http import models
+        except Exception:
+            return {"must": [{"key": "active", "match": {"value": True}}]}
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="active",
+                    match=models.MatchValue(value=True),
+                )
+            ]
+        )

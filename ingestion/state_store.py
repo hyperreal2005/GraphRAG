@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
 from models.ingestion import Chunk
+from models.refactor import DocumentVersion, MergeDecision, OutboxEvent, OutboxEventType
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now_iso() -> str:
@@ -114,6 +116,79 @@ class MetadataStore:
                     status TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS document_versions (
+                    version_id TEXT PRIMARY KEY,
+                    doc_id TEXT NOT NULL REFERENCES documents(doc_id),
+                    checksum TEXT NOT NULL,
+                    pipeline_fingerprint TEXT NOT NULL,
+                    generative_model TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    embedding_dim INTEGER NOT NULL,
+                    embedding_prompt_version TEXT NOT NULL,
+                    embedding_schema_version TEXT NOT NULL DEFAULT 'legacy',
+                    embedding_normalization_policy TEXT NOT NULL DEFAULT 'provider-default',
+                    document_embedding_instruction TEXT NOT NULL DEFAULT 'legacy',
+                    query_embedding_instruction TEXT NOT NULL DEFAULT 'legacy',
+                    extraction_prompt_version TEXT NOT NULL DEFAULT 'legacy',
+                    graph_schema_version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    last_completed_stage TEXT,
+                    created_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    superseded_at TEXT,
+                    last_error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS outbox_events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    document_version_id TEXT NOT NULL REFERENCES document_versions(version_id),
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT NOT NULL,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS merge_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    document_version_id TEXT NOT NULL REFERENCES document_versions(version_id),
+                    incoming_local_entity_id TEXT NOT NULL,
+                    incoming_name TEXT NOT NULL,
+                    incoming_type TEXT NOT NULL,
+                    candidate_entity_id TEXT,
+                    candidate_name TEXT,
+                    candidate_type TEXT,
+                    top1_similarity REAL,
+                    top2_similarity REAL,
+                    score_margin REAL,
+                    type_compatible INTEGER NOT NULL,
+                    decision TEXT NOT NULL,
+                    rationale TEXT NOT NULL,
+                    model_id TEXT,
+                    prompt_version TEXT,
+                    adjudication_confidence REAL,
+                    reverses_decision_id TEXT,
+                    created_at TEXT NOT NULL,
+                    reversed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS version_doc_entities (
+                    document_version_id TEXT NOT NULL REFERENCES document_versions(version_id),
+                    doc_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    canonical_name TEXT NOT NULL,
+                    aliases TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (document_version_id, entity_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_chunks_doc_hash
                     ON chunks (doc_id, chunk_hash);
 
@@ -122,9 +197,31 @@ class MetadataStore:
 
                 CREATE INDEX IF NOT EXISTS idx_doc_entities_name
                     ON doc_entities (doc_id, canonical_name);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_document_version
+                    ON document_versions (doc_id) WHERE status = 'active';
+
+                CREATE INDEX IF NOT EXISTS idx_document_versions_doc_status
+                    ON document_versions (doc_id, status);
+
+                CREATE INDEX IF NOT EXISTS idx_outbox_ready
+                    ON outbox_events (status, available_at);
+
+                CREATE INDEX IF NOT EXISTS idx_outbox_version_type
+                    ON outbox_events (document_version_id, event_type);
+
+                CREATE INDEX IF NOT EXISTS idx_merge_incoming
+                    ON merge_decisions (document_version_id, incoming_local_entity_id);
+
+                CREATE INDEX IF NOT EXISTS idx_merge_candidate
+                    ON merge_decisions (candidate_entity_id);
+
+                CREATE INDEX IF NOT EXISTS idx_version_doc_entities_active
+                    ON version_doc_entities (doc_id, active);
                 """
             )
             self._migrate_documents_table(conn)
+            self._migrate_version_columns(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_documents_table(self, conn: sqlite3.Connection) -> None:
@@ -157,6 +254,654 @@ class MetadataStore:
                 END
             """
         )
+
+    def _migrate_version_columns(self, conn: sqlite3.Connection) -> None:
+        """Add nullable Refactor 1 version keys without rewriting legacy rows."""
+        additions = {
+            "chunks": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
+            "entity_mentions": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
+            "doc_entities": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
+            "ingestion_log": {"document_version_id": "TEXT"},
+        }
+        additions["entity_mentions"]["local_entity_id"] = "TEXT"
+        additions["document_versions"] = {
+            "embedding_schema_version": "TEXT NOT NULL DEFAULT 'legacy'",
+            "embedding_normalization_policy": "TEXT NOT NULL DEFAULT 'provider-default'",
+            "document_embedding_instruction": "TEXT NOT NULL DEFAULT 'legacy'",
+            "query_embedding_instruction": "TEXT NOT NULL DEFAULT 'legacy'",
+            "extraction_prompt_version": "TEXT NOT NULL DEFAULT 'legacy'",
+        }
+        for table, columns_to_add in additions.items():
+            existing = {
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, sql_type in columns_to_add.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_chunks_version_active
+                ON chunks (document_version_id, active);
+            CREATE INDEX IF NOT EXISTS idx_mentions_version_active
+                ON entity_mentions (document_version_id, active);
+            CREATE INDEX IF NOT EXISTS idx_doc_entities_version_active
+                ON doc_entities (document_version_id, active);
+            DROP INDEX IF EXISTS idx_mentions_version_entity_chunk;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mentions_version_local_chunk
+                ON entity_mentions (document_version_id, local_entity_id, chunk_id)
+                WHERE document_version_id IS NOT NULL AND local_entity_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mentions_version_final_chunk_legacy
+                ON entity_mentions (document_version_id, entity_id, chunk_id)
+                WHERE document_version_id IS NOT NULL AND local_entity_id IS NULL;
+            """
+        )
+
+    @staticmethod
+    def build_outbox_event_id(
+        document_version_id: str,
+        event_type: OutboxEventType,
+        discriminator: str = "",
+    ) -> str:
+        """Build a deterministic event identity for idempotent enqueue."""
+        payload = f"{document_version_id}|{event_type}|{discriminator}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def create_document_version(self, version: DocumentVersion) -> None:
+        """Persist an immutable document version before processing begins."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO document_versions (
+                    version_id, doc_id, checksum, pipeline_fingerprint,
+                    generative_model, embedding_model, embedding_dim,
+                    embedding_prompt_version, embedding_schema_version,
+                    embedding_normalization_policy, document_embedding_instruction,
+                    query_embedding_instruction, extraction_prompt_version,
+                    graph_schema_version, status,
+                    last_completed_stage, created_at, activated_at,
+                    superseded_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version.version_id,
+                    version.doc_id,
+                    version.checksum,
+                    version.pipeline_fingerprint,
+                    version.generative_model,
+                    version.embedding_model,
+                    version.embedding_dim,
+                    version.embedding_prompt_version,
+                    version.embedding_schema_version,
+                    version.embedding_normalization_policy,
+                    version.document_embedding_instruction,
+                    version.query_embedding_instruction,
+                    version.extraction_prompt_version,
+                    version.graph_schema_version,
+                    version.status,
+                    version.last_completed_stage,
+                    version.created_at.isoformat(),
+                    version.activated_at.isoformat() if version.activated_at else None,
+                    version.superseded_at.isoformat() if version.superseded_at else None,
+                    version.last_error,
+                ),
+            )
+
+    def get_document_version(self, version_id: str) -> DocumentVersion | None:
+        """Fetch one validated document version."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM document_versions WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+        return self._document_version_from_row(row) if row else None
+
+    def get_active_document_version(self, doc_id: str) -> DocumentVersion | None:
+        """Fetch the active immutable version for a document."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM document_versions WHERE doc_id = ? AND status = 'active'",
+                (doc_id,),
+            ).fetchone()
+        return self._document_version_from_row(row) if row else None
+
+    def list_document_versions(self, doc_id: str) -> list[DocumentVersion]:
+        """List document versions newest first."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM document_versions WHERE doc_id = ? ORDER BY created_at DESC",
+                (doc_id,),
+            ).fetchall()
+        return [self._document_version_from_row(row) for row in rows]
+
+    def stage_document_version(self, version_id: str, last_completed_stage: str) -> None:
+        """Record a successfully staged external-store checkpoint."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE document_versions
+                SET status = 'staged', last_completed_stage = ?, last_error = NULL
+                WHERE version_id = ? AND status IN ('building', 'staged')
+                """,
+                (last_completed_stage, version_id),
+            )
+
+    def fail_document_version(self, version_id: str, error_message: str) -> None:
+        """Fail only the candidate version; never replace the active version."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE document_versions
+                SET status = 'failed', last_error = ?
+                WHERE version_id = ? AND status <> 'active'
+                """,
+                (error_message, version_id),
+            )
+
+    def activate_document_version(self, version_id: str) -> str | None:
+        """Atomically swap the active SQLite version and return the superseded ID."""
+        now = utc_now_iso()
+        with self._connection() as conn:
+            candidate = conn.execute(
+                "SELECT doc_id FROM document_versions WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+            if candidate is None:
+                raise KeyError(f"Unknown document version: {version_id}")
+            doc_id = str(candidate["doc_id"])
+            previous = conn.execute(
+                """
+                SELECT version_id FROM document_versions
+                WHERE doc_id = ? AND status = 'active' AND version_id <> ?
+                """,
+                (doc_id, version_id),
+            ).fetchone()
+            previous_id = str(previous["version_id"]) if previous else None
+            conn.execute(
+                """
+                UPDATE document_versions
+                SET status = 'superseded', superseded_at = ?
+                WHERE doc_id = ? AND status = 'active' AND version_id <> ?
+                """,
+                (now, doc_id, version_id),
+            )
+            updated = conn.execute(
+                """
+                UPDATE document_versions
+                SET status = 'active', activated_at = ?, superseded_at = NULL, last_error = NULL
+                WHERE version_id = ? AND status IN ('building', 'staged')
+                """,
+                (now, version_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(f"Document version {version_id} is not activatable.")
+            conn.execute(
+                "UPDATE chunks SET active = 0 WHERE doc_id = ? AND document_version_id <> ?",
+                (doc_id, version_id),
+            )
+            conn.execute(
+                "UPDATE chunks SET active = 1 WHERE document_version_id = ?",
+                (version_id,),
+            )
+            conn.execute(
+                "UPDATE entity_mentions SET active = 0 WHERE doc_id = ? AND document_version_id <> ?",
+                (doc_id, version_id),
+            )
+            conn.execute(
+                "UPDATE entity_mentions SET active = 1 WHERE document_version_id = ?",
+                (version_id,),
+            )
+            conn.execute(
+                "UPDATE version_doc_entities SET active = 0 WHERE doc_id = ? AND document_version_id <> ?",
+                (doc_id, version_id),
+            )
+            conn.execute(
+                "UPDATE version_doc_entities SET active = 1 WHERE document_version_id = ?",
+                (version_id,),
+            )
+            # Keep the legacy convenience table as a projection of the active
+            # immutable version while all query code is migrated.
+            conn.execute("DELETE FROM doc_entities WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                """
+                INSERT INTO doc_entities (
+                    doc_id, entity_id, canonical_name, aliases,
+                    document_version_id, active
+                )
+                SELECT doc_id, entity_id, canonical_name, aliases,
+                       document_version_id, 1
+                FROM version_doc_entities
+                WHERE document_version_id = ?
+                """,
+                (version_id,),
+            )
+        return previous_id
+
+    def enqueue_outbox_event(self, event: OutboxEvent) -> None:
+        """Insert an event once; replaying the same enqueue is a no-op."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO outbox_events (
+                    event_id, event_type, run_id, doc_id, document_version_id,
+                    payload_json, status, attempts, available_at, last_error,
+                    created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (
+                    event.event_id,
+                    event.event_type,
+                    event.run_id,
+                    event.doc_id,
+                    event.document_version_id,
+                    event.payload_json,
+                    event.status,
+                    event.attempts,
+                    event.available_at.isoformat(),
+                    event.last_error,
+                    event.created_at.isoformat(),
+                    event.completed_at.isoformat() if event.completed_at else None,
+                ),
+            )
+
+    def claim_next_outbox_event(
+        self,
+        max_attempts: int = 5,
+        *,
+        document_version_id: str | None = None,
+        lease_seconds: float = 60.0,
+    ) -> OutboxEvent | None:
+        """Claim ready work, including a processing event whose lease expired."""
+        now = utc_now_iso()
+        lease_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=max(1.0, lease_seconds))
+        ).isoformat()
+        version_clause = "AND document_version_id = ?" if document_version_id is not None else ""
+        select_params: list[object] = [now, max_attempts]
+        if document_version_id is not None:
+            select_params.append(document_version_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT * FROM outbox_events
+                WHERE status IN ('pending', 'failed', 'processing')
+                  AND available_at <= ?
+                  AND attempts < ?
+                  {version_clause}
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                select_params,
+            ).fetchone()
+            if row is None:
+                return None
+            event_id = str(row["event_id"])
+            updated = conn.execute(
+                """
+                UPDATE outbox_events
+                SET status = 'processing', attempts = attempts + 1, available_at = ?
+                WHERE event_id = ? AND status IN ('pending', 'failed', 'processing')
+                """,
+                (lease_until, event_id),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM outbox_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return self._outbox_event_from_row(claimed)
+
+    def complete_outbox_event(self, event_id: str) -> None:
+        """Mark an idempotent external-store event complete."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE outbox_events
+                SET status = 'completed', completed_at = ?, last_error = NULL
+                WHERE event_id = ?
+                """,
+                (utc_now_iso(), event_id),
+            )
+
+    def fail_outbox_event(
+        self,
+        event_id: str,
+        error_message: str,
+        *,
+        max_attempts: int = 5,
+        retry_base_seconds: float = 1.0,
+    ) -> str:
+        """Schedule retry or dead-letter an exhausted event; return new status."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM outbox_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown outbox event: {event_id}")
+            attempts = int(row["attempts"] or 0)
+            if attempts >= max_attempts:
+                status = "dead_letter"
+                available_at = utc_now_iso()
+            else:
+                status = "failed"
+                delay = max(0.0, retry_base_seconds) * (2 ** max(0, attempts - 1))
+                available_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+            conn.execute(
+                """
+                UPDATE outbox_events
+                SET status = ?, available_at = ?, last_error = ?, completed_at = NULL
+                WHERE event_id = ?
+                """,
+                (status, available_at, error_message, event_id),
+            )
+        return status
+
+    def list_outbox_events(
+        self,
+        *,
+        document_version_id: str | None = None,
+        status: str | None = None,
+    ) -> list[OutboxEvent]:
+        """List validated outbox events for reconciliation/observability."""
+        clauses: list[str] = []
+        params: list[str] = []
+        if document_version_id is not None:
+            clauses.append("document_version_id = ?")
+            params.append(document_version_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM outbox_events {where} ORDER BY created_at ASC",
+                params,
+            ).fetchall()
+        return [self._outbox_event_from_row(row) for row in rows]
+
+    def has_pending_corpus_update(self) -> bool:
+        """Return whether activation/reconciliation work remains incomplete."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM outbox_events
+                WHERE status IN ('pending', 'processing', 'failed', 'dead_letter')
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
+    def record_merge_decision(self, decision: MergeDecision) -> None:
+        """Persist a merge decision before applying its graph mapping."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO merge_decisions (
+                    decision_id, run_id, doc_id, document_version_id,
+                    incoming_local_entity_id, incoming_name, incoming_type,
+                    candidate_entity_id, candidate_name, candidate_type,
+                    top1_similarity, top2_similarity, score_margin,
+                    type_compatible, decision, rationale, model_id,
+                    prompt_version, adjudication_confidence,
+                    reverses_decision_id, created_at, reversed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.decision_id,
+                    decision.run_id,
+                    decision.doc_id,
+                    decision.document_version_id,
+                    decision.incoming_local_entity_id,
+                    decision.incoming_name,
+                    decision.incoming_type,
+                    decision.candidate_entity_id,
+                    decision.candidate_name,
+                    decision.candidate_type,
+                    decision.top1_similarity,
+                    decision.top2_similarity,
+                    decision.score_margin,
+                    int(decision.type_compatible),
+                    decision.decision,
+                    decision.rationale,
+                    decision.model_id,
+                    decision.prompt_version,
+                    decision.adjudication_confidence,
+                    decision.reverses_decision_id,
+                    decision.created_at.isoformat(),
+                    decision.reversed_at.isoformat() if decision.reversed_at else None,
+                ),
+            )
+
+    def get_merge_decision(self, decision_id: str) -> MergeDecision | None:
+        """Fetch one merge decision for audit or rollback."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM merge_decisions WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+        return self._merge_decision_from_row(row) if row else None
+
+    def mark_merge_decision_reversed(self, decision_id: str, reversed_at: str | None = None) -> None:
+        """Mark the original decision reversed without deleting its history."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE merge_decisions SET reversed_at = ? WHERE decision_id = ?",
+                (reversed_at or utc_now_iso(), decision_id),
+            )
+
+    def stage_version_records(
+        self,
+        *,
+        document_version_id: str,
+        chunks: Sequence[Chunk],
+        mentions: Sequence[tuple[str, str, str, float] | tuple[str, str, str, float, str]],
+        doc_entities: Sequence[dict[str, object]],
+        initial_event: OutboxEvent,
+    ) -> None:
+        """Atomically stage SQLite records and the first external-store event."""
+        if initial_event.document_version_id != document_version_id:
+            raise ValueError("Initial outbox event belongs to a different document version.")
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO chunks (
+                    chunk_id, doc_id, text, token_count, position, section, page,
+                    chunk_hash, embedding_version, document_version_id, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    text = excluded.text,
+                    token_count = excluded.token_count,
+                    position = excluded.position,
+                    section = excluded.section,
+                    page = excluded.page,
+                    chunk_hash = excluded.chunk_hash,
+                    embedding_version = excluded.embedding_version,
+                    document_version_id = excluded.document_version_id,
+                    active = 0
+                """,
+                [
+                    (
+                        chunk.chunk_id,
+                        chunk.doc_id,
+                        chunk.text,
+                        chunk.token_count,
+                        chunk.position,
+                        chunk.section_heading,
+                        chunk.page_number,
+                        chunk.chunk_hash,
+                        None,
+                        document_version_id,
+                    )
+                    for chunk in chunks
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO entity_mentions (
+                    entity_id, chunk_id, doc_id, confidence, document_version_id, active,
+                    local_entity_id
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT DO UPDATE SET
+                    entity_id = excluded.entity_id,
+                    confidence = excluded.confidence,
+                    doc_id = excluded.doc_id,
+                    active = 0
+                """,
+                [
+                    (
+                        mention[0], mention[1], mention[2], mention[3], document_version_id,
+                        mention[4] if len(mention) > 4 else mention[0],
+                    )
+                    for mention in mentions
+                ],
+            )
+
+            conn.executemany(
+                """
+                INSERT INTO version_doc_entities (
+                    document_version_id, doc_id, entity_id, canonical_name, aliases, active
+                ) VALUES (?, ?, ?, ?, ?, 0)
+                ON CONFLICT(document_version_id, entity_id) DO UPDATE SET
+                    canonical_name = excluded.canonical_name,
+                    aliases = excluded.aliases,
+                    active = 0
+                """,
+                [
+                    (
+                        document_version_id,
+                        str(entity["doc_id"]),
+                        str(entity["entity_id"]),
+                        str(entity["canonical_name"]),
+                        json.dumps(entity.get("aliases", [])),
+                    )
+                    for entity in doc_entities
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO outbox_events (
+                    event_id, event_type, run_id, doc_id, document_version_id,
+                    payload_json, status, attempts, available_at, last_error,
+                    created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (
+                    initial_event.event_id,
+                    initial_event.event_type,
+                    initial_event.run_id,
+                    initial_event.doc_id,
+                    initial_event.document_version_id,
+                    initial_event.payload_json,
+                    initial_event.status,
+                    initial_event.attempts,
+                    initial_event.available_at.isoformat(),
+                    initial_event.last_error,
+                    initial_event.created_at.isoformat(),
+                    initial_event.completed_at.isoformat() if initial_event.completed_at else None,
+                ),
+            )
+
+    def rollback_version_entity_mapping(
+        self,
+        *,
+        document_version_id: str,
+        local_entity_id: str,
+        merged_entity_id: str,
+        restored_entity_id: str,
+        canonical_name: str,
+        aliases: Sequence[str],
+    ) -> int:
+        """Remap only mentions owned by one audited local entity identity."""
+        with self._connection() as conn:
+            version = conn.execute(
+                "SELECT doc_id, status FROM document_versions WHERE version_id = ?",
+                (document_version_id,),
+            ).fetchone()
+            if version is None:
+                raise KeyError(document_version_id)
+            doc_id = str(version["doc_id"])
+            updated = conn.execute(
+                """
+                UPDATE entity_mentions
+                SET entity_id = ?
+                WHERE document_version_id = ?
+                  AND local_entity_id = ?
+                  AND entity_id = ?
+                """,
+                (restored_entity_id, document_version_id, local_entity_id, merged_entity_id),
+            )
+            if updated.rowcount == 0:
+                raise RuntimeError("No affected entity mentions were found for merge rollback.")
+            conn.execute(
+                """
+                INSERT INTO version_doc_entities (
+                    document_version_id, doc_id, entity_id, canonical_name, aliases, active
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_version_id, entity_id) DO UPDATE SET
+                    canonical_name = excluded.canonical_name,
+                    aliases = excluded.aliases,
+                    active = excluded.active
+                """,
+                (
+                    document_version_id,
+                    doc_id,
+                    restored_entity_id,
+                    canonical_name,
+                    json.dumps(list(dict.fromkeys(aliases))),
+                    int(str(version["status"]) == "active"),
+                ),
+            )
+            remaining = conn.execute(
+                """
+                SELECT 1 FROM entity_mentions
+                WHERE document_version_id = ? AND entity_id = ?
+                LIMIT 1
+                """,
+                (document_version_id, merged_entity_id),
+            ).fetchone()
+            if remaining is None:
+                conn.execute(
+                    """
+                    DELETE FROM version_doc_entities
+                    WHERE document_version_id = ? AND entity_id = ?
+                    """,
+                    (document_version_id, merged_entity_id),
+                )
+            if str(version["status"]) == "active":
+                conn.execute("DELETE FROM doc_entities WHERE doc_id = ?", (doc_id,))
+                conn.execute(
+                    """
+                    INSERT INTO doc_entities (
+                        doc_id, entity_id, canonical_name, aliases,
+                        document_version_id, active
+                    )
+                    SELECT doc_id, entity_id, canonical_name, aliases,
+                           document_version_id, 1
+                    FROM version_doc_entities
+                    WHERE document_version_id = ?
+                    """,
+                    (document_version_id,),
+                )
+        return int(updated.rowcount)
+
+    @staticmethod
+    def _document_version_from_row(row: sqlite3.Row) -> DocumentVersion:
+        return DocumentVersion.model_validate(dict(row))
+
+    @staticmethod
+    def _outbox_event_from_row(row: sqlite3.Row) -> OutboxEvent:
+        return OutboxEvent.model_validate(dict(row))
+
+    @staticmethod
+    def _merge_decision_from_row(row: sqlite3.Row) -> MergeDecision:
+        payload = dict(row)
+        payload["type_compatible"] = bool(payload.get("type_compatible"))
+        return MergeDecision.model_validate(payload)
 
     def get_document_by_source(self, source_path: str) -> sqlite3.Row | None:
         """Fetch document row by source path."""
@@ -293,28 +1038,76 @@ class MetadataStore:
                 ("failed", "FAILED", error_message, doc_id),
             )
 
-    def get_chunk_ids_by_hash(self, doc_id: str) -> dict[str, str]:
+    def get_chunk_ids_by_hash(
+        self,
+        doc_id: str,
+        document_version_id: str | None = None,
+        *,
+        active_only: bool = False,
+    ) -> dict[str, str]:
         """Map existing chunk_hash -> chunk_id for one document."""
+        clauses = ["doc_id = ?"]
+        params: list[object] = [doc_id]
+        if document_version_id is not None:
+            clauses.append("document_version_id = ?")
+            params.append(document_version_id)
+        if active_only:
+            clauses.append("active = 1")
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT chunk_hash, chunk_id FROM chunks WHERE doc_id = ?",
-                (doc_id,),
+                f"SELECT chunk_hash, chunk_id FROM chunks WHERE {' AND '.join(clauses)}",
+                params,
             ).fetchall()
         return {str(row["chunk_hash"]): str(row["chunk_id"]) for row in rows}
 
-    def get_chunks_for_doc(self, doc_id: str) -> list[sqlite3.Row]:
+    def get_chunks_for_doc(
+        self,
+        doc_id: str,
+        document_version_id: str | None = None,
+        *,
+        active_only: bool = False,
+    ) -> list[sqlite3.Row]:
         """Fetch all chunk rows for one document."""
+        clauses = ["doc_id = ?"]
+        params: list[object] = [doc_id]
+        if document_version_id is not None:
+            clauses.append("document_version_id = ?")
+            params.append(document_version_id)
+        if active_only:
+            clauses.append("active = 1")
         with self._connection() as conn:
             rows = conn.execute(
-                """
-                SELECT chunk_id, doc_id, text, section, page, chunk_hash, embedding_version
+                f"""
+                SELECT chunk_id, doc_id, text, section, page, chunk_hash, embedding_version,
+                       document_version_id, active
                 FROM chunks
-                WHERE doc_id = ?
+                WHERE {' AND '.join(clauses)}
                 ORDER BY position ASC
                 """,
-                (doc_id,),
+                params,
             ).fetchall()
         return rows
+
+    def get_chunk_by_id(
+        self,
+        chunk_id: str,
+        *,
+        document_version_id: str | None = None,
+        active_only: bool = True,
+    ) -> sqlite3.Row | None:
+        """Resolve one exact evidence chunk, optionally constrained to its version."""
+        clauses = ["chunk_id = ?"]
+        params: list[object] = [chunk_id]
+        if document_version_id is not None:
+            clauses.append("document_version_id = ?")
+            params.append(document_version_id)
+        if active_only:
+            clauses.append("active = 1")
+        with self._connection() as conn:
+            return conn.execute(
+                f"SELECT * FROM chunks WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
 
     def delete_chunks_by_hashes(self, doc_id: str, hashes: Iterable[str]) -> None:
         """Delete only removed chunk hashes for delta update flow."""
@@ -329,21 +1122,30 @@ class MetadataStore:
                 params,
             )
 
-    def upsert_chunks(self, chunks: list[Chunk]) -> None:
+    def upsert_chunks(
+        self,
+        chunks: list[Chunk],
+        document_version_id: str | None = None,
+        *,
+        active: bool = True,
+    ) -> None:
         """Upsert chunk rows emitted by chunker."""
         with self._connection() as conn:
             conn.executemany(
                 """
                 INSERT INTO chunks (
-                    chunk_id, doc_id, text, token_count, position, section, page, chunk_hash, embedding_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    chunk_id, doc_id, text, token_count, position, section, page,
+                    chunk_hash, embedding_version, document_version_id, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
                     position = excluded.position,
                     section = excluded.section,
                     page = excluded.page,
-                    chunk_hash = excluded.chunk_hash
+                    chunk_hash = excluded.chunk_hash,
+                    document_version_id = excluded.document_version_id,
+                    active = excluded.active
                 """,
                 [
                     (
@@ -356,6 +1158,8 @@ class MetadataStore:
                         chunk.page_number,
                         chunk.chunk_hash,
                         None,
+                        document_version_id,
+                        int(active),
                     )
                     for chunk in chunks
                 ],
@@ -373,8 +1177,40 @@ class MetadataStore:
                 params,
             )
 
-    def upsert_doc_entities(self, doc_id: str, entities: Sequence[dict[str, object]]) -> None:
+    def upsert_doc_entities(
+        self,
+        doc_id: str,
+        entities: Sequence[dict[str, object]],
+        document_version_id: str | None = None,
+        *,
+        active: bool = True,
+    ) -> None:
         """Upsert canonical entity records for a document."""
+        if document_version_id is not None:
+            with self._connection() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO version_doc_entities (
+                        document_version_id, doc_id, entity_id, canonical_name, aliases, active
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(document_version_id, entity_id) DO UPDATE SET
+                        canonical_name = excluded.canonical_name,
+                        aliases = excluded.aliases,
+                        active = excluded.active
+                    """,
+                    [
+                        (
+                            document_version_id,
+                            doc_id,
+                            str(entity["entity_id"]),
+                            str(entity["canonical_name"]),
+                            json.dumps(entity.get("aliases", [])),
+                            int(active),
+                        )
+                        for entity in entities
+                    ],
+                )
+            return
         with self._connection() as conn:
             conn.executemany(
                 """
@@ -408,8 +1244,39 @@ class MetadataStore:
                 params,
             )
 
-    def get_doc_entities(self, doc_id: str) -> list[dict[str, object]]:
+    def get_doc_entities(
+        self,
+        doc_id: str,
+        document_version_id: str | None = None,
+        *,
+        active_only: bool = False,
+    ) -> list[dict[str, object]]:
         """Fetch stored canonical entities for a document."""
+        if document_version_id is not None or active_only:
+            clauses = ["doc_id = ?"]
+            params: list[object] = [doc_id]
+            if document_version_id is not None:
+                clauses.append("document_version_id = ?")
+                params.append(document_version_id)
+            if active_only:
+                clauses.append("active = 1")
+            with self._connection() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT entity_id, canonical_name, aliases
+                    FROM version_doc_entities
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    params,
+                ).fetchall()
+            return [
+                {
+                    "entity_id": str(row["entity_id"]),
+                    "canonical_name": str(row["canonical_name"]),
+                    "aliases": json.loads(row["aliases"]) if row["aliases"] else [],
+                }
+                for row in rows
+            ]
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT entity_id, canonical_name, aliases FROM doc_entities WHERE doc_id = ?",
@@ -450,6 +1317,9 @@ class MetadataStore:
     def upsert_entity_mentions(
         self,
         mentions: Sequence[tuple[str, str, str, float]],
+        document_version_id: str | None = None,
+        *,
+        active: bool = True,
     ) -> None:
         """Insert entity mention rows (entity_id, chunk_id, doc_id, confidence)."""
         if not mentions:
@@ -457,15 +1327,26 @@ class MetadataStore:
         with self._connection() as conn:
             conn.executemany(
                 """
-                INSERT INTO entity_mentions (entity_id, chunk_id, doc_id, confidence)
-                SELECT ?, ?, ?, ?
+                INSERT INTO entity_mentions (
+                    entity_id, chunk_id, doc_id, confidence, document_version_id, active
+                )
+                SELECT :entity_id, :chunk_id, :doc_id, :confidence, :version_id, :active
                 WHERE NOT EXISTS (
                     SELECT 1 FROM entity_mentions
-                    WHERE entity_id = ? AND chunk_id = ? AND doc_id = ?
+                    WHERE entity_id = :entity_id AND chunk_id = :chunk_id AND doc_id = :doc_id
+                      AND ((:version_id IS NULL AND document_version_id IS NULL)
+                           OR document_version_id = :version_id)
                 )
                 """,
                 [
-                    (entity_id, chunk_id, doc_id, confidence, entity_id, chunk_id, doc_id)
+                    {
+                        "entity_id": entity_id,
+                        "chunk_id": chunk_id,
+                        "doc_id": doc_id,
+                        "confidence": confidence,
+                        "version_id": document_version_id,
+                        "active": int(active),
+                    }
                     for entity_id, chunk_id, doc_id, confidence in mentions
                 ],
             )
@@ -474,6 +1355,9 @@ class MetadataStore:
         self,
         doc_id: str,
         chunk_ids: Sequence[str] | None = None,
+        document_version_id: str | None = None,
+        *,
+        active_only: bool = False,
     ) -> dict[str, list[str]]:
         """Return mapping chunk_id -> mentioned canonical entity IDs."""
         params: list[str] = [doc_id]
@@ -482,6 +1366,11 @@ class MetadataStore:
             placeholders = ",".join(["?"] * len(chunk_ids))
             chunk_filter = f"AND chunk_id IN ({placeholders})"
             params.extend(chunk_ids)
+        version_filter = ""
+        if document_version_id is not None:
+            version_filter = "AND document_version_id = ?"
+            params.append(document_version_id)
+        active_filter = "AND active = 1" if active_only else ""
         with self._connection() as conn:
             rows = conn.execute(
                 f"""
@@ -489,6 +1378,8 @@ class MetadataStore:
                 FROM entity_mentions
                 WHERE doc_id = ?
                 {chunk_filter}
+                {version_filter}
+                {active_filter}
                 """,
                 params,
             ).fetchall()
@@ -523,12 +1414,25 @@ class MetadataStore:
             ).fetchall()
         return {str(row["entity_id"]) for row in rows}
 
-    def get_entity_ids_with_mentions(self, doc_id: str) -> set[str]:
+    def get_entity_ids_with_mentions(
+        self,
+        doc_id: str,
+        document_version_id: str | None = None,
+        *,
+        active_only: bool = False,
+    ) -> set[str]:
         """Get entity IDs still mentioned in any chunk for a document."""
+        clauses = ["doc_id = ?"]
+        params: list[object] = [doc_id]
+        if document_version_id is not None:
+            clauses.append("document_version_id = ?")
+            params.append(document_version_id)
+        if active_only:
+            clauses.append("active = 1")
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT entity_id FROM entity_mentions WHERE doc_id = ?",
-                (doc_id,),
+                f"SELECT DISTINCT entity_id FROM entity_mentions WHERE {' AND '.join(clauses)}",
+                params,
             ).fetchall()
         return {str(row["entity_id"]) for row in rows}
 
@@ -542,6 +1446,7 @@ class MetadataStore:
         entities_created: int = 0,
         relations_created: int = 0,
         entities_merged: int = 0,
+        document_version_id: str | None = None,
     ) -> None:
         """Write one ingestion_log row for a document run."""
         with self._connection() as conn:
@@ -549,8 +1454,9 @@ class MetadataStore:
                 """
                 INSERT INTO ingestion_log (
                     run_id, doc_id, started_at, finished_at,
-                    entities_created, relations_created, entities_merged, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    entities_created, relations_created, entities_merged, status,
+                    document_version_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -561,5 +1467,6 @@ class MetadataStore:
                     relations_created,
                     entities_merged,
                     status,
+                    document_version_id,
                 ),
             )

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from typing import Any
 
 from config import Settings
+from ingestion.state_store import MetadataStore
 from models.query import LinkedEntity, QueryAnalysis, QueryType, RetrieverResult
 from retrieval.dynamic_cypher import DynamicCypherPlan, DynamicCypherPlanner
 
@@ -29,12 +31,14 @@ class GraphRetriever:
         settings: Settings,
         driver: Any | None = None,
         planner: DynamicCypherPlanner | None = None,
+        store: MetadataStore | None = None,
     ) -> None:
         self.settings = settings
         self._driver = driver
+        self._async_driver = None
         if self._driver is None:
             try:
-                from neo4j import GraphDatabase
+                from neo4j import AsyncGraphDatabase, GraphDatabase
             except Exception as exc:  # pragma: no cover
                 raise RuntimeError("neo4j driver is required for graph retrieval.") from exc
             self._driver = GraphDatabase.driver(
@@ -44,11 +48,127 @@ class GraphRetriever:
                     self.settings.neo4j_query_password or self.settings.neo4j_password,
                 ),
             )
+            self._async_driver = AsyncGraphDatabase.driver(
+                self.settings.neo4j_uri,
+                auth=(
+                    self.settings.neo4j_query_user or self.settings.neo4j_user,
+                    self.settings.neo4j_query_password or self.settings.neo4j_password,
+                ),
+            )
         self._planner = planner or DynamicCypherPlanner(settings=self.settings, driver=self._driver)
+        self.store = store
 
     def close(self) -> None:
         if self._driver is not None:
             self._driver.close()
+
+    async def aclose(self) -> None:
+        if self._async_driver is not None:
+            await self._async_driver.close()
+
+    async def aretrieve(
+        self,
+        analysis: QueryAnalysis,
+        linked_entities: list[LinkedEntity],
+        user_query: str = "",
+    ) -> list[RetrieverResult]:
+        """Retrieve using Neo4j's async driver while preserving static fallback."""
+        if self._async_driver is None:
+            return await asyncio.to_thread(
+                self.retrieve,
+                analysis,
+                linked_entities,
+                user_query,
+            )
+        anchors = self._select_graph_anchors(linked_entities)
+        if not anchors or analysis.query_type is QueryType.GLOBAL:
+            return []
+        if self.settings.query_graph_dynamic_enabled and user_query.strip():
+            try:
+                plan = await asyncio.to_thread(
+                    self._planner.generate_plan,
+                    user_query,
+                    analysis,
+                    anchors,
+                )
+                cypher, params = self._compile_logical_plan(plan)
+                rows = await self._aexecute_read(cypher, params)
+                return self._rows_to_results(
+                    rows,
+                    analysis,
+                    anchors,
+                    "dynamic",
+                    None,
+                    plan,
+                )
+            except Exception as exc:
+                if not self.settings.query_graph_dynamic_fallback_to_static:
+                    return []
+                return await self._aretrieve_static(
+                    analysis,
+                    anchors,
+                    query_mode="static_fallback",
+                    fallback_reason=f"{type(exc).__name__}: {exc}",
+                )
+        return await self._aretrieve_static(analysis, anchors, query_mode="static")
+
+    async def _aretrieve_static(
+        self,
+        analysis: QueryAnalysis,
+        anchors: list[LinkedEntity],
+        *,
+        query_mode: str,
+        fallback_reason: str | None = None,
+    ) -> list[RetrieverResult]:
+        if analysis.query_type is QueryType.MULTIHOP and len(anchors) >= 2:
+            query = self._build_connecting_query(int(self.settings.query_graph_multihop_hops))
+            params = {
+                "entity_a": str(anchors[0].entity_id),
+                "entity_b": str(anchors[1].entity_id),
+                "path_limit": int(self.settings.query_graph_path_limit),
+                "relationship_types": [],
+                **self._temporal_params(analysis.temporal_filter),
+            }
+            rows = await self._aexecute_read(query, params)
+            return self._rows_to_results(
+                rows,
+                analysis,
+                anchors[:2],
+                query_mode,
+                fallback_reason,
+            )
+        hops = (
+            int(self.settings.query_graph_multihop_hops)
+            if analysis.query_type is QueryType.MULTIHOP
+            else int(self.settings.query_graph_local_hops)
+        )
+        query = self._build_neighbor_query(hops)
+        row_groups = await asyncio.gather(
+            *(
+                self._aexecute_read(
+                    query,
+                    {
+                        "entity_id": str(anchor.entity_id),
+                        "path_limit": int(self.settings.query_graph_path_limit),
+                        "relationship_types": [],
+                        **self._temporal_params(analysis.temporal_filter),
+                    },
+                )
+                for anchor in anchors
+            )
+        )
+        results: list[RetrieverResult] = []
+        for anchor, rows in zip(anchors, row_groups):
+            results.extend(
+                self._rows_to_results(
+                    rows,
+                    QueryAnalysis(query_type=analysis.query_type),
+                    [anchor],
+                    query_mode,
+                    fallback_reason,
+                )
+            )
+        return results
 
     def retrieve(
         self,
@@ -99,19 +219,8 @@ class GraphRetriever:
         params.pop("max_hops", None)
         params["path_limit"] = path_limit
         params["relationship_types"] = list(plan.relationship_types)
-        relationship_filter = (
-            "WHERE size($relationship_types) = 0 OR "
-            "all(rel IN relationships(p) WHERE coalesce(rel.type, type(rel)) IN $relationship_types) "
-        )
-        projection = (
-            "[n IN nodes(p) | coalesce(n.name, n.id)] AS node_names, "
-            "[rel IN relationships(p) | coalesce(rel.type, type(rel))] AS rel_types, "
-            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights, "
-            "[i IN range(0, size(relationships(p)) - 1) | "
-            "CASE WHEN startNode(relationships(p)[i]) = nodes(p)[i] THEN 'out' ELSE 'in' END] AS rel_directions, "
-            "[rel IN relationships(p) | coalesce(rel.source_refs, [])] AS rel_source_refs "
-            "LIMIT $path_limit"
-        )
+        params.update(self._temporal_params(plan.temporal_filter_hint))
+        traversal_hops = max_hops * 2
 
         if plan.mode in {"neighborhood", "comparative"}:
             anchor_ids = params.get("anchor_ids")
@@ -119,19 +228,17 @@ class GraphRetriever:
                 raise ValueError(f"Logical graph plan mode {plan.mode} requires anchor_ids.")
             cypher = (
                 "UNWIND $anchor_ids AS anchor_id "
-                f"MATCH p=(start:Entity {{id: anchor_id}})-[*1..{max_hops}]-(nbr:Entity) "
-                f"{relationship_filter}"
-                "RETURN anchor_id AS anchor_entity_id, "
-                f"{projection}"
+                f"MATCH p=(start:Entity {{id: anchor_id}})-[:SUBJECT_OF|OBJECT*1..{traversal_hops}]-(nbr:Entity) "
+                f"{self._assertion_path_filter()}"
+                f"{self._assertion_projection('anchor_id')}"
             )
         elif plan.mode == "multihop_pair":
             if not params.get("anchor_a") or not params.get("anchor_b"):
                 raise ValueError("Logical graph plan mode multihop_pair requires anchor_a and anchor_b.")
             cypher = (
-                f"MATCH p=shortestPath((a:Entity {{id: $anchor_a}})-[*1..{max_hops}]-(b:Entity {{id: $anchor_b}})) "
-                f"{relationship_filter}"
-                "RETURN $anchor_a + '|' + $anchor_b AS anchor_entity_id, "
-                f"{projection}"
+                f"MATCH p=shortestPath((a:Entity {{id: $anchor_a}})-[:SUBJECT_OF|OBJECT*1..{traversal_hops}]-(b:Entity {{id: $anchor_b}})) "
+                f"{self._assertion_path_filter()}"
+                f"{self._assertion_projection("$anchor_a + '|' + $anchor_b") }"
             )
         else:
             raise ValueError(f"Unsupported logical graph plan mode: {plan.mode}")
@@ -160,6 +267,7 @@ class GraphRetriever:
                 linked_entities=anchors,
                 max_hops=int(self.settings.query_graph_local_hops),
                 query_type=analysis.query_type,
+                temporal_filter=analysis.temporal_filter,
                 query_mode=query_mode,
                 fallback_reason=fallback_reason,
             )
@@ -172,6 +280,7 @@ class GraphRetriever:
             linked_entities=anchors,
             max_hops=max_hops,
             query_type=analysis.query_type,
+            temporal_filter=analysis.temporal_filter,
             query_mode=query_mode,
             fallback_reason=fallback_reason,
         )
@@ -195,6 +304,7 @@ class GraphRetriever:
         linked_entities: list[LinkedEntity],
         max_hops: int,
         query_type: QueryType,
+        temporal_filter: str | None,
         query_mode: str,
         fallback_reason: str | None,
     ) -> list[RetrieverResult]:
@@ -204,6 +314,8 @@ class GraphRetriever:
             params = {
                 "entity_id": str(linked.entity_id),
                 "path_limit": int(self.settings.query_graph_path_limit),
+                "relationship_types": [],
+                **self._temporal_params(temporal_filter),
             }
             rows = self._execute_read(query, params)
             all_results.extend(
@@ -229,6 +341,8 @@ class GraphRetriever:
             "entity_a": str(linked_entities[0].entity_id),
             "entity_b": str(linked_entities[1].entity_id),
             "path_limit": int(self.settings.query_graph_path_limit),
+            "relationship_types": [],
+            **self._temporal_params(analysis.temporal_filter),
         }
         rows = self._execute_read(query, params)
         return self._rows_to_results(
@@ -242,36 +356,68 @@ class GraphRetriever:
     def _build_neighbor_query(self, max_hops: int) -> str:
         hops = max(1, int(max_hops))
         return (
-            "MATCH p=(start:Entity {id: $entity_id})-[*1.."
-            f"{hops}"
+            "MATCH p=(start:Entity {id: $entity_id})-[:SUBJECT_OF|OBJECT*1.."
+            f"{hops * 2}"
             "]-(nbr:Entity) "
-            "RETURN "
-            "$entity_id AS anchor_entity_id, "
-            "[n IN nodes(p) | coalesce(n.name, n.id)] AS node_names, "
-            "[rel IN relationships(p) | coalesce(rel.type, type(rel))] AS rel_types, "
-            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights, "
-            "[i IN range(0, size(relationships(p)) - 1) | "
-            "CASE WHEN startNode(relationships(p)[i]) = nodes(p)[i] THEN 'out' ELSE 'in' END] AS rel_directions, "
-            "[rel IN relationships(p) | coalesce(rel.source_refs, [])] AS rel_source_refs "
-            "LIMIT $path_limit"
+            f"{self._assertion_path_filter()}"
+            f"{self._assertion_projection('$entity_id')}"
         )
 
     def _build_connecting_query(self, max_hops: int) -> str:
         hops = max(1, int(max_hops))
         return (
-            "MATCH p=shortestPath((a:Entity {id: $entity_a})-[*1.."
-            f"{hops}"
+            "MATCH p=shortestPath((a:Entity {id: $entity_a})-[:SUBJECT_OF|OBJECT*1.."
+            f"{hops * 2}"
             "]-(b:Entity {id: $entity_b})) "
-            "RETURN "
-            "$entity_a + '|' + $entity_b AS anchor_entity_id, "
-            "[n IN nodes(p) | coalesce(n.name, n.id)] AS node_names, "
-            "[rel IN relationships(p) | coalesce(rel.type, type(rel))] AS rel_types, "
-            "[rel IN relationships(p) | coalesce(rel.weight, 0.0)] AS rel_weights, "
-            "[i IN range(0, size(relationships(p)) - 1) | "
-            "CASE WHEN startNode(relationships(p)[i]) = nodes(p)[i] THEN 'out' ELSE 'in' END] AS rel_directions, "
-            "[rel IN relationships(p) | coalesce(rel.source_refs, [])] AS rel_source_refs "
-            "LIMIT $path_limit"
+            f"{self._assertion_path_filter()}"
+            f"{self._assertion_projection("$entity_a + '|' + $entity_b") }"
         )
+
+    @staticmethod
+    def _assertion_path_filter() -> str:
+        return (
+            "WHERE all(assertion IN [node IN nodes(p) WHERE node:Assertion] WHERE "
+            "assertion.active = true AND "
+            "(size($relationship_types) = 0 OR assertion.predicate_normalized IN $relationship_types) AND "
+            "($temporal_start IS NULL OR assertion.valid_until IS NULL OR assertion.valid_until >= $temporal_start) AND "
+            "($temporal_end IS NULL OR assertion.valid_from IS NULL OR assertion.valid_from <= $temporal_end)) "
+        )
+
+    @staticmethod
+    def _assertion_projection(anchor_expression: str) -> str:
+        return (
+            "WITH " + anchor_expression + " AS anchor_entity_id, "
+            "[node IN nodes(p) WHERE node:Assertion] AS path_assertions "
+            "UNWIND path_assertions AS assertion "
+            "MATCH (subject:Entity)-[:SUBJECT_OF]->(assertion) "
+            "OPTIONAL MATCH (assertion)-[:OBJECT]->(object:Entity) "
+            "RETURN DISTINCT anchor_entity_id, assertion.id AS assertion_id, "
+            "assertion.claim_key AS claim_key, subject.id AS subject_entity_id, "
+            "subject.name AS subject_name, assertion.predicate_raw AS predicate_raw, "
+            "assertion.predicate_normalized AS predicate_normalized, "
+            "assertion.object_kind AS object_kind, object.id AS object_entity_id, "
+            "object.name AS object_name, assertion.literal_value_json AS literal_value_json, "
+            "assertion.properties_json AS properties_json, assertion.confidence AS confidence, "
+            "assertion.doc_id AS doc_id, assertion.document_version_id AS document_version_id, "
+            "assertion.chunk_id AS chunk_id, assertion.source_ref AS source_ref, "
+            "assertion.valid_from AS valid_from, assertion.valid_until AS valid_until, "
+            "size(path_assertions) AS hop_count LIMIT $path_limit"
+        )
+
+    @staticmethod
+    def _temporal_params(value: str | None) -> dict[str, str | None]:
+        clean = str(value or "").strip()
+        if not clean:
+            return {"temporal_start": None, "temporal_end": None}
+        match = re.fullmatch(r"((?:19|20)\d{2})-((?:19|20)\d{2})", clean)
+        if match:
+            return {
+                "temporal_start": f"{match.group(1)}-01-01",
+                "temporal_end": f"{match.group(2)}-12-31",
+            }
+        if re.fullmatch(r"(?:19|20)\d{2}", clean):
+            return {"temporal_start": f"{clean}-01-01", "temporal_end": f"{clean}-12-31"}
+        return {"temporal_start": None, "temporal_end": None}
 
     def _execute_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         self._assert_read_only(query)
@@ -295,6 +441,32 @@ class GraphRetriever:
                 return list(execute_read(run_in_transaction))
             records = session.run(query, params)
             return [dict(record) for record in records]
+
+    async def _aexecute_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        self._assert_read_only(query)
+        if self._async_driver is None:
+            return await asyncio.to_thread(self._execute_read, query, params)
+
+        async with self._async_driver.session() as session:
+            async def run_in_transaction(tx):  # noqa: ANN001, ANN202
+                query_value: Any = query
+                try:
+                    from neo4j import Query
+
+                    query_value = Query(
+                        query,
+                        timeout=max(
+                            0.1,
+                            float(self.settings.query_graph_transaction_timeout_seconds),
+                        ),
+                        metadata={"component": "graphrag_retrieval"},
+                    )
+                except Exception:
+                    query_value = query
+                result = await tx.run(query_value, params)
+                return [record.data() async for record in result]
+
+            return list(await session.execute_read(run_in_transaction))
 
     def _assert_read_only(self, query: str) -> None:
         normalized = query.strip()
@@ -393,6 +565,17 @@ class GraphRetriever:
         fallback_reason: str | None,
         planner_mode: str | None,
     ) -> RetrieverResult | None:
+        if row.get("assertion_id"):
+            return self._build_assertion_result(
+                row=row,
+                anchor_entity_id=anchor_entity_id,
+                query_type=query_type,
+                anchor_status=anchor_status,
+                anchor_similarity=anchor_similarity,
+                query_mode=query_mode,
+                fallback_reason=fallback_reason,
+                planner_mode=planner_mode,
+            )
         node_names, rel_types, rel_weights, rel_directions, rel_source_refs = self._extract_path_parts(row)
         if len(node_names) < 2 or not rel_types:
             return None
@@ -431,6 +614,95 @@ class GraphRetriever:
             source_type="graph",
             source_id=source_id,
             text_or_path=path,
+            score_raw=score,
+            provenance=provenance,
+        )
+
+    def _build_assertion_result(
+        self,
+        *,
+        row: dict[str, Any],
+        anchor_entity_id: str,
+        query_type: QueryType,
+        anchor_status: str,
+        anchor_similarity: float,
+        query_mode: str,
+        fallback_reason: str | None,
+        planner_mode: str | None,
+    ) -> RetrieverResult | None:
+        assertion_id = str(row.get("assertion_id") or "").strip()
+        chunk_id = str(row.get("chunk_id") or "").strip()
+        version_id = str(row.get("document_version_id") or "").strip()
+        if not assertion_id or not chunk_id or not version_id:
+            return None
+        chunk = None
+        if self.store is not None:
+            chunk = self.store.get_chunk_by_id(
+                chunk_id,
+                document_version_id=version_id,
+                active_only=True,
+            )
+            if chunk is None:
+                return None
+
+        subject_name = str(row.get("subject_name") or row.get("subject_entity_id") or "Entity")
+        predicate = str(row.get("predicate_raw") or row.get("predicate_normalized") or "related to")
+        if str(row.get("object_kind") or "entity") == "literal":
+            raw_literal = str(row.get("literal_value_json") or "null")
+            try:
+                import json
+
+                object_value = json.loads(raw_literal)
+            except (TypeError, ValueError):
+                object_value = raw_literal
+            object_text = str(object_value)
+        else:
+            object_text = str(row.get("object_name") or row.get("object_entity_id") or "Entity")
+        graph_path = f"{subject_name} -[{predicate}]-> {object_text}"
+        evidence_text = str(chunk["text"] or "") if chunk is not None else ""
+        text = graph_path
+        if evidence_text:
+            text = f"{graph_path}\nExact source chunk: {evidence_text}"
+
+        score = max(0.0, min(1.0, float(row.get("confidence") or 0.0)))
+        if anchor_status == "ambiguous":
+            score *= max(0.0, min(1.0, float(self.settings.query_graph_ambiguous_score_penalty)))
+        evidence_id = f"assertion:{assertion_id}"
+        provenance: dict[str, Any] = {
+            "evidence_id": evidence_id,
+            "assertion_id": assertion_id,
+            "claim_key": row.get("claim_key"),
+            "anchor_entity_id": anchor_entity_id,
+            "anchor_status": anchor_status,
+            "anchor_similarity": anchor_similarity,
+            "query_type": query_type.value,
+            "hop_count": int(row.get("hop_count") or 1),
+            "subject_entity_id": row.get("subject_entity_id"),
+            "object_entity_id": row.get("object_entity_id"),
+            "object_kind": row.get("object_kind"),
+            "predicate_raw": row.get("predicate_raw"),
+            "predicate_normalized": row.get("predicate_normalized"),
+            "direction": "subject_to_object",
+            "chunk_id": chunk_id,
+            "doc_id": row.get("doc_id") or (chunk["doc_id"] if chunk is not None else None),
+            "document_version_id": version_id,
+            "source_ref": row.get("source_ref"),
+            "valid_from": row.get("valid_from"),
+            "valid_until": row.get("valid_until"),
+            "section_heading": chunk["section"] if chunk is not None else None,
+            "page": chunk["page"] if chunk is not None else None,
+            "evidence_text": evidence_text,
+            "graph_path": graph_path,
+            "query_mode": query_mode,
+        }
+        if fallback_reason:
+            provenance["fallback_reason"] = fallback_reason
+        if planner_mode:
+            provenance["planner_mode"] = planner_mode
+        return RetrieverResult(
+            source_type="graph",
+            source_id=assertion_id,
+            text_or_path=text,
             score_raw=score,
             provenance=provenance,
         )
