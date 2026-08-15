@@ -94,9 +94,15 @@ class IngestionOutboxProcessor:
             )
             if event is None:
                 break
+            started = time.perf_counter()
             try:
                 self._dispatch(event)
                 self.store.complete_outbox_event(event.event_id)
+                self._record_event_metric(
+                    event,
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                    status="completed",
+                )
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 status = self.store.fail_outbox_event(
@@ -112,11 +118,19 @@ class IngestionOutboxProcessor:
                     event.attempts,
                     status,
                 )
+                self._record_event_metric(
+                    event,
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                    status=status,
+                    error=error,
+                )
                 if status == "dead_letter":
                     version = self.store.get_document_version(event.document_version_id)
-                    if version is None or version.status != "active":
+                    if version is not None and version.status == "active":
+                        self.store.record_document_version_error(event.document_version_id, error)
+                    else:
                         self.store.fail_document_version(event.document_version_id, error)
-                        self.store.fail_document(event.doc_id, error)
+                    self.store.fail_document(event.doc_id, error)
                     break
                 if wait_for_retries:
                     delay = max(0.0, float(self.settings.outbox_retry_base_seconds)) * (
@@ -154,6 +168,7 @@ class IngestionOutboxProcessor:
         counts = self.graph_writer.verify_document_version(event.document_version_id)
         entity_assertions = sum(1 for item in assertions if item.object_kind == "entity")
         expected = {
+            "entities": len(nodes),
             "assertions": len(assertions),
             "subject_edges": len(assertions),
             "entity_assertions": entity_assertions,
@@ -226,35 +241,69 @@ class IngestionOutboxProcessor:
                     "SQLite activation observed a different superseded version "
                     f"({sqlite_previous!r} != {previous_version_id!r})."
                 )
-        version = self.store.get_document_version(event.document_version_id)
-        if version is None:
-            raise KeyError(event.document_version_id)
-        doc_row = self.store.get_document_by_id(event.doc_id)
-        self.store.finish_document(
-            event.doc_id,
-            int(doc_row["word_count"] or 0) if doc_row else 0,
-            "DONE",
-        )
-
         if previous_version_id:
             self.store.enqueue_outbox_event(
                 self.make_event(
                     event_type="RETRACT_VERSION",
                     run_id=event.run_id,
                     doc_id=event.doc_id,
-                    document_version_id=previous_version_id,
-                    payload={"activated_version_id": event.document_version_id},
-                    discriminator=event.document_version_id,
+                    document_version_id=event.document_version_id,
+                    payload={
+                        "activated_version_id": event.document_version_id,
+                        "retract_version_id": previous_version_id,
+                    },
+                    discriminator=previous_version_id,
                 )
             )
+            return
+
+        self._finish_active_version(event.doc_id, event.document_version_id)
 
     def _retract(self, event: OutboxEvent, payload: dict[str, Any]) -> None:
-        del payload
+        retract_version_id = self._optional_text(payload.get("retract_version_id"))
+        if retract_version_id is None:
+            # Compatibility with events written by the first Refactor 1 trial build.
+            retract_version_id = event.document_version_id
+        activated_version_id = self._optional_text(payload.get("activated_version_id"))
+        if activated_version_id is None:
+            raise ValueError("Retraction event is missing activated_version_id.")
         active = self.store.get_active_document_version(event.doc_id)
-        if active is not None and active.version_id == event.document_version_id:
+        if active is None or active.version_id != activated_version_id:
+            raise RuntimeError("Retraction owner is not the SQLite-active document version.")
+        if active.version_id == retract_version_id:
             raise RuntimeError("Refusing to retract the active document version.")
-        self.graph_writer.retract_document_version(event.document_version_id)
-        self.vector_indexer.delete_document_version(event.document_version_id)
+        self.graph_writer.retract_document_version(retract_version_id)
+        self.vector_indexer.delete_document_version(retract_version_id)
+        self._finish_active_version(event.doc_id, activated_version_id)
+
+    def _finish_active_version(self, doc_id: str, document_version_id: str) -> None:
+        self.store.complete_document_version(document_version_id)
+        doc_row = self.store.get_document_by_id(doc_id)
+        self.store.finish_document(
+            doc_id,
+            int(doc_row["word_count"] or 0) if doc_row else 0,
+            "DONE",
+        )
+
+    def _record_event_metric(
+        self,
+        event: OutboxEvent,
+        *,
+        duration_ms: float,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        self.store.record_ingestion_stage_metric(
+            run_id=event.run_id,
+            stage=event.event_type,
+            attempt=event.attempts,
+            doc_id=event.doc_id,
+            document_version_id=event.document_version_id,
+            duration_ms=duration_ms,
+            status=status,
+            details={"event_id": event.event_id, "error": error},
+            metric_id=f"{event.event_id}:{event.attempts}",
+        )
 
     def _refresh_entities(self, event: OutboxEvent, payload: dict[str, Any]) -> None:
         """Refresh selected active entity vectors from authoritative Neo4j state."""

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import time
 from typing import Any
 
 from config import Settings
@@ -46,9 +47,9 @@ class QueryOrchestrator:
         if self.store is None and (graph_retriever is None or fusion_engine is None):
             self.store = MetadataStore(settings.metadata_db_path)
         self.analyzer = analyzer or QueryAnalyzer(settings)
-        self.entity_linker = entity_linker or EntityLinker(settings)
+        self.entity_linker = entity_linker or EntityLinker(settings, store=self.store)
         self.graph_retriever = graph_retriever or GraphRetriever(settings, store=self.store)
-        self.vector_retriever = vector_retriever or VectorRetriever(settings)
+        self.vector_retriever = vector_retriever or VectorRetriever(settings, store=self.store)
         self.community_retriever = community_retriever or CommunityRetriever(settings)
         self.fusion_engine = fusion_engine or FusionEngine(settings, store=self.store)
         self.generator = generator or AnswerGenerator(settings)
@@ -62,8 +63,10 @@ class QueryOrchestrator:
                 return GraphRAGResponse.from_dict(cached_payload)
 
         warnings: list[str] = []
+        stage_timings_ms: dict[str, float] = {}
         if self.store is not None and self.store.has_pending_corpus_update():
             warnings.append("corpus_update_in_progress")
+        stage_started = time.perf_counter()
         try:
             analysis = await asyncio.wait_for(
                 asyncio.to_thread(self.analyzer.analyze, user_query),
@@ -71,12 +74,17 @@ class QueryOrchestrator:
             )
         except Exception as exc:
             logger.warning("query_analysis_failed error_type=%s", type(exc).__name__)
+            stage_timings_ms["analysis"] = (time.perf_counter() - stage_started) * 1000.0
             return GraphRAGResponse(
                 answer="I could not safely analyze this question within the configured limits.",
                 confidence=0.0,
                 degraded=True,
                 warnings=[*warnings, f"query_analysis_failed:{type(exc).__name__}"],
+                stage_timings_ms=stage_timings_ms,
+                provider_usage=self._provider_usage(),
             )
+        stage_timings_ms["analysis"] = (time.perf_counter() - stage_started) * 1000.0
+        stage_started = time.perf_counter()
         try:
             async_link = getattr(self.entity_linker, "alink_entities", None)
             link_operation = (
@@ -95,6 +103,7 @@ class QueryOrchestrator:
             logger.warning("entity_linking_failed error_type=%s", type(exc).__name__)
             warnings.append(f"entity_linking_failed:{type(exc).__name__}")
             linked_entities = []
+        stage_timings_ms["entity_linking"] = (time.perf_counter() - stage_started) * 1000.0
 
         graph_task = self._to_thread_or_empty(
             component="graph_retrieval",
@@ -130,9 +139,16 @@ class QueryOrchestrator:
             vector_task,
             community_task,
         )
-        graph_results, graph_warning = graph_outcome
-        vector_results, vector_warning = vector_outcome
-        community_results, community_warning = community_outcome
+        graph_results, graph_warning, graph_duration = graph_outcome
+        vector_results, vector_warning, vector_duration = vector_outcome
+        community_results, community_warning, community_duration = community_outcome
+        stage_timings_ms.update(
+            {
+                "graph_retrieval": graph_duration,
+                "vector_retrieval": vector_duration,
+                "community_retrieval": community_duration,
+            }
+        )
         warnings.extend(
             warning
             for warning in (graph_warning, vector_warning, community_warning)
@@ -140,6 +156,7 @@ class QueryOrchestrator:
         )
         community_fallback_used = bool(analysis.retrieval_flags.get("community")) and not community_results
 
+        stage_started = time.perf_counter()
         try:
             fusion_output = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -155,6 +172,8 @@ class QueryOrchestrator:
         except Exception as exc:
             warnings.append(f"fusion_or_rerank_failed:{type(exc).__name__}")
             fusion_output = FusionOutput()
+        stage_timings_ms["fusion_rerank"] = (time.perf_counter() - stage_started) * 1000.0
+        stage_started = time.perf_counter()
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -173,9 +192,12 @@ class QueryOrchestrator:
                 confidence=0.0,
                 degraded=True,
             )
+        stage_timings_ms["generation"] = (time.perf_counter() - stage_started) * 1000.0
         if warnings:
             response.degraded = True
             response.warnings = list(dict.fromkeys([*response.warnings, *warnings]))
+        response.stage_timings_ms = stage_timings_ms
+        response.provider_usage = self._provider_usage()
 
         if self.settings.query_cache_enabled:
             self.cache.set_query(
@@ -199,21 +221,39 @@ class QueryOrchestrator:
         fn: Any,
         timeout_seconds: float,
         **kwargs: Any,
-    ) -> tuple[list[RetrieverResult], str | None]:
+    ) -> tuple[list[RetrieverResult], str | None, float]:
+        started = time.perf_counter()
         if not enabled:
-            return [], None
+            return [], None, 0.0
         try:
             if inspect.iscoroutinefunction(fn):
                 operation = fn(**kwargs)
             else:
                 operation = asyncio.to_thread(fn, **kwargs)
-            return await asyncio.wait_for(
+            results = await asyncio.wait_for(
                 operation,
                 timeout=max(0.1, float(timeout_seconds)),
-            ), None
+            )
+            return results, None, (time.perf_counter() - started) * 1000.0
         except Exception as exc:
             logger.warning("%s_failed error_type=%s", component, type(exc).__name__)
-            return [], f"{component}_failed:{type(exc).__name__}"
+            return (
+                [],
+                f"{component}_failed:{type(exc).__name__}",
+                (time.perf_counter() - started) * 1000.0,
+            )
+
+    def _provider_usage(self) -> dict[str, dict[str, int]]:
+        usage: dict[str, dict[str, int]] = {}
+        for name, component in (("analysis", self.analyzer), ("generation", self.generator)):
+            payload = getattr(component, "last_usage", None)
+            if isinstance(payload, dict) and payload:
+                usage[name] = {
+                    str(key): int(value)
+                    for key, value in payload.items()
+                    if isinstance(value, (int, float))
+                }
+        return usage
 
     def _retrieve_vector_queries(self, query: str, sub_queries: list[str]) -> list[RetrieverResult]:
         queries = list(dict.fromkeys([query, *sub_queries]))

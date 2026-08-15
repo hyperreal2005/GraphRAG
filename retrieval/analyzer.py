@@ -8,6 +8,7 @@ from typing import Any
 
 from config import Settings
 from generation.model_adapter import build_generate_config
+from generation.usage import extract_usage_metadata
 from models.query import QueryAnalysis, QueryType
 
 
@@ -43,6 +44,7 @@ class QueryAnalyzer:
         self._client = client
         self._types = None
         self._schema = None
+        self.last_usage: dict[str, int] = {}
 
         if self._client is not None:
             return
@@ -54,7 +56,15 @@ class QueryAnalyzer:
         except Exception:
             return
         self._types = types
-        self._client = genai.Client(api_key=self.settings.gemini_api_key)
+        self._client = genai.Client(
+            api_key=self.settings.gemini_api_key,
+            http_options=types.HttpOptions(
+                timeout=max(
+                    1,
+                    int(float(self.settings.query_analysis_timeout_seconds) * 1000),
+                )
+            ),
+        )
         self._schema = self._build_schema(types)
 
     def analyze(self, user_query: str) -> QueryAnalysis:
@@ -137,6 +147,7 @@ class QueryAnalyzer:
             contents=prompt,
             config=config,
         )
+        self.last_usage = extract_usage_metadata(response)
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, dict):
             return parsed

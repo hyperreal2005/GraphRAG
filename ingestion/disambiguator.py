@@ -73,7 +73,15 @@ class EntityDisambiguator:
                 self._update_centroid(matched, embedding)
                 entity_id_map[entity.entity_id] = matched.entity_id
 
-        return DisambiguationResult(canonical_entities=canonical_clusters, entity_id_map=entity_id_map)
+        referenced_cluster_ids = set(entity_id_map.values())
+        return DisambiguationResult(
+            canonical_entities=[
+                cluster
+                for cluster in canonical_clusters
+                if cluster.entity_id in referenced_cluster_ids
+            ],
+            entity_id_map=entity_id_map,
+        )
 
     def _load_existing_clusters(self, existing_entities: list[dict[str, object]]) -> list[CanonicalEntity]:
         clusters: list[CanonicalEntity] = []
@@ -92,6 +100,9 @@ class EntityDisambiguator:
                     canonical_name=canonical_name,
                     aliases=aliases,
                     embedding=self._embed(canonical_name),
+                    entity_types={self._normalize_type(str(entry.get("entity_type") or ""))}
+                    if str(entry.get("entity_type") or "").strip()
+                    else set(),
                     member_count=max(1, len(aliases)),
                 )
             )

@@ -7,6 +7,8 @@ from typing import Any
 
 from config import Settings
 from ingestion.embedder import GeminiEmbedder
+from ingestion.state_store import MetadataStore
+from ingestion.vector_indexer import build_active_version_filter
 from models.query import LinkedEntity
 
 
@@ -18,9 +20,11 @@ class EntityLinker:
         settings: Settings,
         embedder: GeminiEmbedder | None = None,
         client: Any | None = None,
+        store: MetadataStore | None = None,
     ) -> None:
         self.settings = settings
         self.embedder = embedder or GeminiEmbedder(settings)
+        self.store = store
 
         if client is not None:
             self._client = client
@@ -49,6 +53,12 @@ class EntityLinker:
         clean_mentions = [mention.strip() for mention in mentions if mention.strip()]
         if not clean_mentions:
             return []
+        active_version_ids = self._queryable_version_ids()
+        if active_version_ids == []:
+            return [
+                LinkedEntity(mention=mention, status="unresolved", similarity=0.0)
+                for mention in clean_mentions
+            ]
         vectors = self.embedder.embed_texts(
             clean_mentions,
             task_type=self.settings.query_embedding_task_type,
@@ -56,19 +66,31 @@ class EntityLinker:
         if len(vectors) != len(clean_mentions):
             raise RuntimeError("Entity-link embedding output length mismatch.")
         return [
-            self._link_single_mention(mention, vector)
+            self._link_single_mention(mention, vector, active_version_ids)
             for mention, vector in zip(clean_mentions, vectors)
         ]
 
-    def _link_single_mention(self, mention: str, query_vector: list[float]) -> LinkedEntity:
-        points = self._search_entities(query_vector, limit=3)
-        return self._link_from_points(mention, points)
+    def _link_single_mention(
+        self,
+        mention: str,
+        query_vector: list[float],
+        active_version_ids: list[str] | None,
+    ) -> LinkedEntity:
+        points = self._search_entities(query_vector, limit=3, active_version_ids=active_version_ids)
+        return self._link_from_points(mention, points, active_version_ids)
 
-    def _link_from_points(self, mention: str, points: list[Any]) -> LinkedEntity:
+    def _link_from_points(
+        self,
+        mention: str,
+        points: list[Any],
+        active_version_ids: list[str] | None = None,
+    ) -> LinkedEntity:
         points = [
             point
             for point in points
-            if self._embedding_payload_matches(self._extract_payload(point))
+            if self._embedding_payload_matches(
+                self._extract_payload(point), active_version_ids
+            )
         ]
         if not points:
             return LinkedEntity(mention=mention, status="unresolved", similarity=0.0)
@@ -122,6 +144,12 @@ class EntityLinker:
         clean_mentions = [mention.strip() for mention in mentions if mention.strip()]
         if not clean_mentions:
             return []
+        active_version_ids = self._queryable_version_ids()
+        if active_version_ids == []:
+            return [
+                LinkedEntity(mention=mention, status="unresolved", similarity=0.0)
+                for mention in clean_mentions
+            ]
         async_embed = getattr(self.embedder, "aembed_texts", None)
         if callable(async_embed):
             vectors = await async_embed(
@@ -135,18 +163,30 @@ class EntityLinker:
                 self.settings.query_embedding_task_type,
             )
         point_groups = await asyncio.gather(
-            *(self._asearch_entities(vector, limit=3) for vector in vectors)
+            *(
+                self._asearch_entities(
+                    vector,
+                    limit=3,
+                    active_version_ids=active_version_ids,
+                )
+                for vector in vectors
+            )
         )
         return [
-            self._link_from_points(mention, points)
+            self._link_from_points(mention, points, active_version_ids)
             for mention, points in zip(clean_mentions, point_groups)
         ]
 
-    async def _asearch_entities(self, query_vector: list[float], limit: int) -> list[Any]:
+    async def _asearch_entities(
+        self,
+        query_vector: list[float],
+        limit: int,
+        active_version_ids: list[str] | None,
+    ) -> list[Any]:
         response = await self._async_client.query_points(
             collection_name=self.settings.qdrant_entities_collection,
             query=query_vector,
-            query_filter=self._active_filter(),
+            query_filter=build_active_version_filter(active_version_ids),
             limit=limit,
             with_payload=True,
             with_vectors=False,
@@ -157,8 +197,13 @@ class EntityLinker:
         if self._async_client is not None:
             await self._async_client.close()
 
-    def _search_entities(self, query_vector: list[float], limit: int) -> list[Any]:
-        query_filter = self._active_filter()
+    def _search_entities(
+        self,
+        query_vector: list[float],
+        limit: int,
+        active_version_ids: list[str] | None = None,
+    ) -> list[Any]:
+        query_filter = build_active_version_filter(active_version_ids)
         query_points_error: Exception | None = None
         if hasattr(self._client, "query_points"):
             try:
@@ -246,7 +291,15 @@ class EntityLinker:
             return None
         return str(candidate)
 
-    def _embedding_payload_matches(self, payload: dict[str, Any]) -> bool:
+    def _embedding_payload_matches(
+        self,
+        payload: dict[str, Any],
+        active_version_ids: list[str] | None = None,
+    ) -> bool:
+        if active_version_ids is not None and str(payload.get("document_version_id") or "") not in set(
+            active_version_ids
+        ):
+            return False
         if not self.settings.enforce_embedding_metadata:
             return True
         return (
@@ -257,17 +310,7 @@ class EntityLinker:
             and payload.get("active") is True
         )
 
-    @staticmethod
-    def _active_filter() -> Any:
-        try:
-            from qdrant_client.http import models
-        except Exception:
-            return {"must": [{"key": "active", "match": {"value": True}}]}
-        return models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="active",
-                    match=models.MatchValue(value=True),
-                )
-            ]
-        )
+    def _queryable_version_ids(self) -> list[str] | None:
+        if self.store is None:
+            return None
+        return self.store.get_queryable_document_version_ids()

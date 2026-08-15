@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from config import Settings
 from generation.model_adapter import build_generate_config
+from generation.usage import extract_usage_metadata
 from models.extraction import ExtractedEntity, ExtractionResult
 
 
@@ -20,6 +22,10 @@ JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 class ExtractorStats:
     entities_count: int = 0
     relations_count: int = 0
+    call_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
 
 
 class GeminiExtractor:
@@ -29,6 +35,8 @@ class GeminiExtractor:
         self.settings = settings
         self._gliner_model = None
         self._gliner_loaded = False
+        self._stats = ExtractorStats()
+        self._stats_lock = threading.Lock()
 
         if not self.settings.gemini_api_key:
             raise RuntimeError("GOOGLE_API_KEY or GEMINI_API_KEY is required for extraction.")
@@ -41,7 +49,15 @@ class GeminiExtractor:
 
         self._genai = genai
         self._genai_types = types
-        self._client = genai.Client(api_key=self.settings.gemini_api_key)
+        self._client = genai.Client(
+            api_key=self.settings.gemini_api_key,
+            http_options=types.HttpOptions(
+                timeout=max(
+                    1,
+                    int(float(self.settings.ingestion_provider_timeout_seconds) * 1000),
+                )
+            ),
+        )
         self._response_schema = self._build_response_schema()
 
     def extract(self, chunk_text: str, doc_format: str) -> ExtractionResult:
@@ -77,7 +93,16 @@ class GeminiExtractor:
         if result is None:
             raise RuntimeError(f"Extraction failed after {attempts} attempts: {last_error}") from last_error
 
+        with self._stats_lock:
+            self._stats.entities_count += len(result.entities)
+            self._stats.relations_count += len(result.relations)
+
         return result
+
+    def snapshot_stats(self) -> ExtractorStats:
+        """Return a thread-safe copy for per-run usage deltas."""
+        with self._stats_lock:
+            return ExtractorStats(**self._stats.__dict__)
 
     @staticmethod
     def _validate_result_integrity(result: ExtractionResult) -> None:
@@ -169,6 +194,7 @@ class GeminiExtractor:
                 response_schema=self._response_schema,
             ),
         )
+        self._record_response_usage(response)
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, dict):
             return parsed
@@ -180,6 +206,14 @@ class GeminiExtractor:
         if text:
             return self._parse_json(text)
         raise RuntimeError("Gemini returned empty/invalid structured response.")
+
+    def _record_response_usage(self, response: Any) -> None:
+        usage = extract_usage_metadata(response)
+        with self._stats_lock:
+            self._stats.call_count += usage["call_count"]
+            self._stats.input_tokens += usage["input_tokens"]
+            self._stats.output_tokens += usage["output_tokens"]
+            self._stats.total_tokens += usage["total_tokens"]
 
     def _prompt_full(self, chunk_text: str) -> str:
         return (

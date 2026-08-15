@@ -114,6 +114,7 @@ class Chunk:
     char_start: int | None
     char_end: int | None
     chunk_hash: str
+    content_kind: str = "body"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +128,7 @@ class Chunk:
             "char_start": self.char_start,
             "char_end": self.char_end,
             "chunk_hash": self.chunk_hash,
+            "content_kind": self.content_kind,
         }
 
 

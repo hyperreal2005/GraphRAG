@@ -127,8 +127,9 @@ class GraphRAGResponse(QueryModel):
     degraded: bool = False
     warnings: list[str] = Field(default_factory=list)
     confidence_kind: str = "retrieval_grounding_score"
+    stage_timings_ms: dict[str, float] = Field(default_factory=dict)
+    provider_usage: dict[str, dict[str, int]] = Field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "GraphRAGResponse":
         return cls.model_validate(payload)
-

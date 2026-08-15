@@ -83,6 +83,8 @@ class GraphRetriever:
         anchors = self._select_graph_anchors(linked_entities)
         if not anchors or analysis.query_type is QueryType.GLOBAL:
             return []
+        if self._queryable_version_ids() == []:
+            return []
         if self.settings.query_graph_dynamic_enabled and user_query.strip():
             try:
                 plan = await asyncio.to_thread(
@@ -179,6 +181,8 @@ class GraphRetriever:
         """Retrieve graph paths from linked anchors with dynamic + static fallback."""
         anchors = self._select_graph_anchors(linked_entities)
         if not anchors:
+            return []
+        if self._queryable_version_ids() == []:
             return []
 
         use_dynamic = bool(self.settings.query_graph_dynamic_enabled) and analysis.query_type is not QueryType.GLOBAL
@@ -378,6 +382,7 @@ class GraphRetriever:
         return (
             "WHERE all(assertion IN [node IN nodes(p) WHERE node:Assertion] WHERE "
             "assertion.active = true AND "
+            "(NOT $enforce_version_fence OR assertion.document_version_id IN $active_version_ids) AND "
             "(size($relationship_types) = 0 OR assertion.predicate_normalized IN $relationship_types) AND "
             "($temporal_start IS NULL OR assertion.valid_until IS NULL OR assertion.valid_until >= $temporal_start) AND "
             "($temporal_end IS NULL OR assertion.valid_from IS NULL OR assertion.valid_from <= $temporal_end)) "
@@ -421,6 +426,7 @@ class GraphRetriever:
 
     def _execute_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         self._assert_read_only(query)
+        params = {**params, **self._version_fence_params()}
         with self._driver.session() as session:
             execute_read = getattr(session, "execute_read", None)
             if callable(execute_read):
@@ -444,6 +450,7 @@ class GraphRetriever:
 
     async def _aexecute_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         self._assert_read_only(query)
+        params = {**params, **self._version_fence_params()}
         if self._async_driver is None:
             return await asyncio.to_thread(self._execute_read, query, params)
 
@@ -467,6 +474,18 @@ class GraphRetriever:
                 return [record.data() async for record in result]
 
             return list(await session.execute_read(run_in_transaction))
+
+    def _queryable_version_ids(self) -> list[str] | None:
+        if self.store is None:
+            return None
+        return self.store.get_queryable_document_version_ids()
+
+    def _version_fence_params(self) -> dict[str, Any]:
+        active_version_ids = self._queryable_version_ids()
+        return {
+            "enforce_version_fence": active_version_ids is not None,
+            "active_version_ids": active_version_ids or [],
+        }
 
     def _assert_read_only(self, query: str) -> None:
         normalized = query.strip()

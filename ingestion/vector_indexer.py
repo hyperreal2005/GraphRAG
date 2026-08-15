@@ -12,6 +12,53 @@ from config import Settings
 from ingestion.embedder import GeminiEmbedder
 
 
+def build_active_version_filter(
+    active_version_ids: list[str] | None,
+    *,
+    exclude_reference_chunks: bool = False,
+) -> Any:
+    """Build the shared Qdrant read boundary owned by SQLite activation state."""
+    must_fallback: list[dict[str, Any]] = [
+        {"key": "active", "match": {"value": True}}
+    ]
+    if active_version_ids is not None:
+        must_fallback.append(
+            {"key": "document_version_id", "match": {"any": active_version_ids}}
+        )
+    must_not_fallback: list[dict[str, Any]] = []
+    if exclude_reference_chunks:
+        must_not_fallback.append(
+            {"key": "content_kind", "match": {"value": "reference"}}
+        )
+    try:
+        from qdrant_client.http import models
+    except Exception:
+        payload: dict[str, Any] = {"must": must_fallback}
+        if must_not_fallback:
+            payload["must_not"] = must_not_fallback
+        return payload
+
+    must = [
+        models.FieldCondition(key="active", match=models.MatchValue(value=True))
+    ]
+    if active_version_ids is not None:
+        must.append(
+            models.FieldCondition(
+                key="document_version_id",
+                match=models.MatchAny(any=active_version_ids),
+            )
+        )
+    must_not = []
+    if exclude_reference_chunks:
+        must_not.append(
+            models.FieldCondition(
+                key="content_kind",
+                match=models.MatchValue(value="reference"),
+            )
+        )
+    return models.Filter(must=must, must_not=must_not or None)
+
+
 @dataclass
 class ChunkVectorInput:
     chunk_id: str
@@ -22,6 +69,7 @@ class ChunkVectorInput:
     entity_ids_mentioned: list[str] = field(default_factory=list)
     document_version_id: str | None = None
     active: bool = True
+    content_kind: str = "body"
 
 
 @dataclass
@@ -117,6 +165,7 @@ class QdrantVectorIndexer:
                         "entity_ids_mentioned": sorted(set(item.entity_ids_mentioned)),
                         "document_version_id": item.document_version_id,
                         "active": bool(item.active),
+                        "content_kind": item.content_kind,
                         "embedding_model_id": self.settings.embedding_model_id,
                         "embedding_dimension": int(self.settings.embedding_dim),
                         "embedding_normalization_policy": self.settings.embedding_normalization_policy,

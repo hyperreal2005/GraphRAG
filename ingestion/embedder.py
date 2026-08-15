@@ -28,7 +28,15 @@ class GeminiEmbedder:
             raise RuntimeError("google-genai package is required for vector indexing.") from exc
 
         self._types = types
-        self._client = genai.Client(api_key=self.settings.gemini_api_key)
+        self._client = genai.Client(
+            api_key=self.settings.gemini_api_key,
+            http_options=types.HttpOptions(
+                timeout=max(
+                    1,
+                    int(float(self.settings.ingestion_provider_timeout_seconds) * 1000),
+                )
+            ),
+        )
 
     def embed_texts(
         self,

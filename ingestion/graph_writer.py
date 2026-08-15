@@ -63,6 +63,9 @@ ON CREATE SET
     n.aliases = row.aliases,
     n.sources = [row.doc_id],
     n.source_versions = [row.document_version_id],
+    n.source_memberships = [row.source_membership],
+    n.active_source_versions = CASE WHEN row.active THEN [row.document_version_id] ELSE [] END,
+    n.active = row.active,
     n.confidence = row.confidence,
     n.created_at = row.created_at
 ON MATCH SET
@@ -88,6 +91,16 @@ ON MATCH SET
         WHEN row.document_version_id IN coalesce(n.source_versions, []) THEN coalesce(n.source_versions, [])
         ELSE coalesce(n.source_versions, []) + row.document_version_id
     END,
+    n.source_memberships = CASE
+        WHEN row.source_membership IN coalesce(n.source_memberships, []) THEN coalesce(n.source_memberships, [])
+        ELSE coalesce(n.source_memberships, []) + row.source_membership
+    END,
+    n.active_source_versions = CASE
+        WHEN NOT row.active OR row.document_version_id IN coalesce(n.active_source_versions, [])
+            THEN coalesce(n.active_source_versions, [])
+        ELSE coalesce(n.active_source_versions, []) + row.document_version_id
+    END,
+    n.active = coalesce(n.active, false) OR row.active,
     n.confidence = CASE
         WHEN row.confidence > coalesce(n.confidence, 0.0) THEN row.confidence
         ELSE coalesce(n.confidence, 0.0)
@@ -207,6 +220,7 @@ class GraphWriter:
     ) -> None:
         """Stage one version's complete graph contribution in one write transaction."""
         now = utc_now_iso()
+        activate_version = any(assertion.active for assertion in assertions)
         node_rows = [
             {
                 "id": str(node["id"]),
@@ -217,6 +231,8 @@ class GraphWriter:
                 "confidence": float(node.get("confidence", 0.0)),
                 "doc_id": doc_id,
                 "document_version_id": document_version_id,
+                "source_membership": f"{doc_id}|{document_version_id}",
+                "active": activate_version,
                 "created_at": str(node.get("created_at") or now),
                 "updated_at": now,
             }
@@ -289,62 +305,142 @@ class GraphWriter:
     def verify_document_version(self, document_version_id: str) -> dict[str, int]:
         """Return staged count/integrity metrics for an assertion version."""
         query = """
-        MATCH (a:Assertion {document_version_id: $version_id})
-        OPTIONAL MATCH (:Entity)-[subjectEdge:SUBJECT_OF]->(a)
-        OPTIONAL MATCH (a)-[objectEdge:OBJECT]->(:Entity)
-        RETURN count(DISTINCT a) AS assertions,
-               count(DISTINCT subjectEdge) AS subject_edges,
-               count(DISTINCT CASE WHEN a.object_kind = 'entity' THEN a END) AS entity_assertions,
-               count(DISTINCT objectEdge) AS object_edges
+        CALL () {
+            MATCH (a:Assertion {document_version_id: $version_id})
+            OPTIONAL MATCH (:Entity)-[subjectEdge:SUBJECT_OF]->(a)
+            OPTIONAL MATCH (a)-[objectEdge:OBJECT]->(:Entity)
+            RETURN count(DISTINCT a) AS assertions,
+                   count(DISTINCT subjectEdge) AS subject_edges,
+                   count(DISTINCT CASE WHEN a.object_kind = 'entity' THEN a END) AS entity_assertions,
+                   count(DISTINCT objectEdge) AS object_edges
+        }
+        CALL () {
+            MATCH (entity:Entity)
+            WHERE $version_id IN coalesce(entity.source_versions, [])
+            RETURN count(DISTINCT entity) AS entities
+        }
+        RETURN assertions, subject_edges, entity_assertions, object_edges, entities
         """
         with self._driver.session() as session:
             record = session.run(query, {"version_id": document_version_id}).single()
         if record is None:
-            return {"assertions": 0, "subject_edges": 0, "entity_assertions": 0, "object_edges": 0}
-        return {key: int(record[key] or 0) for key in ("assertions", "subject_edges", "entity_assertions", "object_edges")}
+            return {
+                "assertions": 0,
+                "subject_edges": 0,
+                "entity_assertions": 0,
+                "object_edges": 0,
+                "entities": 0,
+            }
+        return {
+            key: int(record[key] or 0)
+            for key in ("assertions", "subject_edges", "entity_assertions", "object_edges", "entities")
+        }
 
     def activate_document_version(self, document_version_id: str, previous_version_id: str | None) -> None:
-        """Activate staged assertions and atomically deactivate the superseded version."""
-        query = """
-        MATCH (candidate:Assertion {document_version_id: $version_id})
-        SET candidate.active = true, candidate.updated_at = $updated_at
-        WITH count(candidate) AS activated
-        OPTIONAL MATCH (old:Assertion {document_version_id: $previous_version_id})
-        WHERE $previous_version_id IS NOT NULL
-        SET old.active = false, old.updated_at = $updated_at
-        RETURN activated, count(old) AS deactivated
-        """
-        with self._driver.session() as session:
-            session.run(
-                query,
-                {
-                    "version_id": document_version_id,
-                    "previous_version_id": previous_version_id,
-                    "updated_at": utc_now_iso(),
-                },
+        """Atomically activate/deactivate assertions and entity-version membership."""
+        params = {
+            "version_id": document_version_id,
+            "previous_version_id": previous_version_id,
+            "updated_at": utc_now_iso(),
+        }
+
+        def activate_transaction(tx: Any) -> None:
+            tx.run(
+                """
+                MATCH (candidate:Assertion {document_version_id: $version_id})
+                SET candidate.active = true, candidate.updated_at = $updated_at
+                """,
+                **params,
             ).consume()
+            tx.run(
+                """
+                MATCH (old:Assertion {document_version_id: $previous_version_id})
+                WHERE $previous_version_id IS NOT NULL
+                SET old.active = false, old.updated_at = $updated_at
+                """,
+                **params,
+            ).consume()
+            tx.run(
+                """
+                MATCH (candidate:Entity)
+                WHERE $version_id IN coalesce(candidate.source_versions, [])
+                SET candidate.active_source_versions = CASE
+                        WHEN $version_id IN coalesce(candidate.active_source_versions, [])
+                            THEN coalesce(candidate.active_source_versions, [])
+                        ELSE coalesce(candidate.active_source_versions, []) + $version_id
+                    END,
+                    candidate.active = true,
+                    candidate.updated_at = $updated_at
+                """,
+                **params,
+            ).consume()
+            tx.run(
+                """
+                MATCH (old:Entity)
+                WHERE $previous_version_id IS NOT NULL
+                  AND $previous_version_id IN coalesce(old.active_source_versions, [])
+                WITH old,
+                     [v IN coalesce(old.active_source_versions, [])
+                      WHERE v <> $previous_version_id] AS remaining_active_versions
+                SET old.active_source_versions = remaining_active_versions,
+                    old.active = size(remaining_active_versions) > 0,
+                    old.updated_at = $updated_at
+                """,
+                **params,
+            ).consume()
+
+        with self._driver.session() as session:
+            execute_write = getattr(session, "execute_write", None)
+            if callable(execute_write):
+                execute_write(activate_transaction)
+            else:  # pragma: no cover - compatibility with older Neo4j drivers
+                activate_transaction(session)
 
     def retract_document_version(self, document_version_id: str) -> None:
         """Delete one version's assertions and clean only assertion-free entity residue."""
-        with self._driver.session() as session:
-            session.run(
+        def retract_transaction(tx: Any) -> None:
+            tx.run(
                 "MATCH (a:Assertion {document_version_id: $version_id}) DETACH DELETE a",
-                {"version_id": document_version_id},
+                version_id=document_version_id,
             ).consume()
-            session.run(
+            tx.run(
                 """
                 MATCH (n:Entity)
                 WHERE $version_id IN coalesce(n.source_versions, [])
-                SET n.source_versions = [v IN coalesce(n.source_versions, []) WHERE v <> $version_id]
-                WITH n
+                WITH n,
+                     [v IN coalesce(n.source_versions, []) WHERE v <> $version_id] AS remaining_versions,
+                     [v IN coalesce(n.active_source_versions, []) WHERE v <> $version_id]
+                        AS remaining_active_versions,
+                     [ref IN coalesce(n.source_memberships, [])
+                      WHERE NOT ref ENDS WITH ('|' + $version_id)] AS remaining_memberships
+                SET n.source_versions = remaining_versions,
+                    n.active_source_versions = remaining_active_versions,
+                    n.source_memberships = remaining_memberships,
+                    n.sources = reduce(
+                        docs = [], ref IN remaining_memberships |
+                        CASE
+                            WHEN split(ref, '|')[0] IN docs THEN docs
+                            ELSE docs + split(ref, '|')[0]
+                        END
+                    ),
+                    n.active = size(remaining_active_versions) > 0
+                WITH n, remaining_versions
                 OPTIONAL MATCH (n)-[:SUBJECT_OF]->(subjectAssertion:Assertion)
                 OPTIONAL MATCH (objectAssertion:Assertion)-[:OBJECT]->(n)
-                WITH n, count(DISTINCT subjectAssertion) + count(DISTINCT objectAssertion) AS evidence_count
-                WHERE evidence_count = 0 AND size(coalesce(n.source_versions, [])) = 0
+                WITH n, remaining_versions,
+                     count(DISTINCT subjectAssertion) + count(DISTINCT objectAssertion) AS evidence_count
+                WHERE evidence_count = 0 AND size(remaining_versions) = 0
                 DETACH DELETE n
                 """,
-                {"version_id": document_version_id},
+                version_id=document_version_id,
             ).consume()
+
+        with self._driver.session() as session:
+            execute_write = getattr(session, "execute_write", None)
+            if callable(execute_write):
+                execute_write(retract_transaction)
+            else:  # pragma: no cover
+                retract_transaction(session)
 
     def retract_assertions_for_chunks(self, document_version_id: str, chunk_ids: Iterable[str]) -> None:
         chunk_list = sorted(set(str(item) for item in chunk_ids if str(item)))

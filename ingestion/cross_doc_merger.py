@@ -5,17 +5,27 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from config import Settings
 from generation.model_adapter import build_generate_config
+from generation.usage import extract_usage_metadata
 from ingestion.embedder import GeminiEmbedder
-from ingestion.vector_indexer import build_entity_summary
+from ingestion.vector_indexer import build_active_version_filter, build_entity_summary
 from models.refactor import MergeDecision
 
 
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+
+
+@dataclass
+class MergeProviderStats:
+    call_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
 
 
 @dataclass
@@ -72,6 +82,8 @@ class CrossDocumentMerger:
         self._llm_client = llm_client
         self._types = None
         self._llm_schema = None
+        self._stats = MergeProviderStats()
+        self._stats_lock = threading.Lock()
 
         if self._qdrant_client is None:
             try:
@@ -92,7 +104,15 @@ class CrossDocumentMerger:
                 self._llm_client = None
             else:
                 self._types = types
-                self._llm_client = genai.Client(api_key=self.settings.gemini_api_key)
+                self._llm_client = genai.Client(
+                    api_key=self.settings.gemini_api_key,
+                    http_options=types.HttpOptions(
+                        timeout=max(
+                            1,
+                            int(float(self.settings.ingestion_provider_timeout_seconds) * 1000),
+                        )
+                    ),
+                )
                 self._llm_schema = types.Schema(
                     type="OBJECT",
                     required=["same_entity", "confidence", "rationale"],
@@ -102,6 +122,11 @@ class CrossDocumentMerger:
                         "rationale": types.Schema(type="STRING"),
                     },
                 )
+
+    def snapshot_stats(self) -> MergeProviderStats:
+        """Return an atomic provider-usage snapshot for stage telemetry."""
+        with self._stats_lock:
+            return MergeProviderStats(**self._stats.__dict__)
 
     def resolve(
         self,
@@ -114,9 +139,54 @@ class CrossDocumentMerger:
     ) -> CrossDocMergeResult:
         """Resolve identities and persist each decision before graph mutation."""
         result = CrossDocMergeResult()
+        active_version_ids = (
+            store.get_queryable_document_version_ids() if store is not None else None
+        )
+        if store is not None and doc_id and active_version_ids is not None:
+            # This stage is explicitly cross-document. The within-document
+            # disambiguator has already compared a replacement with its prior
+            # active mappings, so searching the same document's old vectors is
+            # redundant, costly, and can create circular merge evidence.
+            active_doc_version = store.get_active_document_version(doc_id)
+            if active_doc_version is not None:
+                active_version_ids = [
+                    version_id
+                    for version_id in active_version_ids
+                    if version_id != active_doc_version.version_id
+                ]
+
+        eligible_nodes = [
+            node
+            for node in canonical_nodes
+            if str(node.get("id") or "").strip() and str(node.get("name") or "").strip()
+        ]
+        candidates_by_local_id: dict[str, list[dict[str, Any]]] = {}
+        if active_version_ids != [] and eligible_nodes:
+            query_vectors = self.embedder.embed_texts(
+                [self._build_entity_query_text(node) for node in eligible_nodes],
+                task_type=self.settings.query_embedding_task_type,
+            )
+            if len(query_vectors) != len(eligible_nodes):
+                raise RuntimeError("Embedding output length mismatch for cross-document resolution.")
+            candidate_sets = self._get_candidates_batch(
+                query_vectors=query_vectors,
+                active_version_ids=active_version_ids,
+            )
+            for node, candidates in zip(eligible_nodes, candidate_sets):
+                candidates_by_local_id[str(node.get("id") or "")] = candidates
+
         for node in canonical_nodes:
-            decision = self._resolve_one(node)
             local_id = str(node.get("id") or "")
+            precomputed_candidates = (
+                candidates_by_local_id.get(local_id)
+                if local_id in candidates_by_local_id
+                else None
+            )
+            decision = self._resolve_one(
+                node,
+                active_version_ids=active_version_ids,
+                candidates=precomputed_candidates,
+            )
             if not local_id:
                 continue
             if store is not None:
@@ -134,7 +204,13 @@ class CrossDocumentMerger:
             result.decisions.append(decision)
         return result
 
-    def _resolve_one(self, node: dict[str, Any]) -> CrossDocMergeDecision:
+    def _resolve_one(
+        self,
+        node: dict[str, Any],
+        active_version_ids: list[str] | None = None,
+        *,
+        candidates: list[dict[str, Any]] | None = None,
+    ) -> CrossDocMergeDecision:
         local_id = str(node.get("id") or "")
         name = str(node.get("name") or "").strip()
         entity_type = str(node.get("type") or "Entity").strip() or "Entity"
@@ -148,12 +224,24 @@ class CrossDocumentMerger:
                 decision="NEW_NODE",
             )
 
-        query_text = self._build_entity_query_text(node)
-        query_vector = self.embedder.embed_texts(
-            [query_text],
-            task_type=self.settings.query_embedding_task_type,
-        )[0]
-        candidates = self._get_candidates(query_vector=query_vector)
+        if active_version_ids == []:
+            return CrossDocMergeDecision(
+                local_entity_id=local_id,
+                final_entity_id=local_id,
+                decision="NEW_NODE",
+                rationale="No SQLite-active corpus version exists yet.",
+            )
+
+        if candidates is None:
+            query_text = self._build_entity_query_text(node)
+            query_vector = self.embedder.embed_texts(
+                [query_text],
+                task_type=self.settings.query_embedding_task_type,
+            )[0]
+            candidates = self._get_candidates(
+                query_vector=query_vector,
+                active_version_ids=active_version_ids,
+            )
         if not candidates:
             return CrossDocMergeDecision(
                 local_entity_id=local_id,
@@ -185,6 +273,43 @@ class CrossDocumentMerger:
         candidate_type = str(payload.get("type") or "Entity").strip() or "Entity"
         candidate_name = str(payload.get("name") or "").strip() or None
         compatible = self._types_compatible(entity_type=entity_type, candidate_type=candidate_type)
+
+        if self._is_document_local_reference(name) or self._is_document_local_reference(
+            str(candidate_name or "")
+        ):
+            return CrossDocMergeDecision(
+                local_entity_id=local_id,
+                final_entity_id=local_id,
+                decision="NEW_NODE",
+                similarity=score,
+                candidate_entity_id=candidate_id,
+                candidate_name=candidate_name,
+                candidate_type=candidate_type,
+                top2_similarity=top2,
+                score_margin=margin,
+                type_compatible=compatible,
+                rationale="Document-local/deictic entity names are never cross-document merged.",
+            )
+
+        if self._is_context_dependent_generic(name) or self._is_context_dependent_generic(
+            str(candidate_name or "")
+        ):
+            return CrossDocMergeDecision(
+                local_entity_id=local_id,
+                final_entity_id=local_id,
+                decision="NEW_NODE",
+                similarity=score,
+                candidate_entity_id=candidate_id,
+                candidate_name=candidate_name,
+                candidate_type=candidate_type,
+                top2_similarity=top2,
+                score_margin=margin,
+                type_compatible=compatible,
+                rationale=(
+                    "Unqualified context-dependent identity labels are never "
+                    "cross-document merged."
+                ),
+            )
 
         exact_name = self._normalized_names(node) & self._normalized_names(payload)
         if exact_name and compatible:
@@ -249,7 +374,12 @@ class CrossDocumentMerger:
                 candidate_summary=payload.get("summary"),
                 similarity=score,
             )
-            if approved and confidence >= float(self.settings.cross_doc_llm_confidence_threshold):
+            lexical_support = self._names_support_identity(name, str(candidate_name or ""))
+            if (
+                approved
+                and confidence >= float(self.settings.cross_doc_llm_confidence_threshold)
+                and lexical_support
+            ):
                 return CrossDocMergeDecision(
                     local_entity_id=local_id,
                     final_entity_id=candidate_id,
@@ -264,6 +394,11 @@ class CrossDocumentMerger:
                     adjudication_confidence=confidence,
                     rationale=rationale or "Structured adjudication approved the merge.",
                 )
+            if approved and confidence >= float(self.settings.cross_doc_llm_confidence_threshold):
+                rationale = (
+                    "Structured adjudication approved the pair, but deterministic lexical "
+                    "identity support was absent; strict merge rejected."
+                )
 
         return CrossDocMergeDecision(
             local_entity_id=local_id,
@@ -276,7 +411,7 @@ class CrossDocumentMerger:
             top2_similarity=top2,
             score_margin=margin,
             type_compatible=compatible,
-            rationale="Strict automatic/LLM merge requirements were not met.",
+            rationale=rationale if should_adjudicate and rationale else "Strict automatic/LLM merge requirements were not met.",
         )
 
     def _build_entity_query_text(self, node: dict[str, Any]) -> str:
@@ -289,29 +424,110 @@ class CrossDocumentMerger:
         )
         return f"{name}\nType: {entity_type}\nSummary: {summary}"
 
-    def _get_candidates(self, query_vector: list[float]) -> list[dict[str, Any]]:
+    def _get_candidates(
+        self,
+        query_vector: list[float],
+        active_version_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if active_version_ids == []:
+            return []
         limit = max(1, int(self.settings.cross_doc_candidate_k))
-        points = self._search_points(query_vector=query_vector, limit=limit)
+        points = self._search_points(
+            query_vector=query_vector,
+            limit=limit,
+            active_version_ids=active_version_ids,
+        )
+        return self._authorize_candidates(points, active_version_ids)
+
+    def _get_candidates_batch(
+        self,
+        *,
+        query_vectors: list[list[float]],
+        active_version_ids: list[str] | None,
+    ) -> list[list[dict[str, Any]]]:
+        """Retrieve candidate sets in one Qdrant request when supported."""
+        if not query_vectors:
+            return []
+        if active_version_ids == []:
+            return [[] for _ in query_vectors]
+        limit = max(1, int(self.settings.cross_doc_candidate_k))
+        batches = self._search_points_batch(
+            query_vectors=query_vectors,
+            limit=limit,
+            active_version_ids=active_version_ids,
+        )
+        if len(batches) != len(query_vectors):
+            raise RuntimeError("Qdrant batch candidate response length mismatch.")
+        return [
+            self._authorize_candidates(points, active_version_ids)
+            for points in batches
+        ]
+
+    @staticmethod
+    def _authorize_candidates(
+        points: list[dict[str, Any]],
+        active_version_ids: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        if active_version_ids is not None:
+            authorized = set(active_version_ids)
+            points = [
+                point
+                for point in points
+                if str((point.get("payload") or {}).get("document_version_id") or "")
+                in authorized
+                and (point.get("payload") or {}).get("active") is True
+            ]
         return sorted(points, key=lambda item: float(item.get("score") or 0.0), reverse=True)
 
-    def _search_points(self, query_vector: list[float], limit: int) -> list[dict[str, Any]]:
+    def _search_points_batch(
+        self,
+        *,
+        query_vectors: list[list[float]],
+        limit: int,
+        active_version_ids: list[str] | None,
+    ) -> list[list[dict[str, Any]]]:
         collection = self.settings.qdrant_entities_collection
-        active_filter: Any = {
-            "must": [{"key": "active", "match": {"value": True}}]
-        }
-        try:
-            from qdrant_client.http import models as qdrant_models
-        except Exception:
-            pass
-        else:
-            active_filter = qdrant_models.Filter(
-                must=[
-                    qdrant_models.FieldCondition(
-                        key="active",
-                        match=qdrant_models.MatchValue(value=True),
+        active_filter = build_active_version_filter(active_version_ids)
+        if hasattr(self._qdrant_client, "query_batch_points"):
+            try:
+                from qdrant_client.http import models
+
+                requests = [
+                    models.QueryRequest(
+                        query=query_vector,
+                        filter=active_filter,
+                        limit=limit,
+                        with_payload=True,
+                        with_vector=False,
                     )
+                    for query_vector in query_vectors
                 ]
+                responses = self._qdrant_client.query_batch_points(
+                    collection_name=collection,
+                    requests=requests,
+                )
+                return [self._extract_points(response) for response in responses]
+            except Exception:
+                # Compatibility fallback for older clients and lightweight
+                # fakes. Each fallback query retains the same active fence.
+                pass
+        return [
+            self._search_points(
+                query_vector=query_vector,
+                limit=limit,
+                active_version_ids=active_version_ids,
             )
+            for query_vector in query_vectors
+        ]
+
+    def _search_points(
+        self,
+        query_vector: list[float],
+        limit: int,
+        active_version_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        collection = self.settings.qdrant_entities_collection
+        active_filter = build_active_version_filter(active_version_ids)
         if hasattr(self._qdrant_client, "query_points"):
             try:
                 try:
@@ -413,6 +629,124 @@ class CrossDocumentMerger:
         return entity_type.strip().lower() == "entity" or candidate_type.strip().lower() == "entity"
 
     @staticmethod
+    def _is_document_local_reference(name: str) -> bool:
+        tokens = re.findall(r"[a-z0-9]+", str(name).casefold())
+        if not tokens:
+            return False
+        deictic = {"this", "our", "current", "present", "the"}
+        local_heads = {
+            "study",
+            "paper",
+            "work",
+            "research",
+            "document",
+            "article",
+            "analysis",
+            "experiment",
+            "survey",
+            "project",
+        }
+        return tokens[0] in deictic and any(token in local_heads for token in tokens[1:])
+
+    @classmethod
+    def _is_context_dependent_generic(cls, name: str) -> bool:
+        """Reject unqualified labels whose identity is supplied only by context."""
+        tokens = cls._identity_tokens(name)
+        local_modifiers = {
+            "a",
+            "an",
+            "the",
+            "this",
+            "our",
+            "current",
+            "present",
+            "proposed",
+            "developed",
+            "existing",
+            "target",
+            "source",
+        }
+        while tokens and tokens[0] in local_modifiers:
+            tokens.pop(0)
+        generic_heads = {
+            "analysis",
+            "application",
+            "approach",
+            "component",
+            "database",
+            "dataset",
+            "document",
+            "experiment",
+            "feature",
+            "framework",
+            "interface",
+            "method",
+            "model",
+            "paper",
+            "pipeline",
+            "platform",
+            "project",
+            "research",
+            "solution",
+            "study",
+            "survey",
+            "system",
+            "tool",
+        }
+        return len(tokens) == 1 and tokens[0] in generic_heads
+
+    @classmethod
+    def _names_support_identity(cls, incoming_name: str, candidate_name: str) -> bool:
+        """Require deterministic lexical support before accepting an LLM merge."""
+        left = cls._identity_tokens(incoming_name)
+        right = cls._identity_tokens(candidate_name)
+        if not left or not right:
+            return False
+        if cls._identity_token_sequences_match(left, right):
+            return True
+        suffixes = {
+            "system",
+            "model",
+            "architecture",
+            "method",
+            "technology",
+            "tool",
+            "application",
+            "concept",
+        }
+        left_base = list(left)
+        right_base = list(right)
+        while len(left_base) > 1 and left_base[-1] in suffixes:
+            left_base.pop()
+        while len(right_base) > 1 and right_base[-1] in suffixes:
+            right_base.pop()
+        return cls._identity_token_sequences_match(left_base, right_base)
+
+    @staticmethod
+    def _identity_token_sequences_match(left: list[str], right: list[str]) -> bool:
+        if left == right:
+            return True
+        left_compact = "".join(left)
+        right_compact = "".join(right)
+        if left_compact == right_compact:
+            return True
+        if len(left) == 1 and left_compact == "".join(token[0] for token in right):
+            return True
+        if len(right) == 1 and right_compact == "".join(token[0] for token in left):
+            return True
+        return False
+
+    @staticmethod
+    def _identity_tokens(name: str) -> list[str]:
+        tokens = re.findall(r"[a-z0-9]+", str(name).casefold())
+        if not tokens:
+            return []
+        normalized = [token[:-1] if len(token) > 3 and token.endswith("s") else token for token in tokens]
+        if len(normalized) > 1 and normalized[-1] == "".join(token[0] for token in normalized[:-1]):
+            normalized = normalized[:-1]
+        return normalized
+
+    @staticmethod
     def _normalized_names(value: dict[str, Any]) -> set[str]:
         names = [value.get("name")]
         aliases = value.get("aliases")
@@ -459,6 +793,8 @@ class CrossDocumentMerger:
         )
 
         try:
+            with self._stats_lock:
+                self._stats.call_count += 1
             config = None
             if self._types is not None:
                 config = build_generate_config(
@@ -473,6 +809,11 @@ class CrossDocumentMerger:
                 contents=prompt,
                 config=config,
             )
+            usage = extract_usage_metadata(response)
+            with self._stats_lock:
+                self._stats.input_tokens += usage["input_tokens"]
+                self._stats.output_tokens += usage["output_tokens"]
+                self._stats.total_tokens += usage["total_tokens"]
             parsed = getattr(response, "parsed", None)
             if isinstance(parsed, dict):
                 return self._parse_adjudication(parsed)

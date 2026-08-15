@@ -23,6 +23,9 @@ class Settings:
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.5-flash-lite"
     gemini_max_workers: int = 2
+    ingestion_provider_timeout_seconds: float = 120.0
+    ingestion_progress_interval_chunks: int = 5
+    graph_exclude_reference_sections: bool = True
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "your_password"
@@ -71,11 +74,11 @@ class Settings:
     qdrant_entities_collection: str = "entities"
     qdrant_communities_collection: str = "communities"
     auto_backfill_vectors: bool = True
-    extraction_prompt_version: str = "assertion-r1-v1"
+    extraction_prompt_version: str = "assertion-r1-v2"
     assertion_review_confidence_threshold: float = 0.50
     extraction_max_attempts: int = 3
     extraction_retry_base_seconds: float = 1.0
-    graph_schema_version: int = 2
+    graph_schema_version: int = 3
     outbox_max_attempts: int = 5
     outbox_retry_base_seconds: float = 1.0
     outbox_lease_seconds: float = 60.0
@@ -112,6 +115,7 @@ class Settings:
     query_context_max_items: int = 20
     query_context_max_chars: int = 12000
     query_filter_boilerplate_chunks: bool = True
+    query_include_reference_chunks: bool = False
     query_citation_max: int = 8
     query_temperature_local: float = 0.1
     query_temperature_multihop: float = 0.1
@@ -138,6 +142,24 @@ class Settings:
             self.gemini_max_workers = int(os.getenv("GEMINI_MAX_WORKERS", self.gemini_max_workers))
         except ValueError:
             self.gemini_max_workers = self.gemini_max_workers
+        try:
+            self.ingestion_provider_timeout_seconds = float(
+                os.getenv(
+                    "INGESTION_PROVIDER_TIMEOUT_SECONDS",
+                    self.ingestion_provider_timeout_seconds,
+                )
+            )
+        except ValueError:
+            pass
+        try:
+            self.ingestion_progress_interval_chunks = int(
+                os.getenv(
+                    "INGESTION_PROGRESS_INTERVAL_CHUNKS",
+                    self.ingestion_progress_interval_chunks,
+                )
+            )
+        except ValueError:
+            pass
         try:
             self.embedding_batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", self.embedding_batch_size))
         except ValueError:
@@ -439,6 +461,20 @@ class Settings:
         filter_boilerplate_env = os.getenv("QUERY_FILTER_BOILERPLATE_CHUNKS")
         if filter_boilerplate_env is not None:
             self.query_filter_boilerplate_chunks = filter_boilerplate_env.strip().lower() not in {"0", "false", "no"}
+        include_references_env = os.getenv("QUERY_INCLUDE_REFERENCE_CHUNKS")
+        if include_references_env is not None:
+            self.query_include_reference_chunks = include_references_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
+        exclude_reference_graph_env = os.getenv("GRAPH_EXCLUDE_REFERENCE_SECTIONS")
+        if exclude_reference_graph_env is not None:
+            self.graph_exclude_reference_sections = exclude_reference_graph_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }
         embedding_metadata_env = os.getenv("ENFORCE_EMBEDDING_METADATA")
         if embedding_metadata_env is not None:
             self.enforce_embedding_metadata = embedding_metadata_env.strip().lower() not in {

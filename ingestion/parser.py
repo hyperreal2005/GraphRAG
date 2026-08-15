@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ingestion.content_classifier import classify_content_kind
 from models.ingestion import DocumentMetadata, ParsedDocument, Section, SectionType
 
 try:
@@ -185,8 +186,156 @@ class DocumentParser:
     def _parse_pdf(self, source_path: Path) -> list[Section]:
         sections_from_docling = self._parse_pdf_with_docling(source_path)
         if sections_from_docling:
-            return sections_from_docling
+            return self._recover_missing_pdf_pages(source_path, sections_from_docling)
         return self._parse_pdf_with_pypdf(source_path)
+
+    def _recover_missing_pdf_pages(
+        self,
+        source_path: Path,
+        sections: list[Section],
+    ) -> list[Section]:
+        """Recover pages Docling omitted while retaining deterministic provenance.
+
+        Docling can return a successful conversion after an individual OCR/page
+        preprocessing failure.  A successful document-level result is therefore
+        not sufficient evidence of complete source coverage.  When structured
+        output contains page provenance, compare it with the source PDF and use
+        its text layer only for pages that are entirely absent.
+        """
+        if PdfReader is None:
+            raise RuntimeError(
+                "Complete PDF parsing requires pypdf to verify Docling page coverage."
+            )
+
+        covered_pages = {int(section.page) for section in sections if section.page is not None}
+        if not covered_pages:
+            # Markdown/text Docling fallbacks do not provide page provenance. Do
+            # not duplicate the complete document through a second parser.
+            logger.warning("pdf_page_coverage_unverifiable source=%s", source_path)
+            return sections
+
+        reader = PdfReader(str(source_path))
+        source_page_count = len(reader.pages)
+        missing_pages = [page for page in range(1, source_page_count + 1) if page not in covered_pages]
+        if not missing_pages:
+            return sections
+
+        logger.warning(
+            "docling_pages_missing_recovering source=%s missing_pages=%s",
+            source_path,
+            missing_pages,
+        )
+        sections_by_page: dict[int, list[Section]] = {}
+        unpaged_sections: list[Section] = []
+        for section in sections:
+            if section.page is None:
+                unpaged_sections.append(section)
+            else:
+                sections_by_page.setdefault(int(section.page), []).append(section)
+
+        ordered: list[Section] = list(unpaged_sections)
+        last_heading = source_path.stem
+        in_references = False
+        for page_number in range(1, source_page_count + 1):
+            existing = sections_by_page.get(page_number, [])
+            if existing:
+                ordered.extend(existing)
+                for section in existing:
+                    if section.heading:
+                        last_heading = section.heading
+                        if classify_content_kind(section.heading) == "reference":
+                            in_references = True
+                continue
+
+            try:
+                raw_text = reader.pages[page_number - 1].extract_text() or ""
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Docling omitted PDF page {page_number} and text-layer recovery failed."
+                ) from exc
+
+            lines = raw_text.splitlines()
+            normalized_page_text = normalize_whitespace(raw_text)
+            if not normalized_page_text:
+                raise RuntimeError(
+                    f"Docling omitted PDF page {page_number} and its text layer is empty."
+                )
+
+            reference_line_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if classify_content_kind(line) == "reference"
+                ),
+                None,
+            )
+            part_index = 1
+            if in_references:
+                ordered.append(
+                    self._recovered_pdf_section(
+                        page_number=page_number,
+                        part_index=part_index,
+                        heading="References",
+                        text=normalized_page_text,
+                    )
+                )
+                continue
+
+            if reference_line_index is None:
+                ordered.append(
+                    self._recovered_pdf_section(
+                        page_number=page_number,
+                        part_index=part_index,
+                        heading=last_heading,
+                        text=normalized_page_text,
+                    )
+                )
+                continue
+
+            body_text = normalize_whitespace("\n".join(lines[:reference_line_index]))
+            if body_text:
+                ordered.append(
+                    self._recovered_pdf_section(
+                        page_number=page_number,
+                        part_index=part_index,
+                        heading=last_heading,
+                        text=body_text,
+                    )
+                )
+                part_index += 1
+
+            reference_heading = normalize_whitespace(lines[reference_line_index]) or "References"
+            reference_text = normalize_whitespace("\n".join(lines[reference_line_index + 1 :]))
+            if reference_text:
+                ordered.append(
+                    self._recovered_pdf_section(
+                        page_number=page_number,
+                        part_index=part_index,
+                        heading=reference_heading,
+                        text=reference_text,
+                    )
+                )
+            in_references = True
+            last_heading = reference_heading
+
+        return ordered
+
+    @staticmethod
+    def _recovered_pdf_section(
+        *,
+        page_number: int,
+        part_index: int,
+        heading: str,
+        text: str,
+    ) -> Section:
+        """Build an auditable page-level text-layer recovery section."""
+        return Section(
+            section_id=f"pdf-recovered-{page_number}-{part_index}",
+            section_type=SectionType.TEXT,
+            heading=heading,
+            text=text,
+            page=page_number,
+        )
 
     def _parse_pdf_with_docling(self, source_path: Path) -> list[Section]:
         if self._docling_converter is None:

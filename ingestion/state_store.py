@@ -14,7 +14,7 @@ from models.ingestion import Chunk
 from models.refactor import DocumentVersion, MergeDecision, OutboxEvent, OutboxEventType
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now_iso() -> str:
@@ -82,7 +82,8 @@ class MetadataStore:
                     section TEXT,
                     page INTEGER,
                     chunk_hash TEXT,
-                    embedding_version TEXT
+                    embedding_version TEXT,
+                    content_kind TEXT NOT NULL DEFAULT 'body'
                 );
 
                 CREATE TABLE IF NOT EXISTS entity_mentions (
@@ -114,6 +115,25 @@ class MetadataStore:
                     relations_created INTEGER,
                     entities_merged INTEGER,
                     status TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS ingestion_stage_metrics (
+                    metric_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    doc_id TEXT NOT NULL,
+                    document_version_id TEXT,
+                    duration_ms REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    provider TEXT,
+                    model_id TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER,
+                    call_count INTEGER,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS document_versions (
@@ -218,6 +238,9 @@ class MetadataStore:
 
                 CREATE INDEX IF NOT EXISTS idx_version_doc_entities_active
                     ON version_doc_entities (doc_id, active);
+
+                CREATE INDEX IF NOT EXISTS idx_ingestion_stage_metrics_version
+                    ON ingestion_stage_metrics (document_version_id, stage);
                 """
             )
             self._migrate_documents_table(conn)
@@ -258,7 +281,11 @@ class MetadataStore:
     def _migrate_version_columns(self, conn: sqlite3.Connection) -> None:
         """Add nullable Refactor 1 version keys without rewriting legacy rows."""
         additions = {
-            "chunks": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
+            "chunks": {
+                "document_version_id": "TEXT",
+                "active": "INTEGER NOT NULL DEFAULT 1",
+                "content_kind": "TEXT NOT NULL DEFAULT 'body'",
+            },
             "entity_mentions": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
             "doc_entities": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
             "ingestion_log": {"document_version_id": "TEXT"},
@@ -366,6 +393,23 @@ class MetadataStore:
             ).fetchone()
         return self._document_version_from_row(row) if row else None
 
+    def get_queryable_document_version_ids(self) -> list[str] | None:
+        """Return SQLite-authorized corpus versions, or ``None`` for a legacy corpus.
+
+        An empty list is intentionally distinct from ``None``: it means versioned
+        records exist but none is active, so query-plane stores must return no data.
+        ``None`` keeps read compatibility only for databases that predate immutable
+        document versions entirely.
+        """
+        with self._connection() as conn:
+            versioned = conn.execute("SELECT 1 FROM document_versions LIMIT 1").fetchone()
+            if versioned is None:
+                return None
+            rows = conn.execute(
+                "SELECT version_id FROM document_versions WHERE status = 'active' ORDER BY version_id"
+            ).fetchall()
+        return [str(row["version_id"]) for row in rows]
+
     def list_document_versions(self, doc_id: str) -> list[DocumentVersion]:
         """List document versions newest first."""
         with self._connection() as conn:
@@ -429,7 +473,8 @@ class MetadataStore:
             updated = conn.execute(
                 """
                 UPDATE document_versions
-                SET status = 'active', activated_at = ?, superseded_at = NULL, last_error = NULL
+                SET status = 'active', activated_at = ?, superseded_at = NULL,
+                    last_completed_stage = 'ACTIVE', last_error = NULL
                 WHERE version_id = ? AND status IN ('building', 'staged')
                 """,
                 (now, version_id),
@@ -477,6 +522,28 @@ class MetadataStore:
                 (version_id,),
             )
         return previous_id
+
+    def complete_document_version(self, version_id: str) -> None:
+        """Record completion only after activation and required retraction finish."""
+        with self._connection() as conn:
+            updated = conn.execute(
+                """
+                UPDATE document_versions
+                SET last_completed_stage = 'DONE', last_error = NULL
+                WHERE version_id = ? AND status = 'active'
+                """,
+                (version_id,),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(f"Document version {version_id} is not active.")
+
+    def record_document_version_error(self, version_id: str, error_message: str) -> None:
+        """Attach reconciliation failure details without corrupting lifecycle status."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE document_versions SET last_error = ? WHERE version_id = ?",
+                (error_message, version_id),
+            )
 
     def enqueue_outbox_event(self, event: OutboxEvent) -> None:
         """Insert an event once; replaying the same enqueue is a no-op."""
@@ -685,6 +752,39 @@ class MetadataStore:
             ).fetchone()
         return self._merge_decision_from_row(row) if row else None
 
+    def get_local_entities_for_version(
+        self,
+        doc_id: str,
+        document_version_id: str,
+    ) -> list[dict[str, object]]:
+        """Rebuild prior document-local identities without global merge leakage."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT incoming_local_entity_id, incoming_name, incoming_type
+                FROM merge_decisions
+                WHERE doc_id = ? AND document_version_id = ?
+                  AND reverses_decision_id IS NULL
+                ORDER BY created_at ASC, decision_id ASC
+                """,
+                (doc_id, document_version_id),
+            ).fetchall()
+        by_local_id: dict[str, dict[str, object]] = {}
+        for row in rows:
+            local_id = str(row["incoming_local_entity_id"] or "").strip()
+            name = str(row["incoming_name"] or "").strip()
+            if not local_id or not name:
+                continue
+            by_local_id[local_id] = {
+                "entity_id": local_id,
+                "canonical_name": name,
+                "aliases": [name],
+                "entity_type": str(row["incoming_type"] or "Entity"),
+            }
+        if by_local_id:
+            return [by_local_id[key] for key in sorted(by_local_id)]
+        return self.get_doc_entities(doc_id, document_version_id, active_only=True)
+
     def mark_merge_decision_reversed(self, decision_id: str, reversed_at: str | None = None) -> None:
         """Mark the original decision reversed without deleting its history."""
         with self._connection() as conn:
@@ -705,13 +805,36 @@ class MetadataStore:
         """Atomically stage SQLite records and the first external-store event."""
         if initial_event.document_version_id != document_version_id:
             raise ValueError("Initial outbox event belongs to a different document version.")
+        chunk_ids = {chunk.chunk_id for chunk in chunks}
+        mention_entity_ids = {str(mention[0]) for mention in mentions}
+        mention_chunk_ids = {str(mention[1]) for mention in mentions}
+        doc_entity_ids = {str(entity["entity_id"]) for entity in doc_entities}
+        entities_without_mentions = doc_entity_ids - mention_entity_ids
+        mentions_without_entities = mention_entity_ids - doc_entity_ids
+        mentions_without_chunks = mention_chunk_ids - chunk_ids
+        if entities_without_mentions:
+            raise ValueError(
+                "Document-version entities without current mentions: "
+                f"{sorted(entities_without_mentions)}"
+            )
+        if mentions_without_entities:
+            raise ValueError(
+                "Document-version mentions without entity mappings: "
+                f"{sorted(mentions_without_entities)}"
+            )
+        if mentions_without_chunks:
+            raise ValueError(
+                "Document-version mentions reference missing chunks: "
+                f"{sorted(mentions_without_chunks)}"
+            )
         with self._connection() as conn:
             conn.executemany(
                 """
                 INSERT INTO chunks (
                     chunk_id, doc_id, text, token_count, position, section, page,
-                    chunk_hash, embedding_version, document_version_id, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    chunk_hash, embedding_version, content_kind,
+                    document_version_id, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
@@ -720,6 +843,7 @@ class MetadataStore:
                     page = excluded.page,
                     chunk_hash = excluded.chunk_hash,
                     embedding_version = excluded.embedding_version,
+                    content_kind = excluded.content_kind,
                     document_version_id = excluded.document_version_id,
                     active = 0
                 """,
@@ -734,6 +858,7 @@ class MetadataStore:
                         chunk.page_number,
                         chunk.chunk_hash,
                         None,
+                        chunk.content_kind,
                         document_version_id,
                     )
                     for chunk in chunks
@@ -1011,6 +1136,79 @@ class MetadataStore:
                 (word_count, utc_now_iso(), "complete", pipeline_stage, pipeline_stage, doc_id),
             )
 
+    def record_ingestion_stage_metric(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        attempt: int,
+        doc_id: str,
+        document_version_id: str | None,
+        duration_ms: float,
+        status: str,
+        provider: str | None = None,
+        model_id: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        call_count: int | None = None,
+        details: dict[str, object] | None = None,
+        metric_id: str | None = None,
+    ) -> None:
+        """Persist one idempotent per-stage attempt for latency/usage acceptance."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ingestion_stage_metrics (
+                    metric_id, run_id, stage, attempt, doc_id, document_version_id,
+                    duration_ms, status, provider, model_id, input_tokens,
+                    output_tokens, total_tokens, call_count, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(metric_id) DO UPDATE SET
+                    duration_ms = excluded.duration_ms,
+                    status = excluded.status,
+                    provider = excluded.provider,
+                    model_id = excluded.model_id,
+                    input_tokens = excluded.input_tokens,
+                    output_tokens = excluded.output_tokens,
+                    total_tokens = excluded.total_tokens,
+                    call_count = excluded.call_count,
+                    details_json = excluded.details_json
+                """,
+                (
+                    metric_id
+                    or hashlib.sha256(
+                        f"{run_id}|{stage}|{max(1, int(attempt))}".encode("utf-8")
+                    ).hexdigest(),
+                    run_id,
+                    stage,
+                    max(1, int(attempt)),
+                    doc_id,
+                    document_version_id,
+                    max(0.0, float(duration_ms)),
+                    status,
+                    provider,
+                    model_id,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    call_count,
+                    json.dumps(details or {}, sort_keys=True, separators=(",", ":"), default=str),
+                    utc_now_iso(),
+                ),
+            )
+
+    def list_ingestion_stage_metrics(self, run_id: str) -> list[sqlite3.Row]:
+        """List stage timings and provider usage for one ingestion run."""
+        with self._connection() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM ingestion_stage_metrics
+                WHERE run_id = ? ORDER BY created_at, stage, attempt
+                """,
+                (run_id,),
+            ).fetchall()
+
     def update_pipeline_stage(self, doc_id: str, stage: str, word_count: int | None = None) -> None:
         """Record a durable successful checkpoint without promoting the generation."""
         with self._connection() as conn:
@@ -1079,7 +1277,7 @@ class MetadataStore:
             rows = conn.execute(
                 f"""
                 SELECT chunk_id, doc_id, text, section, page, chunk_hash, embedding_version,
-                       document_version_id, active
+                       content_kind, document_version_id, active
                 FROM chunks
                 WHERE {' AND '.join(clauses)}
                 ORDER BY position ASC
@@ -1135,8 +1333,9 @@ class MetadataStore:
                 """
                 INSERT INTO chunks (
                     chunk_id, doc_id, text, token_count, position, section, page,
-                    chunk_hash, embedding_version, document_version_id, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    chunk_hash, embedding_version, content_kind,
+                    document_version_id, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
@@ -1144,6 +1343,7 @@ class MetadataStore:
                     section = excluded.section,
                     page = excluded.page,
                     chunk_hash = excluded.chunk_hash,
+                    content_kind = excluded.content_kind,
                     document_version_id = excluded.document_version_id,
                     active = excluded.active
                 """,
@@ -1158,6 +1358,7 @@ class MetadataStore:
                         chunk.page_number,
                         chunk.chunk_hash,
                         None,
+                        chunk.content_kind,
                         document_version_id,
                         int(active),
                     )

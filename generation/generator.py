@@ -9,6 +9,7 @@ from typing import Any
 
 from config import Settings
 from generation.model_adapter import build_generate_config
+from generation.usage import add_usage, extract_usage_metadata
 from generation.prompt_builder import PromptBuilder
 from models.query import AnswerClaim, Citation, FusionOutput, GraphRAGResponse, QueryAnalysis, RetrieverResult
 
@@ -35,6 +36,7 @@ class AnswerGenerator:
         self._client = client
         self._types = None
         self._response_schema = None
+        self.last_usage: dict[str, int] = {}
 
         if self._client is None and self.settings.gemini_api_key:
             try:
@@ -44,7 +46,15 @@ class AnswerGenerator:
                 pass
             else:
                 self._types = types
-                self._client = genai.Client(api_key=self.settings.gemini_api_key)
+                self._client = genai.Client(
+                    api_key=self.settings.gemini_api_key,
+                    http_options=types.HttpOptions(
+                        timeout=max(
+                            1,
+                            int(float(self.settings.query_generation_timeout_seconds) * 1000),
+                        )
+                    ),
+                )
         elif self._client is not None:
             try:
                 from google.genai import types
@@ -78,6 +88,7 @@ class AnswerGenerator:
 
     def generate(self, question: str, analysis: QueryAnalysis, fusion: FusionOutput) -> GraphRAGResponse:
         """Generate structured claims, validate references, and derive citations from those claims."""
+        self.last_usage = {}
         if not fusion.context_items:
             return GraphRAGResponse(
                 answer="I do not have enough retrieved evidence to answer this question.",
@@ -235,6 +246,7 @@ class AnswerGenerator:
             contents=prompt,
             config=config,
         )
+        self.last_usage = add_usage(self.last_usage, extract_usage_metadata(response))
         parsed = getattr(response, "parsed", None)
         if isinstance(parsed, dict):
             return parsed
@@ -302,4 +314,3 @@ class AnswerGenerator:
             0.0,
             min(1.0, sum(item.support_score for item in claims) / len(claims)),
         )
-

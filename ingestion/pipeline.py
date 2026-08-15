@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -13,6 +15,7 @@ from pathlib import Path
 from config import Settings
 from ingestion.chunker import CHUNK_FINGERPRINT_VERSION, SemanticChunker
 from ingestion.coref import CoreferenceResolver
+from ingestion.content_classifier import classify_content_sequence, is_graph_extractable
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
 from ingestion.assertion_builder import AssertionBuilder
 from ingestion.outbox import IngestionOutboxProcessor
@@ -33,8 +36,11 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-INGESTION_PIPELINE_VERSION = "refactor1-versioned-assertions-v1"
+INGESTION_PIPELINE_VERSION = "refactor1-versioned-assertions-v6"
 STAGE_ORDER = {"PARSING": 1, "EXTRACTED": 2, "GRAPH_WRITTEN": 3, "VECTORS_WRITTEN": 4, "DONE": 5}
+
+
+logger = logging.getLogger(__name__)
 
 
 class PhaseOnePipeline:
@@ -177,6 +183,7 @@ class PhaseOnePipeline:
                     )
                 )
 
+            parse_started = time.perf_counter()
             parsed = self.parser.parse_document(
                 source_path=absolute_path,
                 doc_id=doc_id,
@@ -184,6 +191,18 @@ class PhaseOnePipeline:
             )
             resolved = self.coref.resolve_document(parsed)
             chunks = self.chunker.chunk_document(resolved)
+            content_kinds = (
+                classify_content_sequence([chunk.section_heading for chunk in chunks])
+                if self.settings.graph_exclude_reference_sections
+                else ["body" for _ in chunks]
+            )
+            chunks = [
+                replace(
+                    chunk,
+                    content_kind=content_kind,
+                )
+                for chunk, content_kind in zip(chunks, content_kinds)
+            ]
             active_version = self.store.get_active_document_version(doc_id)
             old_hash_to_chunk_id = self.store.get_chunk_ids_by_hash(
                 doc_id,
@@ -228,6 +247,21 @@ class PhaseOnePipeline:
                 chunks=chunks,
                 action=action,
                 delta=delta,
+            )
+            self.store.record_ingestion_stage_metric(
+                run_id=run_id,
+                stage="PARSE_COREF_CHUNK",
+                attempt=1,
+                doc_id=doc_id,
+                document_version_id=document_version_id,
+                duration_ms=(time.perf_counter() - parse_started) * 1000.0,
+                status="completed",
+                details={
+                    "chunks": len(chunks),
+                    "reference_chunks": sum(
+                        1 for chunk in chunks if chunk.content_kind == "reference"
+                    ),
+                },
             )
 
             entities_created = 0
@@ -322,13 +356,70 @@ class PhaseOnePipeline:
             raw_result = self.extractor.extract(chunk.text, doc_format)
             return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
 
+        extractable_chunks = [
+            chunk for chunk in chunks if is_graph_extractable(chunk.content_kind)
+        ]
+        skipped_reference_chunks = len(chunks) - len(extractable_chunks)
+        stats_before = self._extractor_stats()
+        extraction_started = time.perf_counter()
         max_workers = max(1, int(self.settings.gemini_max_workers))
-        if max_workers == 1 or len(chunks) <= 1:
-            extraction_results = [run_extract(chunk) for chunk in chunks]
-        else:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as executor:
-                futures = [executor.submit(run_extract, chunk) for chunk in chunks]
-                extraction_results = [future.result() for future in as_completed(futures)]
+        extraction_results = []
+        completed_chunks = 0
+        progress_interval = max(1, int(self.settings.ingestion_progress_interval_chunks))
+        try:
+            if max_workers == 1 or len(extractable_chunks) <= 1:
+                for chunk in extractable_chunks:
+                    extraction_results.append(run_extract(chunk))
+                    completed_chunks += 1
+                    self._log_extraction_progress(
+                        completed_chunks,
+                        len(extractable_chunks),
+                        progress_interval,
+                    )
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=min(max_workers, len(extractable_chunks))
+                ) as executor:
+                    futures = [executor.submit(run_extract, chunk) for chunk in extractable_chunks]
+                    try:
+                        for future in as_completed(futures):
+                            extraction_results.append(future.result())
+                            completed_chunks += 1
+                            self._log_extraction_progress(
+                                completed_chunks,
+                                len(extractable_chunks),
+                                progress_interval,
+                            )
+                    except Exception:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+        except Exception as exc:
+            self._record_extraction_metric(
+                run_id=run_id,
+                doc_id=doc_id,
+                document_version_id=document_version_id,
+                started=extraction_started,
+                status="failed",
+                stats_before=stats_before,
+                chunks_completed=completed_chunks,
+                chunks_total=len(extractable_chunks),
+                reference_chunks_skipped=skipped_reference_chunks,
+                error=str(exc),
+            )
+            raise
+
+        self._record_extraction_metric(
+            run_id=run_id,
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            started=extraction_started,
+            status="completed",
+            stats_before=stats_before,
+            chunks_completed=completed_chunks,
+            chunks_total=len(extractable_chunks),
+            reference_chunks_skipped=skipped_reference_chunks,
+        )
         extraction_results.sort(key=lambda item: (item[0].position, item[0].chunk_id))
 
         extraction_entities = []
@@ -355,10 +446,12 @@ class PhaseOnePipeline:
                     }
                 )
 
-        existing_entities = self.store.get_doc_entities(
-            doc_id,
-            active_version_id,
-            active_only=active_version_id is not None,
+        resolution_started = time.perf_counter()
+        merge_stats_before = self._merger_stats()
+        existing_entities = (
+            self.store.get_local_entities_for_version(doc_id, active_version_id)
+            if active_version_id is not None
+            else []
         )
         disamb = self.disambiguator.disambiguate(extraction_entities, existing_entities)
         canonical_nodes: dict[str, dict[str, object]] = {}
@@ -460,6 +553,34 @@ class PhaseOnePipeline:
             raw_to_local_entity_id=disamb.entity_id_map,
             raw_entity_chunk_ids=raw_entity_chunk_ids,
         )
+        merge_stats_after = self._merger_stats()
+
+        def merge_delta(key: str) -> int:
+            return max(0, merge_stats_after.get(key, 0) - merge_stats_before.get(key, 0))
+
+        merge_call_count = merge_delta("call_count")
+        self.store.record_ingestion_stage_metric(
+            run_id=run_id,
+            stage="DISAMBIGUATE_MERGE_ASSERT",
+            attempt=1,
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            duration_ms=(time.perf_counter() - resolution_started) * 1000.0,
+            status="completed",
+            provider="google" if merge_call_count else None,
+            model_id=self.settings.gemini_model if merge_call_count else None,
+            input_tokens=merge_delta("input_tokens"),
+            output_tokens=merge_delta("output_tokens"),
+            total_tokens=merge_delta("total_tokens"),
+            call_count=merge_call_count,
+            details={
+                "entities_extracted": len(extraction_entities),
+                "canonical_entities": len(canonical_nodes),
+                "assertions": len(assertions),
+                "auto_or_llm_merges": merge_result.merged_total,
+                "llm_adjudication_calls": merge_call_count,
+            },
+        )
         node_rows = [canonical_nodes[key] for key in sorted(canonical_nodes)]
         doc_entities = [
             {
@@ -480,6 +601,7 @@ class PhaseOnePipeline:
                 entity_ids_mentioned=mentions_by_chunk.get(chunk.chunk_id, []),
                 document_version_id=document_version_id,
                 active=False,
+                content_kind=chunk.content_kind,
             )
             for chunk in chunks
         ]
@@ -495,6 +617,7 @@ class PhaseOnePipeline:
             document_version_id=document_version_id,
             payload=payload,
         )
+        sqlite_stage_started = time.perf_counter()
         self.store.stage_version_records(
             document_version_id=document_version_id,
             chunks=chunks,
@@ -502,13 +625,131 @@ class PhaseOnePipeline:
             doc_entities=doc_entities,
             initial_event=initial_event,
         )
+        self.store.record_ingestion_stage_metric(
+            run_id=run_id,
+            stage="SQLITE_STAGE_VERSION",
+            attempt=1,
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            duration_ms=(time.perf_counter() - sqlite_stage_started) * 1000.0,
+            status="completed",
+            details={
+                "chunks": len(chunks),
+                "mentions": len(mapped_mentions),
+                "entities": len(doc_entities),
+                "assertions": len(assertions),
+            },
+        )
         self.store.update_pipeline_stage(doc_id, "EXTRACTED")
         self.outbox_processor.reconcile(
             document_version_id=document_version_id,
             wait_for_retries=True,
             max_events=100,
         )
+        incomplete_events = [
+            event
+            for event in self.store.list_outbox_events(
+                document_version_id=document_version_id
+            )
+            if event.status != "completed"
+        ]
+        if incomplete_events:
+            states = ", ".join(
+                f"{event.event_type}:{event.status}" for event in incomplete_events
+            )
+            raise RuntimeError(f"Document version reconciliation is incomplete: {states}.")
+        completed_version = self.store.get_document_version(document_version_id)
+        if (
+            completed_version is None
+            or completed_version.status != "active"
+            or completed_version.last_completed_stage != "DONE"
+        ):
+            raise RuntimeError("Document version did not reach the DONE activation checkpoint.")
         return merge_result.new_nodes, merge_result.merged_total, len(assertions)
+
+    def _extractor_stats(self) -> dict[str, int]:
+        snapshot = getattr(self.extractor, "snapshot_stats", None)
+        if not callable(snapshot):
+            return {}
+        stats = snapshot()
+        return {
+            key: int(getattr(stats, key, 0) or 0)
+            for key in (
+                "entities_count",
+                "relations_count",
+                "call_count",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+        }
+
+    def _merger_stats(self) -> dict[str, int]:
+        snapshot = getattr(self.cross_doc_merger, "snapshot_stats", None)
+        if not callable(snapshot):
+            return {}
+        stats = snapshot()
+        return {
+            key: int(getattr(stats, key, 0) or 0)
+            for key in (
+                "call_count",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+            )
+        }
+
+    def _record_extraction_metric(
+        self,
+        *,
+        run_id: str,
+        doc_id: str,
+        document_version_id: str,
+        started: float,
+        status: str,
+        stats_before: dict[str, int],
+        chunks_completed: int,
+        chunks_total: int,
+        reference_chunks_skipped: int,
+        error: str | None = None,
+    ) -> None:
+        stats_after = self._extractor_stats()
+
+        def delta(key: str) -> int:
+            return max(0, stats_after.get(key, 0) - stats_before.get(key, 0))
+
+        self.store.record_ingestion_stage_metric(
+            run_id=run_id,
+            stage="GEMINI_EXTRACTION",
+            attempt=1,
+            doc_id=doc_id,
+            document_version_id=document_version_id,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            status=status,
+            provider="google",
+            model_id=self.settings.gemini_model,
+            input_tokens=delta("input_tokens"),
+            output_tokens=delta("output_tokens"),
+            total_tokens=delta("total_tokens"),
+            call_count=delta("call_count"),
+            details={
+                "chunks_completed": chunks_completed,
+                "chunks_total": chunks_total,
+                "reference_chunks_skipped": reference_chunks_skipped,
+                "entities": delta("entities_count"),
+                "relations": delta("relations_count"),
+                "error": error,
+            },
+        )
+
+    @staticmethod
+    def _log_extraction_progress(completed: int, total: int, interval: int) -> None:
+        if completed == total or completed % max(1, interval) == 0:
+            logger.info(
+                "ingestion_extraction_progress completed=%d total=%d",
+                completed,
+                total,
+            )
 
     def _pipeline_fingerprint(self, target_stage: str) -> str:
         payload = {
@@ -522,6 +763,11 @@ class PhaseOnePipeline:
             "chunk_overlap_tokens": self.settings.chunk_overlap_tokens,
             "gemini_model": self.settings.gemini_model if self.settings.enable_graph else None,
             "extraction_prompt_version": self.settings.extraction_prompt_version if self.settings.enable_graph else None,
+            "graph_exclude_reference_sections": (
+                self.settings.graph_exclude_reference_sections
+                if self.settings.enable_graph
+                else None
+            ),
             "disamb_model": self.settings.disamb_model if self.settings.enable_graph else None,
             "disamb_threshold": self.settings.disamb_threshold if self.settings.enable_graph else None,
             "embedding_model_id": self.settings.embedding_model_id if self.settings.enable_graph else None,

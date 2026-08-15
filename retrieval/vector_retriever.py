@@ -9,6 +9,8 @@ from typing import Any
 
 from config import Settings
 from ingestion.embedder import GeminiEmbedder
+from ingestion.state_store import MetadataStore
+from ingestion.vector_indexer import build_active_version_filter
 from models.query import RetrieverResult
 
 logger = logging.getLogger(__name__)
@@ -22,9 +24,11 @@ class VectorRetriever:
         settings: Settings,
         embedder: GeminiEmbedder | None = None,
         client: Any | None = None,
+        store: MetadataStore | None = None,
     ) -> None:
         self.settings = settings
         self.embedder = embedder or GeminiEmbedder(settings)
+        self.store = store
         if client is not None:
             self._client = client
             self._async_client = None
@@ -49,6 +53,9 @@ class VectorRetriever:
         clean_query = query.strip()
         if not clean_query:
             return []
+        active_version_ids = self._queryable_version_ids()
+        if active_version_ids == []:
+            return []
 
         limit = max(1, int(top_k or self.settings.query_vector_top_k))
         mmr_enabled = bool(self.settings.query_mmr_enabled)
@@ -63,9 +70,16 @@ class VectorRetriever:
             query_vector=query_vector,
             limit=candidate_limit,
             with_vectors=mmr_enabled,
+            active_version_ids=active_version_ids,
         )
 
-        return self._rank_hits(query_vector, hits, limit=limit, mmr_enabled=mmr_enabled)
+        return self._rank_hits(
+            query_vector,
+            hits,
+            limit=limit,
+            mmr_enabled=mmr_enabled,
+            active_version_ids=active_version_ids,
+        )
 
     def _rank_hits(
         self,
@@ -74,11 +88,12 @@ class VectorRetriever:
         *,
         limit: int,
         mmr_enabled: bool,
+        active_version_ids: list[str] | None = None,
     ) -> list[RetrieverResult]:
         candidates: list[tuple[RetrieverResult, list[float] | None]] = []
         for hit in hits:
             payload = self._extract_payload(hit)
-            if not self._embedding_payload_matches(payload):
+            if not self._embedding_payload_matches(payload, active_version_ids):
                 continue
             point_id = self._extract_point_id(hit, payload)
             score = self._clamp01(self._extract_score(hit))
@@ -146,6 +161,9 @@ class VectorRetriever:
         clean_query = query.strip()
         if not clean_query:
             return []
+        active_version_ids = self._queryable_version_ids()
+        if active_version_ids == []:
+            return []
         limit = max(1, int(top_k or self.settings.query_vector_top_k))
         mmr_enabled = bool(self.settings.query_mmr_enabled)
         multiplier = max(1, int(self.settings.query_mmr_candidate_multiplier))
@@ -169,7 +187,10 @@ class VectorRetriever:
         response = await self._async_client.query_points(
             collection_name=self.settings.qdrant_chunks_collection,
             query=query_vector,
-            query_filter=self._active_filter(),
+            query_filter=build_active_version_filter(
+                active_version_ids,
+                exclude_reference_chunks=not self.settings.query_include_reference_chunks,
+            ),
             limit=candidate_limit,
             with_payload=True,
             with_vectors=mmr_enabled,
@@ -179,14 +200,24 @@ class VectorRetriever:
             self._extract_points(response),
             limit=limit,
             mmr_enabled=mmr_enabled,
+            active_version_ids=active_version_ids,
         )
 
     async def aclose(self) -> None:
         if self._async_client is not None:
             await self._async_client.close()
 
-    def _search_chunks(self, query_vector: list[float], limit: int, with_vectors: bool) -> list[Any]:
-        query_filter = self._active_filter()
+    def _search_chunks(
+        self,
+        query_vector: list[float],
+        limit: int,
+        with_vectors: bool,
+        active_version_ids: list[str] | None = None,
+    ) -> list[Any]:
+        query_filter = build_active_version_filter(
+            active_version_ids,
+            exclude_reference_chunks=not self.settings.query_include_reference_chunks,
+        )
         if hasattr(self._client, "query_points"):
             try:
                 try:
@@ -393,7 +424,20 @@ class VectorRetriever:
     def _clamp01(self, value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
-    def _embedding_payload_matches(self, payload: dict[str, Any]) -> bool:
+    def _embedding_payload_matches(
+        self,
+        payload: dict[str, Any],
+        active_version_ids: list[str] | None = None,
+    ) -> bool:
+        if active_version_ids is not None and str(payload.get("document_version_id") or "") not in set(
+            active_version_ids
+        ):
+            return False
+        if (
+            not self.settings.query_include_reference_chunks
+            and str(payload.get("content_kind") or "body") == "reference"
+        ):
+            return False
         if not self.settings.enforce_embedding_metadata:
             return True
         return (
@@ -404,17 +448,7 @@ class VectorRetriever:
             and payload.get("active") is True
         )
 
-    @staticmethod
-    def _active_filter() -> Any:
-        try:
-            from qdrant_client.http import models
-        except Exception:
-            return {"must": [{"key": "active", "match": {"value": True}}]}
-        return models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="active",
-                    match=models.MatchValue(value=True),
-                )
-            ]
-        )
+    def _queryable_version_ids(self) -> list[str] | None:
+        if self.store is None:
+            return None
+        return self.store.get_queryable_document_version_ids()
