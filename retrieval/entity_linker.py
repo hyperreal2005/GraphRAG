@@ -46,7 +46,11 @@ class EntityLinker:
             timeout=self.settings.qdrant_timeout_seconds,
         )
 
-    def link_entities(self, mentions: list[str]) -> list[LinkedEntity]:
+    def link_entities(
+        self,
+        mentions: list[str],
+        query_context: str = "",
+    ) -> list[LinkedEntity]:
         """Resolve mention strings to graph entity IDs with thresholded decisions."""
         if not mentions:
             return []
@@ -59,15 +63,32 @@ class EntityLinker:
                 LinkedEntity(mention=mention, status="unresolved", similarity=0.0)
                 for mention in clean_mentions
             ]
+        embedding_inputs = self._embedding_inputs(clean_mentions, query_context)
         vectors = self.embedder.embed_texts(
-            clean_mentions,
+            embedding_inputs,
             task_type=self.settings.query_embedding_task_type,
         )
-        if len(vectors) != len(clean_mentions):
+        if len(vectors) != len(embedding_inputs):
             raise RuntimeError("Entity-link embedding output length mismatch.")
+        point_groups = [
+            self._search_entities(
+                vector,
+                limit=int(self.settings.entity_link_candidate_k),
+                active_version_ids=active_version_ids,
+            )
+            for vector in vectors
+        ]
+        mention_groups = point_groups[: len(clean_mentions)]
+        context_groups = point_groups[len(clean_mentions) :]
         return [
-            self._link_single_mention(mention, vector, active_version_ids)
-            for mention, vector in zip(clean_mentions, vectors)
+            self._link_from_points(
+                mention,
+                self._merge_candidate_points(mention, mention_points, context_groups[index])
+                if context_groups
+                else mention_points,
+                active_version_ids,
+            )
+            for index, (mention, mention_points) in enumerate(zip(clean_mentions, mention_groups))
         ]
 
     def _link_single_mention(
@@ -76,7 +97,11 @@ class EntityLinker:
         query_vector: list[float],
         active_version_ids: list[str] | None,
     ) -> LinkedEntity:
-        points = self._search_entities(query_vector, limit=3, active_version_ids=active_version_ids)
+        points = self._search_entities(
+            query_vector,
+            limit=int(self.settings.entity_link_candidate_k),
+            active_version_ids=active_version_ids,
+        )
         return self._link_from_points(mention, points, active_version_ids)
 
     def _link_from_points(
@@ -118,7 +143,7 @@ class EntityLinker:
                 entity_id=point_id,
                 entity_name=str(payload.get("name") or mention),
                 entity_type=str(payload.get("type") or "Entity"),
-                candidate_ids=candidate_ids[:3],
+                candidate_ids=candidate_ids[: int(self.settings.entity_link_candidate_k)],
             )
         if best_score >= float(self.settings.entity_link_ambiguous_threshold):
             return LinkedEntity(
@@ -128,19 +153,23 @@ class EntityLinker:
                 entity_id=point_id,
                 entity_name=str(payload.get("name") or mention),
                 entity_type=str(payload.get("type") or "Entity"),
-                candidate_ids=candidate_ids[:3],
+                candidate_ids=candidate_ids[: int(self.settings.entity_link_candidate_k)],
             )
         return LinkedEntity(
             mention=mention,
             status="unresolved",
             similarity=best_score,
-            candidate_ids=candidate_ids[:3],
+            candidate_ids=candidate_ids[: int(self.settings.entity_link_candidate_k)],
         )
 
-    async def alink_entities(self, mentions: list[str]) -> list[LinkedEntity]:
+    async def alink_entities(
+        self,
+        mentions: list[str],
+        query_context: str = "",
+    ) -> list[LinkedEntity]:
         """Link mentions through Gemini/Qdrant async clients when available."""
         if self._async_client is None:
-            return await asyncio.to_thread(self.link_entities, mentions)
+            return await asyncio.to_thread(self.link_entities, mentions, query_context)
         clean_mentions = [mention.strip() for mention in mentions if mention.strip()]
         if not clean_mentions:
             return []
@@ -151,31 +180,121 @@ class EntityLinker:
                 for mention in clean_mentions
             ]
         async_embed = getattr(self.embedder, "aembed_texts", None)
+        embedding_inputs = self._embedding_inputs(clean_mentions, query_context)
         if callable(async_embed):
             vectors = await async_embed(
-                clean_mentions,
+                embedding_inputs,
                 task_type=self.settings.query_embedding_task_type,
             )
         else:
             vectors = await asyncio.to_thread(
                 self.embedder.embed_texts,
-                clean_mentions,
+                embedding_inputs,
                 self.settings.query_embedding_task_type,
             )
+        if len(vectors) != len(embedding_inputs):
+            raise RuntimeError("Entity-link embedding output length mismatch.")
         point_groups = await asyncio.gather(
             *(
                 self._asearch_entities(
                     vector,
-                    limit=3,
+                    limit=int(self.settings.entity_link_candidate_k),
                     active_version_ids=active_version_ids,
                 )
                 for vector in vectors
             )
         )
+        mention_groups = point_groups[: len(clean_mentions)]
+        context_groups = point_groups[len(clean_mentions) :]
         return [
-            self._link_from_points(mention, points, active_version_ids)
-            for mention, points in zip(clean_mentions, point_groups)
+            self._link_from_points(
+                mention,
+                self._merge_candidate_points(mention, mention_points, context_groups[index])
+                if context_groups
+                else mention_points,
+                active_version_ids,
+            )
+            for index, (mention, mention_points) in enumerate(zip(clean_mentions, mention_groups))
         ]
+
+    @staticmethod
+    def _embedding_inputs(mentions: list[str], query_context: str) -> list[str]:
+        context = str(query_context or "").strip()
+        if not context:
+            return list(mentions)
+        bounded_context = context[:2000]
+        context_inputs = [
+            f"{mention}\nQuery context: {bounded_context}"
+            for mention in mentions
+        ]
+        return [*mentions, *context_inputs]
+
+    def _merge_candidate_points(
+        self,
+        mention: str,
+        mention_points: list[Any],
+        context_points: list[Any],
+    ) -> list[dict[str, Any]]:
+        """Fuse mention identity with query-context relevance before thresholding."""
+        by_id: dict[str, dict[str, Any]] = {}
+        for source, points in (("mention", mention_points), ("context", context_points)):
+            for point in points:
+                payload = self._extract_payload(point)
+                candidate_id = self._extract_point_id(point, payload)
+                if not candidate_id:
+                    continue
+                entry = by_id.setdefault(
+                    candidate_id,
+                    {
+                        "id": candidate_id,
+                        "payload": payload,
+                        "mention_score": None,
+                        "context_score": None,
+                    },
+                )
+                score_key = f"{source}_score"
+                score = self._extract_score(point)
+                existing = entry.get(score_key)
+                if existing is None or score > float(existing):
+                    entry[score_key] = score
+                    entry["payload"] = payload
+
+        mention_weight = float(self.settings.entity_link_mention_weight)
+        context_weight = 1.0 - mention_weight
+        normalized_mention = self._normalize_name(mention)
+        merged: list[dict[str, Any]] = []
+        for candidate_id, entry in by_id.items():
+            mention_score = entry.get("mention_score")
+            context_score = entry.get("context_score")
+            if mention_score is not None and context_score is not None:
+                score = (mention_weight * float(mention_score)) + (
+                    context_weight * float(context_score)
+                )
+            else:
+                available_score = float(
+                    mention_score if mention_score is not None else context_score or 0.0
+                )
+                candidate_name = str(entry["payload"].get("name") or "")
+                score = (
+                    available_score
+                    if normalized_mention
+                    and self._normalize_name(candidate_name) == normalized_mention
+                    else available_score * max(mention_weight, context_weight)
+                )
+            merged.append(
+                {
+                    "id": candidate_id,
+                    "payload": entry["payload"],
+                    "score": max(0.0, min(1.0, score)),
+                }
+            )
+        return sorted(merged, key=self._extract_score, reverse=True)[
+            : int(self.settings.entity_link_candidate_k)
+        ]
+
+    @staticmethod
+    def _normalize_name(value: str) -> str:
+        return "".join(character for character in value.casefold() if character.isalnum())
 
     async def _asearch_entities(
         self,

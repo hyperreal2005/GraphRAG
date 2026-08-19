@@ -36,7 +36,7 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-INGESTION_PIPELINE_VERSION = "refactor1-versioned-assertions-v6"
+INGESTION_PIPELINE_VERSION = "refactor1-versioned-assertions-v8"
 STAGE_ORDER = {"PARSING": 1, "EXTRACTED": 2, "GRAPH_WRITTEN": 3, "VECTORS_WRITTEN": 4, "DONE": 5}
 
 

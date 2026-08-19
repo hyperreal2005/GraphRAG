@@ -132,7 +132,29 @@ class GeminiExtractor:
             )
 
     def _build_response_schema(self) -> Any:
-        properties_schema = self._genai_types.Schema(type="OBJECT")
+        property_item_schema = self._genai_types.Schema(
+            type="OBJECT",
+            required=["name", "value_text", "value_type"],
+            properties={
+                "name": self._genai_types.Schema(
+                    type="STRING",
+                    min_length=1,
+                    max_length=64,
+                    pattern=r"^[a-z][a-z0-9_]*$",
+                ),
+                "value_text": self._genai_types.Schema(type="STRING", min_length=1),
+                "value_type": self._genai_types.Schema(
+                    type="STRING",
+                    format="enum",
+                    enum=["string", "integer", "number", "boolean"],
+                ),
+            },
+        )
+        properties_schema = self._genai_types.Schema(
+            type="ARRAY",
+            items=property_item_schema,
+            max_items=12,
+        )
         entity_schema = self._genai_types.Schema(
             type="OBJECT",
             required=["id", "name", "type", "properties"],
@@ -244,12 +266,22 @@ class GeminiExtractor:
             "- Assign a confidence score (0.0-1.0) to each relation.\n"
             "- Keep extraction concise. Output zero entities/relations when the chunk\n"
             "  lacks meaningful graph facts.\n"
-            "- Properties must be JSON objects with primitive values only.\n"
+            "- Entity properties are explicit literal attribute/value facts about that\n"
+            "  entity which are not better represented as a relationship to another\n"
+            "  entity (for example parameter_count, publication_year, or version).\n"
+            "- Capture salient entity properties stated directly in the text; never\n"
+            "  infer them. Property names must be specific lowercase snake_case keys.\n"
+            "- Entity and relation properties must be JSON arrays of records with keys\n"
+            "  name, value_text, and value_type. value_type must be string, integer,\n"
+            "  number, or boolean; encode the primitive value exactly in value_text.\n"
+            "  Use [] when there are no properties. Do not emit null values.\n"
             "- Return ONLY valid JSON. No explanation, no preamble.\n"
             "Output format:\n"
             "{\n"
             "\"entities\": [\n"
-            "{\"id\": \"e1\", \"name\": \"...\", \"type\": \"...\", \"properties\": {...}, \"confidence\": 0.9}\n"
+            "{\"id\": \"e1\", \"name\": \"ChatGPT\", \"type\": \"Language Model\", "
+            "\"properties\": [{\"name\": \"parameter_count\", \"value_text\": "
+            "\"175000000000\", \"value_type\": \"integer\"}], \"confidence\": 0.9}\n"
             "],\n"
             "\"relations\": [\n"
             "{\n"
@@ -259,7 +291,8 @@ class GeminiExtractor:
             "\"raw_relation\": \"was developed by\",\n"
             "\"tail\": \"e2\",\n"
             "\"tail_type\": \"Organisation\",\n"
-            "\"properties\": {\"year\": 2003},\n"
+            "\"properties\": [{\"name\": \"year\", \"value_text\": \"2003\", "
+            "\"value_type\": \"integer\"}],\n"
             "\"confidence\": 0.95,\n"
             "\"valid_from\": \"2003\",\n"
             "\"valid_until\": \"2019\"\n"
@@ -348,6 +381,8 @@ class GeminiExtractor:
             "\"entities\" and \"relations\". Do not include any markdown or explanation.\n"
             "Each relation must include head, head_type, relation, raw_relation, tail,\n"
             "tail_type, properties, and confidence.\n"
+            "Each entity properties array may contain only explicit literal facts as\n"
+            "name/value_text/value_type records with lowercase snake_case names.\n"
             "CRITICAL: every entity id must be non-empty and unique within the entities array.\n"
             "CRITICAL: relation head and tail values must be exact entity id values\n"
             "from the entities array (for example e1), never entity names.\n"

@@ -37,6 +37,41 @@ BOILERPLATE_HINTS = (
     "doi:",
     "journal",
 )
+RELEVANCE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "does",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "through",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+}
+RELEVANCE_ACRONYMS = {
+    "llm": {"large", "language", "model"},
+    "rag": {"retrieval", "augmented", "generation"},
+    "nlp": {"natural", "language", "processing"},
+}
 
 
 class FusionEngine:
@@ -66,16 +101,15 @@ class FusionEngine:
         merged.extend(community_results)
         self._ensure_evidence_ids(merged)
 
-        deduped = self._dedupe_and_score(merged)
+        deduped = self._dedupe_and_score(merged, user_query=user_query)
         ranked = sorted(deduped.values(), key=self._ranking_score, reverse=True)
         reranked, rerank_mode = self._apply_rerank(user_query=user_query, ranked=ranked)
         selected = self._select_context_items(reranked)
 
-        prioritized = sorted(
-            selected,
-            key=lambda item: (SOURCE_PRIORITY.get(item.source_type, 99), -self._ranking_score(item)),
-        )
-        packed_items, context_text = self._pack_context(prioritized)
+        # _select_context_items places the best graph and vector candidates first.
+        # Preserve that order so a graph-heavy result set cannot exhaust the
+        # character budget before the selected vector evidence is packed.
+        packed_items, context_text = self._pack_context(selected)
         top_scores = [self._confidence_score(item) for item in packed_items[:3]]
         citations = self._build_citations(packed_items)
         graph_paths = [
@@ -112,9 +146,6 @@ class FusionEngine:
 
     def _select_context_items(self, ranked: list[RetrieverResult]) -> list[RetrieverResult]:
         max_items = max(1, int(self.settings.query_context_max_items))
-        if len(ranked) <= max_items:
-            return list(ranked)
-
         has_graph = any(item.source_type == "graph" for item in ranked)
         has_vector = any(item.source_type == "vector" for item in ranked)
         if not (has_graph and has_vector):
@@ -140,7 +171,12 @@ class FusionEngine:
 
         return selected[:max_items]
 
-    def _dedupe_and_score(self, results: list[RetrieverResult]) -> dict[str, RetrieverResult]:
+    def _dedupe_and_score(
+        self,
+        results: list[RetrieverResult],
+        *,
+        user_query: str = "",
+    ) -> dict[str, RetrieverResult]:
         deduped: dict[str, RetrieverResult] = {}
         for item in results:
             if (
@@ -151,13 +187,44 @@ class FusionEngine:
                 continue
             source_weight = SOURCE_WEIGHTS.get(item.source_type, 0.6)
             base_score = max(0.0, min(1.0, float(item.score_raw)))
-            item.score_fused = base_score * source_weight
+            relevance = self._lexical_relevance(user_query, item)
+            item.score_fused = base_score * source_weight * (0.75 + (0.25 * relevance))
             item.score_reranked = None
             key = item.dedupe_key()
             existing = deduped.get(key)
             if existing is None or item.score_fused > existing.score_fused:
                 deduped[key] = item
         return deduped
+
+    def _lexical_relevance(self, user_query: str, item: RetrieverResult) -> float:
+        query_tokens = self._relevance_tokens(user_query)
+        if not query_tokens:
+            return 1.0
+        if item.source_type == "graph":
+            evidence_text = str(
+                item.provenance.get("graph_path")
+                or item.text_or_path.split("\nExact source chunk:", 1)[0]
+            )
+        else:
+            evidence_text = item.text_or_path
+        evidence_tokens = self._relevance_tokens(evidence_text)
+        if not evidence_tokens:
+            return 0.0
+        overlap = len(query_tokens.intersection(evidence_tokens))
+        return max(0.0, min(1.0, overlap / max(1, min(8, len(query_tokens)))))
+
+    @staticmethod
+    def _relevance_tokens(value: str) -> set[str]:
+        raw_tokens = re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        tokens: set[str] = set()
+        for token in raw_tokens:
+            normalized = token[:-1] if len(token) > 3 and token.endswith("s") else token
+            if normalized and normalized not in RELEVANCE_STOPWORDS:
+                tokens.add(normalized)
+                tokens.update(RELEVANCE_ACRONYMS.get(normalized, set()))
+        if "how" in raw_tokens and "many" in raw_tokens:
+            tokens.add("count")
+        return tokens
 
     def _ranking_score(self, item: RetrieverResult) -> float:
         if item.score_reranked is not None:
@@ -273,9 +340,15 @@ class FusionEngine:
         max_chars = max(500, int(self.settings.query_context_max_chars))
         lines: list[str] = []
         packed: list[RetrieverResult] = []
+        hydrated_graph_chunks: set[str] = set()
         total = 0
         for item in results:
-            block = self._context_block(item)
+            graph_chunk_id = ""
+            include_graph_source = True
+            if item.source_type == "graph":
+                graph_chunk_id = str(item.provenance.get("chunk_id") or "")
+                include_graph_source = not graph_chunk_id or graph_chunk_id not in hydrated_graph_chunks
+            block = self._context_block(item, include_graph_source=include_graph_source)
             if not block:
                 continue
             projected = total + len(block) + 1
@@ -283,16 +356,37 @@ class FusionEngine:
                 if not lines:
                     lines.append(block[:max_chars].rstrip())
                     packed.append(item)
+                    if graph_chunk_id and include_graph_source:
+                        hydrated_graph_chunks.add(graph_chunk_id)
                 break
             lines.append(block)
             packed.append(item)
+            if graph_chunk_id and include_graph_source:
+                hydrated_graph_chunks.add(graph_chunk_id)
             total = projected
         return packed, "\n".join(lines)
 
-    def _context_block(self, item: RetrieverResult) -> str:
+    def _context_block(
+        self,
+        item: RetrieverResult,
+        *,
+        include_graph_source: bool = True,
+    ) -> str:
         evidence_id = str(item.provenance.get("evidence_id") or item.source_id)
         if item.source_type == "graph":
-            return f"[EVIDENCE id={evidence_id} type=graph_assertion]\n{item.text_or_path}"
+            graph_path = str(item.provenance.get("graph_path") or item.text_or_path)
+            block = f"[EVIDENCE id={evidence_id} type=graph_assertion]\nAssertion: {graph_path}"
+            evidence_text = str(item.provenance.get("evidence_text") or "").strip()
+            if include_graph_source and evidence_text:
+                chunk_id = item.provenance.get("chunk_id")
+                doc_id = item.provenance.get("doc_id")
+                section = item.provenance.get("section_heading")
+                page = item.provenance.get("page")
+                block += (
+                    f"\nSource: doc_id={doc_id}, chunk_id={chunk_id}, section={section}, page={page}"
+                    f"\nExact source chunk: {evidence_text}"
+                )
+            return block
         if item.source_type == "community":
             return f"[EVIDENCE id={evidence_id} type=community]\n{item.text_or_path}"
         chunk_id = str(item.provenance.get("chunk_id") or item.source_id)

@@ -64,6 +64,8 @@ ON CREATE SET
     n.sources = [row.doc_id],
     n.source_versions = [row.document_version_id],
     n.source_memberships = [row.source_membership],
+    n.source_type_memberships = [row.type_membership],
+    n.types = CASE WHEN row.active THEN [row.type] ELSE [] END,
     n.active_source_versions = CASE WHEN row.active THEN [row.document_version_id] ELSE [] END,
     n.active = row.active,
     n.confidence = row.confidence,
@@ -94,6 +96,11 @@ ON MATCH SET
     n.source_memberships = CASE
         WHEN row.source_membership IN coalesce(n.source_memberships, []) THEN coalesce(n.source_memberships, [])
         ELSE coalesce(n.source_memberships, []) + row.source_membership
+    END,
+    n.source_type_memberships = CASE
+        WHEN row.type_membership IN coalesce(n.source_type_memberships, [])
+            THEN coalesce(n.source_type_memberships, [])
+        ELSE coalesce(n.source_type_memberships, []) + row.type_membership
     END,
     n.active_source_versions = CASE
         WHEN NOT row.active OR row.document_version_id IN coalesce(n.active_source_versions, [])
@@ -232,6 +239,10 @@ class GraphWriter:
                 "doc_id": doc_id,
                 "document_version_id": document_version_id,
                 "source_membership": f"{doc_id}|{document_version_id}",
+                "type_membership": (
+                    f"{document_version_id}|"
+                    f"{str(node.get('type') or 'Entity').replace('|', '/')}"
+                ),
                 "active": activate_version,
                 "created_at": str(node.get("created_at") or now),
                 "updated_at": now,
@@ -388,6 +399,31 @@ class GraphWriter:
                 """,
                 **params,
             ).consume()
+            tx.run(
+                """
+                MATCH (typed:Entity)
+                WHERE $version_id IN coalesce(typed.source_versions, [])
+                   OR ($previous_version_id IS NOT NULL
+                       AND $previous_version_id IN coalesce(typed.source_versions, []))
+                WITH typed,
+                     [membership IN coalesce(typed.source_type_memberships, [])
+                      WHERE split(membership, '|')[0]
+                            IN coalesce(typed.active_source_versions, []) |
+                      split(membership, '|')[1]] AS active_type_candidates
+                WITH typed,
+                     reduce(types = [], candidate IN active_type_candidates |
+                         CASE WHEN candidate IN types THEN types ELSE types + candidate END
+                     ) AS active_types
+                SET typed.types = active_types,
+                    typed.type = CASE
+                        WHEN size(active_types) = 0 THEN coalesce(typed.type, 'Entity')
+                        WHEN typed.type IN active_types THEN typed.type
+                        ELSE head(active_types)
+                    END,
+                    typed.updated_at = $updated_at
+                """,
+                **params,
+            ).consume()
 
         with self._driver.session() as session:
             execute_write = getattr(session, "execute_write", None)
@@ -413,9 +449,13 @@ class GraphWriter:
                         AS remaining_active_versions,
                      [ref IN coalesce(n.source_memberships, [])
                       WHERE NOT ref ENDS WITH ('|' + $version_id)] AS remaining_memberships
+                     , [membership IN coalesce(n.source_type_memberships, [])
+                        WHERE NOT membership STARTS WITH ($version_id + '|')]
+                        AS remaining_type_memberships
                 SET n.source_versions = remaining_versions,
                     n.active_source_versions = remaining_active_versions,
                     n.source_memberships = remaining_memberships,
+                    n.source_type_memberships = remaining_type_memberships,
                     n.sources = reduce(
                         docs = [], ref IN remaining_memberships |
                         CASE
@@ -424,6 +464,20 @@ class GraphWriter:
                         END
                     ),
                     n.active = size(remaining_active_versions) > 0
+                WITH n, remaining_versions,
+                     [membership IN remaining_type_memberships
+                      WHERE split(membership, '|')[0] IN remaining_active_versions |
+                      split(membership, '|')[1]] AS active_type_candidates
+                WITH n, remaining_versions,
+                     reduce(types = [], candidate IN active_type_candidates |
+                         CASE WHEN candidate IN types THEN types ELSE types + candidate END
+                     ) AS active_types
+                SET n.types = active_types,
+                    n.type = CASE
+                        WHEN size(active_types) = 0 THEN coalesce(n.type, 'Entity')
+                        WHEN n.type IN active_types THEN n.type
+                        ELSE head(active_types)
+                    END
                 WITH n, remaining_versions
                 OPTIONAL MATCH (n)-[:SUBJECT_OF]->(subjectAssertion:Assertion)
                 OPTIONAL MATCH (objectAssertion:Assertion)-[:OBJECT]->(n)

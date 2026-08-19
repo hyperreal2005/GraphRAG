@@ -88,11 +88,12 @@ class QueryOrchestrator:
         try:
             async_link = getattr(self.entity_linker, "alink_entities", None)
             link_operation = (
-                async_link(analysis.mentioned_entities)
+                async_link(analysis.mentioned_entities, query_context=user_query)
                 if callable(async_link)
                 else asyncio.to_thread(
                     self.entity_linker.link_entities,
                     analysis.mentioned_entities,
+                    user_query,
                 )
             )
             linked_entities = await asyncio.wait_for(

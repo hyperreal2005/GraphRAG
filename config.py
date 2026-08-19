@@ -74,11 +74,11 @@ class Settings:
     qdrant_entities_collection: str = "entities"
     qdrant_communities_collection: str = "communities"
     auto_backfill_vectors: bool = True
-    extraction_prompt_version: str = "assertion-r1-v2"
+    extraction_prompt_version: str = "assertion-r1-v3"
     assertion_review_confidence_threshold: float = 0.50
     extraction_max_attempts: int = 3
     extraction_retry_base_seconds: float = 1.0
-    graph_schema_version: int = 3
+    graph_schema_version: int = 4
     outbox_max_attempts: int = 5
     outbox_retry_base_seconds: float = 1.0
     outbox_lease_seconds: float = 60.0
@@ -86,6 +86,8 @@ class Settings:
     entity_link_resolve_threshold: float = 0.85
     entity_link_ambiguous_threshold: float = 0.70
     entity_link_resolve_margin: float = 0.05
+    entity_link_candidate_k: int = 5
+    entity_link_mention_weight: float = 0.60
     enforce_embedding_metadata: bool = True
     query_vector_top_k: int = 15
     query_mmr_enabled: bool = True
@@ -287,6 +289,23 @@ class Settings:
         try:
             self.entity_link_resolve_margin = float(
                 os.getenv("ENTITY_LINK_RESOLVE_MARGIN", self.entity_link_resolve_margin)
+            )
+        except ValueError:
+            pass
+        try:
+            self.entity_link_candidate_k = max(
+                2,
+                min(20, int(os.getenv("ENTITY_LINK_CANDIDATE_K", self.entity_link_candidate_k))),
+            )
+        except ValueError:
+            pass
+        try:
+            self.entity_link_mention_weight = max(
+                0.0,
+                min(
+                    1.0,
+                    float(os.getenv("ENTITY_LINK_MENTION_WEIGHT", self.entity_link_mention_weight)),
+                ),
             )
         except ValueError:
             pass

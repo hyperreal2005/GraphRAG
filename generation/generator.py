@@ -183,12 +183,14 @@ class AnswerGenerator:
             "Use only evidence IDs shown in the retrieved evidence."
         )
         last_valid: list[AnswerClaim] = []
+        invalid_reference_found = False
         for attempt in range(2):
             attempt_prompt = prompt
             if attempt:
                 attempt_prompt += (
-                    "\nYour previous response referenced an unknown evidence ID. "
-                    "Regenerate using only the exact IDs supplied above."
+                    "\nYour previous response referenced unknown evidence or an assertion whose exact "
+                    "value did not support the claim. Regenerate using only exact supplied IDs whose "
+                    "asserted facts directly support each claim."
                 )
             try:
                 payload = self._request_payload(attempt_prompt, temperature)
@@ -198,7 +200,7 @@ class AnswerGenerator:
             if not isinstance(raw_claims, list):
                 continue
             validated: list[AnswerClaim] = []
-            unknown_found = False
+            invalid_reference_found = False
             for index, raw_claim in enumerate(raw_claims):
                 if not isinstance(raw_claim, dict):
                     continue
@@ -210,7 +212,10 @@ class AnswerGenerator:
                     dict.fromkeys(str(item).strip() for item in ids if str(item).strip())
                 )
                 if not evidence_ids or any(item not in evidence for item in evidence_ids):
-                    unknown_found = True
+                    invalid_reference_found = True
+                    continue
+                if not self._claim_matches_literal_assertions(text, evidence_ids, evidence):
+                    invalid_reference_found = True
                     continue
                 support = min(self._item_score(evidence[item]) for item in evidence_ids)
                 claim_id = str(raw_claim.get("claim_id") or "").strip() or hashlib.sha256(
@@ -226,9 +231,62 @@ class AnswerGenerator:
                     )
                 )
             last_valid = validated
-            if not unknown_found:
+            if not invalid_reference_found:
                 return validated, None
-        return last_valid, "invalid_or_unknown_claim_evidence_references"
+        return last_valid, "invalid_or_unsupported_claim_evidence_references"
+
+    def _claim_matches_literal_assertions(
+        self,
+        text: str,
+        evidence_ids: list[str],
+        evidence: dict[str, RetrieverResult],
+    ) -> bool:
+        for evidence_id in evidence_ids:
+            item = evidence[evidence_id]
+            if item.source_type != "graph" or item.provenance.get("object_kind") != "literal":
+                continue
+            raw_value = item.provenance.get("literal_value_json")
+            if raw_value is None or not self._literal_value_appears_in_claim(text, raw_value):
+                return False
+        return True
+
+    @staticmethod
+    def _literal_value_appears_in_claim(text: str, raw_value: Any) -> bool:
+        try:
+            value = json.loads(str(raw_value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = raw_value
+
+        normalized_text = " ".join(str(text).casefold().split())
+        if isinstance(value, bool):
+            return str(value).casefold() in normalized_text
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            scales = {
+                "": 1.0,
+                "thousand": 1_000.0,
+                "million": 1_000_000.0,
+                "billion": 1_000_000_000.0,
+                "trillion": 1_000_000_000_000.0,
+            }
+            pattern = re.compile(
+                r"(?<![\w.])([-+]?\d[\d,]*(?:\.\d+)?)\s*(?:-|\s)?\s*"
+                r"(thousand|million|billion|trillion)?\b",
+                re.IGNORECASE,
+            )
+            target = float(value)
+            for match in pattern.finditer(text):
+                try:
+                    candidate = float(match.group(1).replace(",", ""))
+                except ValueError:
+                    continue
+                candidate *= scales[str(match.group(2) or "").casefold()]
+                tolerance = max(1e-9, abs(target) * 0.005)
+                if abs(candidate - target) <= tolerance:
+                    return True
+            return False
+
+        normalized_value = " ".join(str(value).casefold().split())
+        return bool(normalized_value and normalized_value in normalized_text)
 
     def _request_payload(self, prompt: str, temperature: float) -> dict[str, Any]:
         config = None
@@ -296,7 +354,19 @@ class AnswerGenerator:
             matching = [item for item in citation.evidence_ids if item in used_evidence]
             if not matching:
                 continue
-            selected.append(citation.model_copy(update={"evidence_ids": matching}))
+            assertion_ids = [
+                assertion_id
+                for assertion_id in citation.assertion_ids
+                if f"assertion:{assertion_id}" in matching
+            ]
+            selected.append(
+                citation.model_copy(
+                    update={
+                        "evidence_ids": matching,
+                        "assertion_ids": assertion_ids,
+                    }
+                )
+            )
         return selected
 
     @staticmethod
