@@ -11,6 +11,7 @@ from typing import Any
 from config import Settings
 from ingestion.state_store import MetadataStore
 from models.query import LinkedEntity, QueryAnalysis, QueryType, RetrieverResult
+from retrieval import graph_traversal
 from retrieval.dynamic_cypher import DynamicCypherPlan, DynamicCypherPlanner
 
 
@@ -94,8 +95,18 @@ class GraphRetriever:
                     analysis,
                     anchors,
                 )
-                cypher, params = self._compile_logical_plan(plan)
-                rows = await self._aexecute_read(cypher, params)
+                anchor_ids, max_hops, targets, params = self._compile_logical_plan(plan)
+                rows = await self._abfs(
+                    anchor_ids=anchor_ids,
+                    max_hops=max_hops,
+                    params=params,
+                    targets=targets,
+                )
+                default_anchor = (
+                    "|".join(sorted(targets | set(anchor_ids))) if targets else anchor_ids[0]
+                )
+                for row in rows:
+                    row.setdefault("anchor_entity_id", default_anchor)
                 return self._rows_to_results(
                     rows,
                     analysis,
@@ -124,25 +135,24 @@ class GraphRetriever:
         fallback_reason: str | None = None,
     ) -> list[RetrieverResult]:
         if analysis.query_type is QueryType.MULTIHOP and len(anchors) >= 2:
-            query = self._build_connecting_query(int(self.settings.query_graph_multihop_hops))
             pairs = self._anchor_pairs(anchors)
             row_groups = await asyncio.gather(
                 *(
-                    self._aexecute_read(
-                        query,
-                        {
-                            "entity_a": str(pair[0].entity_id),
-                            "entity_b": str(pair[1].entity_id),
-                            "path_limit": int(self.settings.query_graph_path_limit),
-                            "relationship_types": [],
-                            **self._temporal_params(analysis.temporal_filter),
-                        },
+                    self._abfs(
+                        anchor_ids=[str(pair[0].entity_id)],
+                        max_hops=int(self.settings.query_graph_multihop_hops),
+                        params=self._traversal_params(analysis.temporal_filter),
+                        targets={str(pair[1].entity_id)},
                     )
                     for pair in pairs
                 )
             )
             connecting_results: list[RetrieverResult] = []
             for pair, rows in zip(pairs, row_groups):
+                for row in rows:
+                    row.setdefault(
+                        "anchor_entity_id", f"{pair[0].entity_id}|{pair[1].entity_id}"
+                    )
                 connecting_results.extend(
                     self._rows_to_results(
                         rows,
@@ -160,23 +170,20 @@ class GraphRetriever:
             if analysis.query_type is QueryType.MULTIHOP
             else int(self.settings.query_graph_local_hops)
         )
-        query = self._build_neighbor_query(hops)
         row_groups = await asyncio.gather(
             *(
-                self._aexecute_read(
-                    query,
-                    {
-                        "entity_id": str(anchor.entity_id),
-                        "path_limit": int(self.settings.query_graph_path_limit),
-                        "relationship_types": [],
-                        **self._temporal_params(analysis.temporal_filter),
-                    },
+                self._abfs(
+                    anchor_ids=[str(anchor.entity_id)],
+                    max_hops=hops,
+                    params=self._traversal_params(analysis.temporal_filter),
                 )
                 for anchor in anchors
             )
         )
         results: list[RetrieverResult] = []
         for anchor, rows in zip(anchors, row_groups):
+            for row in rows:
+                row.setdefault("anchor_entity_id", str(anchor.entity_id))
             results.extend(
                 self._rows_to_results(
                     rows,
@@ -220,8 +227,16 @@ class GraphRetriever:
         anchors: list[LinkedEntity],
     ) -> list[RetrieverResult]:
         plan = self._planner.generate_plan(user_query=user_query, analysis=analysis, anchors=anchors)
-        cypher, params = self._compile_logical_plan(plan)
-        rows = self._execute_read(cypher, params)
+        anchor_ids, max_hops, targets, params = self._compile_logical_plan(plan)
+        rows = self._bfs(
+            anchor_ids=anchor_ids,
+            max_hops=max_hops,
+            params=params,
+            targets=targets,
+        )
+        default_anchor = "|".join(sorted(targets | set(anchor_ids))) if targets else anchor_ids[0]
+        for row in rows:
+            row.setdefault("anchor_entity_id", default_anchor)
         return self._rows_to_results(
             rows=rows,
             analysis=analysis,
@@ -231,40 +246,39 @@ class GraphRetriever:
             plan=plan,
         )
 
-    def _compile_logical_plan(self, plan: DynamicCypherPlan) -> tuple[str, dict[str, Any]]:
-        """Compile validated model choices into application-owned bounded Cypher."""
+    def _compile_logical_plan(
+        self,
+        plan: DynamicCypherPlan,
+    ) -> tuple[list[str], int, set[str] | None, dict[str, Any]]:
+        """Turn validated model choices into bounded traversal inputs.
+
+        The model contributes only relationship-type filters and hop/limit numbers, all
+        of which are clamped here. Since WP4-B the traversal itself is level-wise BFS, so
+        there is no generated Cypher string to validate — the query is a constant in
+        `retrieval/graph_traversal.py`.
+        """
         max_hops = max(1, min(6, int(plan.params.get("max_hops", 1))))
         path_limit = max(1, min(100, int(plan.params.get("path_limit", self.settings.query_graph_path_limit))))
-        params = dict(plan.params)
-        params.pop("max_hops", None)
-        params["path_limit"] = path_limit
-        params["relationship_types"] = list(plan.relationship_types)
-        params.update(self._temporal_params(plan.temporal_filter_hint))
-        traversal_hops = max_hops * 2
+        params = {
+            "path_limit": path_limit,
+            "relationship_types": list(plan.relationship_types),
+            **self._temporal_params(plan.temporal_filter_hint),
+        }
 
         if plan.mode in {"neighborhood", "comparative"}:
-            anchor_ids = params.get("anchor_ids")
+            anchor_ids = plan.params.get("anchor_ids")
             if not isinstance(anchor_ids, list) or not anchor_ids:
                 raise ValueError(f"Logical graph plan mode {plan.mode} requires anchor_ids.")
-            cypher = (
-                "UNWIND $anchor_ids AS anchor_id "
-                f"MATCH p=(start:Entity {{id: anchor_id}})-[:SUBJECT_OF|OBJECT*1..{traversal_hops}]-(endpoint) "
-                f"{self._assertion_path_filter()}"
-                f"{self._assertion_projection('anchor_id')}"
-            )
-        elif plan.mode == "multihop_pair":
-            if not params.get("anchor_a") or not params.get("anchor_b"):
-                raise ValueError("Logical graph plan mode multihop_pair requires anchor_a and anchor_b.")
-            cypher = (
-                f"MATCH p=shortestPath((a:Entity {{id: $anchor_a}})-[:SUBJECT_OF|OBJECT*1..{traversal_hops}]-(b:Entity {{id: $anchor_b}})) "
-                f"{self._assertion_path_filter()}"
-                f"{self._assertion_projection("$anchor_a + '|' + $anchor_b") }"
-            )
-        else:
-            raise ValueError(f"Unsupported logical graph plan mode: {plan.mode}")
+            return [str(item) for item in anchor_ids], max_hops, None, params
 
-        self._assert_read_only(cypher)
-        return cypher, params
+        if plan.mode == "multihop_pair":
+            anchor_a = str(plan.params.get("anchor_a") or "")
+            anchor_b = str(plan.params.get("anchor_b") or "")
+            if not anchor_a or not anchor_b:
+                raise ValueError("Logical graph plan mode multihop_pair requires anchor_a and anchor_b.")
+            return [anchor_a], max_hops, {anchor_b}, params
+
+        raise ValueError(f"Unsupported logical graph plan mode: {plan.mode}")
 
     def _retrieve_static(
         self,
@@ -335,16 +349,15 @@ class GraphRetriever:
         query_mode: str,
         fallback_reason: str | None,
     ) -> list[RetrieverResult]:
-        query = self._build_neighbor_query(max_hops=max_hops)
         all_results: list[RetrieverResult] = []
         for linked in linked_entities:
-            params = {
-                "entity_id": str(linked.entity_id),
-                "path_limit": int(self.settings.query_graph_path_limit),
-                "relationship_types": [],
-                **self._temporal_params(temporal_filter),
-            }
-            rows = self._execute_read(query, params)
+            rows = self._bfs(
+                anchor_ids=[str(linked.entity_id)],
+                max_hops=max_hops,
+                params=self._traversal_params(temporal_filter),
+            )
+            for row in rows:
+                row.setdefault("anchor_entity_id", str(linked.entity_id))
             all_results.extend(
                 self._rows_to_results(
                     rows=rows,
@@ -380,15 +393,16 @@ class GraphRetriever:
         query_mode: str,
         fallback_reason: str | None,
     ) -> list[RetrieverResult]:
-        query = self._build_connecting_query(max_hops=int(self.settings.query_graph_multihop_hops))
-        params = {
-            "entity_a": str(linked_entities[0].entity_id),
-            "entity_b": str(linked_entities[1].entity_id),
-            "path_limit": int(self.settings.query_graph_path_limit),
-            "relationship_types": [],
-            **self._temporal_params(analysis.temporal_filter),
-        }
-        rows = self._execute_read(query, params)
+        entity_a = str(linked_entities[0].entity_id)
+        entity_b = str(linked_entities[1].entity_id)
+        rows = self._bfs(
+            anchor_ids=[entity_a],
+            max_hops=int(self.settings.query_graph_multihop_hops),
+            params=self._traversal_params(analysis.temporal_filter),
+            targets={entity_b},
+        )
+        for row in rows:
+            row.setdefault("anchor_entity_id", f"{entity_a}|{entity_b}")
         return self._rows_to_results(
             rows=rows,
             analysis=analysis,
@@ -397,59 +411,90 @@ class GraphRetriever:
             fallback_reason=fallback_reason,
         )
 
-    def _build_neighbor_query(self, max_hops: int) -> str:
-        hops = max(1, int(max_hops))
-        return (
-            "MATCH p=(start:Entity {id: $entity_id})-[:SUBJECT_OF|OBJECT*1.."
-            f"{hops * 2}"
-            "]-(endpoint) "
-            f"{self._assertion_path_filter()}"
-            f"{self._assertion_projection('$entity_id')}"
-        )
+    def _traversal_params(
+        self,
+        temporal_filter: str | None,
+        relationship_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "relationship_types": list(relationship_types or []),
+            **self._temporal_params(temporal_filter),
+        }
 
-    def _build_connecting_query(self, max_hops: int) -> str:
-        hops = max(1, int(max_hops))
-        return (
-            "MATCH p=shortestPath((a:Entity {id: $entity_a})-[:SUBJECT_OF|OBJECT*1.."
-            f"{hops * 2}"
-            "]-(b:Entity {id: $entity_b})) "
-            f"{self._assertion_path_filter()}"
-            f"{self._assertion_projection("$entity_a + '|' + $entity_b") }"
+    def _bfs(
+        self,
+        *,
+        anchor_ids: list[str],
+        max_hops: int,
+        params: dict[str, Any],
+        targets: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Synchronous level-wise expansion (WP4-B)."""
+        result = graph_traversal.expand(
+            self._execute_read,
+            anchor_ids=anchor_ids,
+            max_hops=max_hops,
+            level_limit=self._level_limit(),
+            params=params,
+            targets=targets,
         )
+        return result.limited(int(self.settings.query_graph_path_limit))
 
-    @staticmethod
-    def _assertion_path_filter() -> str:
-        return (
-            "WHERE all(assertion IN [node IN nodes(p) WHERE node:Assertion] WHERE "
-            "assertion.active = true AND "
-            "(NOT $enforce_version_fence OR assertion.document_version_id IN $active_version_ids) AND "
-            "(size($relationship_types) = 0 OR assertion.predicate_normalized IN $relationship_types) AND "
-            "($temporal_start IS NULL OR assertion.valid_until IS NULL OR assertion.valid_until >= $temporal_start) AND "
-            "($temporal_end IS NULL OR assertion.valid_from IS NULL OR assertion.valid_from <= $temporal_end)) "
-        )
+    async def _abfs(
+        self,
+        *,
+        anchor_ids: list[str],
+        max_hops: int,
+        params: dict[str, Any],
+        targets: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Async level-wise expansion. Levels are sequential by nature: each one's
+        frontier is the previous one's output."""
+        result = graph_traversal.TraversalResult()
+        frontier = [str(item) for item in anchor_ids if str(item)]
+        visited: set[str] = set(frontier)
+        result.reached.update(frontier)
+        parents: dict[str, tuple[dict[str, Any], str]] = {}
+        seen: set[str] = set()
 
-    @staticmethod
-    def _assertion_projection(anchor_expression: str) -> str:
-        return (
-            "WITH " + anchor_expression + " AS anchor_entity_id, "
-            "[node IN nodes(p) WHERE node:Assertion] AS path_assertions "
-            "UNWIND path_assertions AS assertion "
-            "MATCH (subject:Entity)-[:SUBJECT_OF]->(assertion) "
-            "OPTIONAL MATCH (assertion)-[:OBJECT]->(object:Entity) "
-            "RETURN DISTINCT anchor_entity_id, assertion.id AS assertion_id, "
-            "assertion.claim_key AS claim_key, subject.id AS subject_entity_id, "
-            "subject.name AS subject_name, assertion.predicate_raw AS predicate_raw, "
-            "assertion.predicate_normalized AS predicate_normalized, "
-            "assertion.object_kind AS object_kind, object.id AS object_entity_id, "
-            "object.name AS object_name, assertion.literal_value_json AS literal_value_json, "
-            "assertion.properties_json AS properties_json, assertion.confidence AS confidence, "
-            "assertion.doc_id AS doc_id, assertion.document_version_id AS document_version_id, "
-            "assertion.chunk_id AS chunk_id, assertion.source_ref AS source_ref, "
-            "assertion.valid_from AS valid_from, assertion.valid_until AS valid_until, "
-            "size(path_assertions) AS hop_count "
-            "ORDER BY hop_count ASC, assertion.confidence DESC, assertion.id ASC "
-            "LIMIT $path_limit"
-        )
+        for level in range(1, max(1, int(max_hops)) + 1):
+            if not frontier:
+                break
+            rows = await self._aexecute_read(
+                graph_traversal.build_level_query(),
+                {**params, "frontier": frontier, "level_limit": self._level_limit()},
+            )
+            result.levels_executed = level
+            next_frontier: list[str] = []
+            for row in rows:
+                source_entity_id = str(row.get("source_entity_id") or "")
+                annotated = {**row, "hop_count": level}
+                identity = str(row.get("assertion_id") or "") or graph_traversal._fallback_identity(row)
+                if identity not in seen:
+                    seen.add(identity)
+                    result.rows.append(annotated)
+                for neighbour in graph_traversal.neighbours(row, source_entity_id):
+                    result.reached.add(neighbour)
+                    if neighbour not in parents and neighbour not in visited:
+                        parents[neighbour] = (annotated, source_entity_id)
+                    if neighbour not in visited:
+                        visited.add(neighbour)
+                        next_frontier.append(neighbour)
+
+            if targets:
+                hit = next((item for item in targets if item in result.reached), None)
+                if hit is not None:
+                    result.target_found = True
+                    result.rows = graph_traversal._path_rows(parents, hit)
+                    return result.limited(int(self.settings.query_graph_path_limit))
+            frontier = next_frontier
+
+        if targets and not result.target_found:
+            return []
+        return result.limited(int(self.settings.query_graph_path_limit))
+
+    def _level_limit(self) -> int:
+        return max(1, int(self.settings.query_graph_level_fanout))
 
     @staticmethod
     def _temporal_params(value: str | None) -> dict[str, str | None]:
@@ -728,6 +773,7 @@ class GraphRetriever:
             "literal_value_json": row.get("literal_value_json"),
             "properties_json": row.get("properties_json"),
             "predicate_raw": row.get("predicate_raw"),
+            "predicate_canonical": row.get("predicate_canonical"),
             "predicate_normalized": row.get("predicate_normalized"),
             "direction": "subject_to_object",
             "chunk_id": chunk_id,

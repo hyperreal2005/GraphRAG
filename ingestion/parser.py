@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from ingestion.content_classifier import classify_content_kind
-from models.ingestion import DocumentMetadata, ParsedDocument, Section, SectionType
+from models.ingestion import (
+    DocumentMetadata,
+    ParsedDocument,
+    Section,
+    SectionProvenance,
+    SectionType,
+)
 
 try:
     from docling.document_converter import DocumentConverter
@@ -441,9 +447,10 @@ class DocumentParser:
 
                 if not item_text:
                     continue
+                section_id = f"pdf-{section_index}"
                 sections.append(
                     Section(
-                        section_id=f"pdf-{section_index}",
+                        section_id=section_id,
                         section_type=SectionType.TEXT,
                         heading=current_heading,
                         text=item_text,
@@ -451,6 +458,17 @@ class DocumentParser:
                         char_start=char_start,
                         char_end=char_end,
                         bbox=bbox,
+                        # WP2-A groups these items; recording provenance here is what
+                        # lets exact citation survive the merge.
+                        provenance=[
+                            SectionProvenance(
+                                section_id=section_id,
+                                page=page,
+                                char_start=char_start,
+                                char_end=char_end,
+                                bbox=bbox,
+                            )
+                        ],
                     )
                 )
                 section_index += 1

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
 from typing import Any, Iterable
 
@@ -143,6 +144,59 @@ class IngestionOutboxProcessor:
             processed += 1
         return processed
 
+    def sweep_orphans(
+        self,
+        *,
+        older_than_hours: float | None = None,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Retract external rows left by versions that were abandoned mid-build.
+
+        REVIEW1 finding B6: `reconcile` was only ever called scoped to the version being
+        built, so a crash left that version `building`/`staged` with inactive rows in
+        Neo4j and Qdrant that nothing ever collected. The next run created a *new*
+        version and never looked back, so orphans accumulated silently.
+
+        An active version is never touched, whatever its age.
+        """
+        hours = (
+            float(self.settings.outbox_orphan_sweep_hours)
+            if older_than_hours is None
+            else float(older_than_hours)
+        )
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(0.0, hours))
+        swept: list[str] = []
+
+        for version in self.store.list_abandoned_document_versions(cutoff.isoformat()):
+            pending = [
+                event
+                for event in self.store.list_outbox_events(document_version_id=version.version_id)
+                if event.status in {"pending", "processing", "failed"}
+            ]
+            if pending:
+                # Still recoverable by the reconciler; sweeping now would lose work.
+                continue
+            if dry_run:
+                swept.append(version.version_id)
+                continue
+            try:
+                self.graph_writer.retract_document_version(version.version_id)
+                self.vector_indexer.delete_document_version(version.version_id)
+            except Exception as exc:
+                logger.warning(
+                    "orphan_sweep_failed version=%s error=%s",
+                    version.version_id,
+                    type(exc).__name__,
+                )
+                continue
+            self.store.supersede_abandoned_version(
+                version.version_id,
+                f"Swept by orphan sweeper; abandoned before {cutoff.isoformat()}.",
+            )
+            swept.append(version.version_id)
+            logger.info("orphan_sweep_retracted version=%s", version.version_id)
+        return swept
+
     def _dispatch(self, event: OutboxEvent) -> None:
         payload = self._payload(event)
         handlers = {
@@ -202,6 +256,7 @@ class IngestionOutboxProcessor:
                     entity_type=str(node.get("type") or "Entity"),
                     properties=node.get("properties"),
                 ),
+                aliases=[str(alias) for alias in (node.get("aliases") or [])],
                 document_version_id=event.document_version_id,
                 doc_id=event.doc_id,
                 active=False,

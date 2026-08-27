@@ -17,6 +17,11 @@ class Settings:
     chunk_target_tokens: int = 700
     chunk_max_tokens: int = 800
     chunk_overlap_tokens: int = 100
+    # WP2-A: merge parser items into logical sections before coref/chunking (B1).
+    section_group_enabled: bool = True
+    section_group_target_tokens: int = 700
+    section_group_max_tokens: int = 2000
+    section_group_page_gap_tolerance: int = 1
     coref_profile: str = "balanced"
     strict_coref: bool = True
     enable_graph: bool = True
@@ -25,6 +30,9 @@ class Settings:
     gemini_max_workers: int = 2
     ingestion_provider_timeout_seconds: float = 120.0
     ingestion_progress_interval_chunks: int = 5
+    # Hard ceiling on extractable chunks per document, checked before the first
+    # provider call. Bounds what one bad input can cost. 0 disables the check.
+    ingestion_max_chunks_per_document: int = 400
     graph_exclude_reference_sections: bool = True
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
@@ -50,6 +58,10 @@ class Settings:
     )
     disamb_model: str = "all-MiniLM-L6-v2"
     disamb_threshold: float = 0.92
+    # WP2-B: identity is name-first; type only blocks on a coarse-class conflict.
+    entity_identity_name_first: bool = True
+    entity_coarse_class_blocking: bool = True
+    entity_same_type_bonus: float = 0.02
     cross_doc_auto_merge_threshold: float = 0.95
     cross_doc_llm_min_threshold: float = 0.80
     cross_doc_llm_max_threshold: float = 0.95
@@ -60,28 +72,45 @@ class Settings:
     cross_doc_llm_enabled: bool = True
     embedding_model_id: str = "gemini-embedding-2"
     embedding_dim: int = 3072
-    embedding_version: str = "embedding2-3072-r1"
-    embedding_prompt_version: str = "embedding2-r1-v1"
+    embedding_version: str = "embedding2-3072-r2"
+    embedding_prompt_version: str = "embedding2-r2-v1"
     embedding_normalization_policy: str = "provider-default"
-    embedding_document_prefix: str = "task: search result | title: {title} | text: "
+    # WP2-E: aligned to the documented asymmetric form. The document side carries no
+    # `task:` component; only the query side does.
+    embedding_document_prefix: str = "title: {title} | text: "
     embedding_query_prefix: str = "task: search result | query: "
     gemini_embedding_task_type: str = "RETRIEVAL_DOCUMENT"
+    # WP2-E: model behaviour is selected by explicit capability, never by matching a
+    # model-name string. Setting the documented `gemini-embedding-2-preview` id used
+    # to silently flip the pipeline back to legacy behaviour (REVIEW1 B10).
+    embedding_model_supports_task_type: bool = False
+    embedding_model_uses_instruction_prefix: bool = True
+    embedding_probe_on_startup: bool = True
     embedding_batch_size: int = 32
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
     qdrant_timeout_seconds: float = 30.0
+    # Points per upsert request. One request per document is unbounded: a 987-chunk
+    # document built a 47.7 MB body against Qdrant 33.5 MB limit and could never
+    # succeed, however many times it was retried.
+    qdrant_upsert_batch_size: int = 64
     qdrant_chunks_collection: str = "chunks"
     qdrant_entities_collection: str = "entities"
     qdrant_communities_collection: str = "communities"
-    auto_backfill_vectors: bool = True
-    extraction_prompt_version: str = "assertion-r1-v3"
+    extraction_prompt_version: str = "assertion-r2-v1"
     assertion_review_confidence_threshold: float = 0.50
     extraction_max_attempts: int = 3
+    # WP7: reuse a chunk assertions when its content hash is unchanged (A4).
+    extraction_reuse_enabled: bool = True
+    # WP3-C: share of chunks that may be quarantined before the document fails.
+    extraction_chunk_failure_ratio: float = 0.05
     extraction_retry_base_seconds: float = 1.0
-    graph_schema_version: int = 4
+    graph_schema_version: int = 5
     outbox_max_attempts: int = 5
     outbox_retry_base_seconds: float = 1.0
     outbox_lease_seconds: float = 60.0
+    # WP3-B: age at which a mid-build version is treated as abandoned by the sweeper.
+    outbox_orphan_sweep_hours: float = 24.0
     query_embedding_task_type: str = "RETRIEVAL_QUERY"
     entity_link_resolve_threshold: float = 0.85
     entity_link_ambiguous_threshold: float = 0.70
@@ -90,12 +119,25 @@ class Settings:
     entity_link_mention_weight: float = 0.60
     enforce_embedding_metadata: bool = True
     query_vector_top_k: int = 15
+    # WP6: lexical channel fused with dense retrieval by reciprocal rank (A5).
+    # DEFAULT OFF - measured and rejected 2026-08-27. On the judged set, holding corpus
+    # and questions fixed and toggling only this flag, recall@10 fell 0.653 to 0.612 and
+    # MRR 0.463 to 0.449. The code and its tests are kept so the decision can be revisited
+    # with weighted fusion; see docs/REFACTOR2.md section 8.5.
+    query_sparse_enabled: bool = False
+    query_rrf_k: int = 60
+    # Expected chunk length used for BM25 length normalization. The configured chunk
+    # target, not a measured corpus statistic, so a chunk weight never changes because
+    # some unrelated document was ingested.
+    sparse_average_chunk_tokens: int = 700
     query_mmr_enabled: bool = True
     query_mmr_lambda: float = 0.65
     query_mmr_candidate_multiplier: int = 3
     query_graph_local_hops: int = 3
     query_graph_multihop_hops: int = 4
     query_graph_path_limit: int = 25
+    # WP4-B: per-level frontier cap for level-wise BFS traversal.
+    query_graph_level_fanout: int = 64
     query_analysis_timeout_seconds: float = 15.0
     query_entity_link_timeout_seconds: float = 20.0
     query_graph_timeout_seconds: float = 15.0
@@ -130,6 +172,9 @@ class Settings:
     query_rerank_top_n: int = 15
     query_cache_enabled: bool = False
     query_cache_ttl_seconds: int = 3600
+    # WP1 evaluation harness (docs/REFACTOR2.md section 3)
+    eval_judge_model: str = "gemini-3.5-flash-lite"
+    eval_judge_prompt_version: str = "judge-r2-v1"
 
     def ensure_directories(self) -> None:
         """Ensure required directories exist before execution."""
@@ -140,6 +185,40 @@ class Settings:
         """Allow env vars to override sensitive defaults."""
         self.gemini_api_key = self.gemini_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         self.gemini_model = os.getenv("GEMINI_MODEL", self.gemini_model).strip() or self.gemini_model
+        try:
+            self.section_group_target_tokens = max(
+                1, int(os.getenv("SECTION_GROUP_TARGET_TOKENS", self.section_group_target_tokens))
+            )
+        except ValueError:
+            pass
+        try:
+            self.section_group_max_tokens = max(
+                1, int(os.getenv("SECTION_GROUP_MAX_TOKENS", self.section_group_max_tokens))
+            )
+        except ValueError:
+            pass
+        try:
+            self.section_group_page_gap_tolerance = max(
+                0,
+                int(os.getenv(
+                    "SECTION_GROUP_PAGE_GAP_TOLERANCE",
+                    self.section_group_page_gap_tolerance,
+                )),
+            )
+        except ValueError:
+            pass
+        try:
+            self.entity_same_type_bonus = max(
+                0.0, min(0.2, float(os.getenv("ENTITY_SAME_TYPE_BONUS", self.entity_same_type_bonus)))
+            )
+        except ValueError:
+            pass
+        coarse_block_env = os.getenv("ENTITY_COARSE_CLASS_BLOCKING")
+        if coarse_block_env is not None:
+            self.entity_coarse_class_blocking = coarse_block_env.strip().lower() not in {"0", "false", "no"}
+        section_group_env = os.getenv("SECTION_GROUP_ENABLED")
+        if section_group_env is not None:
+            self.section_group_enabled = section_group_env.strip().lower() not in {"0", "false", "no"}
         try:
             self.gemini_max_workers = int(os.getenv("GEMINI_MAX_WORKERS", self.gemini_max_workers))
         except ValueError:
@@ -164,6 +243,9 @@ class Settings:
             pass
         try:
             self.embedding_batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", self.embedding_batch_size))
+            self.qdrant_upsert_batch_size = max(
+                1, int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", self.qdrant_upsert_batch_size))
+            )
         except ValueError:
             self.embedding_batch_size = self.embedding_batch_size
         try:
@@ -232,6 +314,12 @@ class Settings:
             self.query_graph_path_limit = int(os.getenv("QUERY_GRAPH_PATH_LIMIT", self.query_graph_path_limit))
         except ValueError:
             self.query_graph_path_limit = self.query_graph_path_limit
+        try:
+            self.query_graph_level_fanout = max(
+                1, int(os.getenv("QUERY_GRAPH_LEVEL_FANOUT", self.query_graph_level_fanout))
+            )
+        except ValueError:
+            pass
         try:
             self.query_graph_schema_cache_ttl_seconds = int(
                 os.getenv("QUERY_GRAPH_SCHEMA_CACHE_TTL_SECONDS", self.query_graph_schema_cache_ttl_seconds)
@@ -357,6 +445,14 @@ class Settings:
             self.qdrant_communities_collection,
         )
         self.embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", self.embedding_model_id)
+        for attribute, environment_name in (
+            ("embedding_model_supports_task_type", "EMBEDDING_MODEL_SUPPORTS_TASK_TYPE"),
+            ("embedding_model_uses_instruction_prefix", "EMBEDDING_MODEL_USES_INSTRUCTION_PREFIX"),
+            ("embedding_probe_on_startup", "EMBEDDING_PROBE_ON_STARTUP"),
+        ):
+            raw_value = os.getenv(environment_name)
+            if raw_value is not None:
+                setattr(self, attribute, raw_value.strip().lower() not in {"0", "false", "no"})
         self.embedding_version = os.getenv("EMBEDDING_VERSION", self.embedding_version)
         self.embedding_prompt_version = os.getenv(
             "EMBEDDING_PROMPT_VERSION",
@@ -391,11 +487,48 @@ class Settings:
         except ValueError:
             self.extraction_max_attempts = self.extraction_max_attempts
         try:
+            self.ingestion_max_chunks_per_document = max(
+                0,
+                int(os.getenv(
+                    "INGESTION_MAX_CHUNKS_PER_DOCUMENT",
+                    self.ingestion_max_chunks_per_document,
+                )),
+            )
+        except ValueError:
+            pass
+        sparse_env = os.getenv("QUERY_SPARSE_ENABLED")
+        if sparse_env is not None:
+            self.query_sparse_enabled = sparse_env.strip().lower() not in {"0", "false", "no"}
+        try:
+            self.query_rrf_k = max(1, int(os.getenv("QUERY_RRF_K", self.query_rrf_k)))
+        except ValueError:
+            pass
+        reuse_env = os.getenv("EXTRACTION_REUSE_ENABLED")
+        if reuse_env is not None:
+            self.extraction_reuse_enabled = reuse_env.strip().lower() not in {"0", "false", "no"}
+        try:
+            self.extraction_chunk_failure_ratio = max(
+                0.0,
+                min(1.0, float(os.getenv(
+                    "EXTRACTION_CHUNK_FAILURE_RATIO",
+                    self.extraction_chunk_failure_ratio,
+                ))),
+            )
+        except ValueError:
+            pass
+        try:
             self.outbox_lease_seconds = float(
                 os.getenv("OUTBOX_LEASE_SECONDS", self.outbox_lease_seconds)
             )
         except ValueError:
             self.outbox_lease_seconds = self.outbox_lease_seconds
+        try:
+            self.outbox_orphan_sweep_hours = max(
+                0.0,
+                float(os.getenv("OUTBOX_ORPHAN_SWEEP_HOURS", self.outbox_orphan_sweep_hours)),
+            )
+        except ValueError:
+            pass
         try:
             self.extraction_retry_base_seconds = float(
                 os.getenv("EXTRACTION_RETRY_BASE_SECONDS", self.extraction_retry_base_seconds)
@@ -403,6 +536,11 @@ class Settings:
         except ValueError:
             self.extraction_retry_base_seconds = self.extraction_retry_base_seconds
         self.query_rerank_model = os.getenv("QUERY_RERANK_MODEL", self.query_rerank_model)
+        self.eval_judge_model = os.getenv("EVAL_JUDGE_MODEL", self.eval_judge_model)
+        self.eval_judge_prompt_version = os.getenv(
+            "EVAL_JUDGE_PROMPT_VERSION",
+            self.eval_judge_prompt_version,
+        )
         dynamic_model = os.getenv("QUERY_GRAPH_DYNAMIC_MODEL")
         if dynamic_model is not None and dynamic_model.strip():
             self.query_graph_dynamic_model = dynamic_model.strip()
@@ -511,8 +649,5 @@ class Settings:
         cross_doc_llm_env = os.getenv("CROSS_DOC_LLM_ENABLED")
         if cross_doc_llm_env is not None:
             self.cross_doc_llm_enabled = cross_doc_llm_env.strip().lower() not in {"0", "false", "no"}
-        auto_backfill_env = os.getenv("AUTO_BACKFILL_VECTORS")
-        if auto_backfill_env is not None:
-            self.auto_backfill_vectors = auto_backfill_env.strip().lower() not in {"0", "false", "no"}
         if self.query_graph_dynamic_model is None:
             self.query_graph_dynamic_model = self.gemini_model

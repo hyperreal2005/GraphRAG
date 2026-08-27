@@ -14,7 +14,7 @@ from models.ingestion import Chunk
 from models.refactor import DocumentVersion, MergeDecision, OutboxEvent, OutboxEventType
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now_iso() -> str:
@@ -58,7 +58,6 @@ class MetadataStore:
                     doc_id TEXT PRIMARY KEY,
                     source_path TEXT NOT NULL UNIQUE,
                     format TEXT,
-                    checksum TEXT UNIQUE,
                     word_count INTEGER,
                     ingested_at TEXT,
                     status TEXT,
@@ -199,6 +198,15 @@ class MetadataStore:
                     reversed_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS chunk_extraction_failures (
+                    document_version_id TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (document_version_id, chunk_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS version_doc_entities (
                     document_version_id TEXT NOT NULL REFERENCES document_versions(version_id),
                     doc_id TEXT NOT NULL,
@@ -263,20 +271,106 @@ class MetadataStore:
             if name not in columns:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {sql_type}")
 
+        if "checksum" in columns:
+            # Legacy rows carried the content hash in `documents.checksum`; move it into
+            # the generation columns before the column is dropped below.
+            conn.execute(
+                """
+                UPDATE documents
+                SET active_checksum = CASE
+                        WHEN active_checksum IS NULL AND status = 'complete' THEN checksum
+                        ELSE active_checksum
+                    END,
+                    desired_checksum = coalesce(desired_checksum, checksum)
+                """
+            )
         conn.execute(
             """
             UPDATE documents
-            SET active_checksum = CASE
-                    WHEN active_checksum IS NULL AND status = 'complete' THEN checksum
-                    ELSE active_checksum
-                END,
-                desired_checksum = coalesce(desired_checksum, checksum),
-                last_completed_stage = CASE
+            SET last_completed_stage = CASE
                     WHEN last_completed_stage IS NULL AND pipeline_stage <> 'FAILED' THEN pipeline_stage
                     ELSE last_completed_stage
                 END
             """
         )
+        self._drop_legacy_checksum_column(conn, columns)
+
+    def _drop_legacy_checksum_column(self, conn: sqlite3.Connection, columns: set[str]) -> None:
+        """Remove `documents.checksum` (WP5-A, REVIEW1 finding `B8`).
+
+        The column was written as NULL by every current code path while
+        `_is_active_generation_current` still read it as a fallback, so a legacy row and a
+        fresh row answered "is this generation current?" by different rules. SQLite cannot
+        `DROP COLUMN` a UNIQUE column, so the table is rebuilt; foreign keys are suspended
+        for the swap because `chunks.doc_id` references it by name.
+        """
+        if "checksum" not in columns:
+            return
+        # `PRAGMA foreign_keys` is silently ignored while a transaction is open, and this
+        # runs inside `_initialize`'s transaction. The rebuild therefore needs its own
+        # autocommit connection, where the pragma actually takes effect — without it
+        # `DROP TABLE documents` fails on every child row in `chunks`.
+        conn.commit()
+        rebuild = sqlite3.connect(self.db_path, timeout=5.0)
+        rebuild.row_factory = sqlite3.Row
+        try:
+            rebuild.isolation_level = None
+            rebuild.execute("PRAGMA foreign_keys = OFF")
+            self._rebuild_documents_without_checksum(rebuild)
+            rebuild.execute("PRAGMA foreign_keys = ON")
+            violations = rebuild.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"documents rebuild left {len(violations)} dangling reference(s); "
+                    "the legacy checksum column was not dropped."
+                )
+        finally:
+            rebuild.close()
+
+    def _rebuild_documents_without_checksum(self, conn: sqlite3.Connection) -> None:
+        """Copy `documents` into a table without `checksum`, then swap it in."""
+        keep = [
+            "doc_id", "source_path", "format", "word_count", "ingested_at", "status",
+            "pipeline_stage", "last_error", "active_checksum", "desired_checksum",
+            "last_completed_stage", "target_stage", "active_pipeline_fingerprint",
+            "desired_pipeline_fingerprint", "current_run_id",
+        ]
+        column_list = ", ".join(keep)
+        # The caller has already disabled foreign keys, which SQLite only permits outside
+        # a transaction. Everything below is one transaction so a failure cannot leave the
+        # database with `documents` dropped and nothing in its place.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE documents_wp5a (
+                    doc_id TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL UNIQUE,
+                    format TEXT,
+                    word_count INTEGER,
+                    ingested_at TEXT,
+                    status TEXT,
+                    pipeline_stage TEXT,
+                    last_error TEXT,
+                    active_checksum TEXT,
+                    desired_checksum TEXT,
+                    last_completed_stage TEXT,
+                    target_stage TEXT,
+                    active_pipeline_fingerprint TEXT,
+                    desired_pipeline_fingerprint TEXT,
+                    current_run_id TEXT
+                )
+                """
+            )
+            conn.execute(
+                f"INSERT INTO documents_wp5a ({column_list}) SELECT {column_list} FROM documents"
+            )
+            conn.execute("DROP TABLE documents")
+            conn.execute("ALTER TABLE documents_wp5a RENAME TO documents")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
 
     def _migrate_version_columns(self, conn: sqlite3.Connection) -> None:
         """Add nullable Refactor 1 version keys without rewriting legacy rows."""
@@ -285,12 +379,19 @@ class MetadataStore:
                 "document_version_id": "TEXT",
                 "active": "INTEGER NOT NULL DEFAULT 1",
                 "content_kind": "TEXT NOT NULL DEFAULT 'body'",
+                # WP2-D: change detection that survives a position shift.
+                "content_hash": "TEXT",
             },
             "entity_mentions": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
             "doc_entities": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
             "ingestion_log": {"document_version_id": "TEXT"},
         }
         additions["entity_mentions"]["local_entity_id"] = "TEXT"
+        additions["version_doc_entities"] = {
+            # WP2-B: the emergent schema, kept as evidence rather than as a gate.
+            "entity_types_json": "TEXT",
+            "coarse_class": "TEXT",
+        }
         additions["document_versions"] = {
             "embedding_schema_version": "TEXT NOT NULL DEFAULT 'legacy'",
             "embedding_normalization_policy": "TEXT NOT NULL DEFAULT 'provider-default'",
@@ -311,6 +412,8 @@ class MetadataStore:
             """
             CREATE INDEX IF NOT EXISTS idx_chunks_version_active
                 ON chunks (document_version_id, active);
+            CREATE INDEX IF NOT EXISTS idx_chunks_doc_content_hash
+                ON chunks (doc_id, content_hash);
             CREATE INDEX IF NOT EXISTS idx_mentions_version_active
                 ON entity_mentions (document_version_id, active);
             CREATE INDEX IF NOT EXISTS idx_doc_entities_version_active
@@ -418,6 +521,35 @@ class MetadataStore:
                 (doc_id,),
             ).fetchall()
         return [self._document_version_from_row(row) for row in rows]
+
+    def list_abandoned_document_versions(self, created_before: str) -> list[DocumentVersion]:
+        """Versions stuck mid-build, old enough that no run is plausibly still working.
+
+        An `active` version is excluded by the status filter and can never be returned.
+        """
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM document_versions
+                WHERE status IN ('building', 'staged', 'failed')
+                  AND created_at < ?
+                ORDER BY created_at ASC
+                """,
+                (created_before,),
+            ).fetchall()
+        return [self._document_version_from_row(row) for row in rows]
+
+    def supersede_abandoned_version(self, version_id: str, reason: str) -> None:
+        """Retire a swept version without ever disturbing the active one."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE document_versions
+                SET status = 'superseded', superseded_at = ?, last_error = ?
+                WHERE version_id = ? AND status <> 'active'
+                """,
+                (utc_now_iso(), reason, version_id),
+            )
 
     def stage_document_version(self, version_id: str, last_completed_stage: str) -> None:
         """Record a successfully staged external-store checkpoint."""
@@ -743,6 +875,31 @@ class MetadataStore:
                 ),
             )
 
+    def list_merge_decisions(
+        self,
+        *,
+        doc_id: str | None = None,
+        decision: str | None = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """List recorded merge decisions for audit (WP3-A)."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if doc_id:
+            clauses.append("doc_id = ?")
+            params.append(doc_id)
+        if decision:
+            clauses.append("decision = ?")
+            params.append(decision)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._connection() as conn:
+            return conn.execute(
+                f"""SELECT * FROM merge_decisions {where}
+                    ORDER BY created_at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+
     def get_merge_decision(self, decision_id: str) -> MergeDecision | None:
         """Fetch one merge decision for audit or rollback."""
         with self._connection() as conn:
@@ -832,9 +989,9 @@ class MetadataStore:
                 """
                 INSERT INTO chunks (
                     chunk_id, doc_id, text, token_count, position, section, page,
-                    chunk_hash, embedding_version, content_kind,
+                    chunk_hash, embedding_version, content_kind, content_hash,
                     document_version_id, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
@@ -844,6 +1001,7 @@ class MetadataStore:
                     chunk_hash = excluded.chunk_hash,
                     embedding_version = excluded.embedding_version,
                     content_kind = excluded.content_kind,
+                    content_hash = excluded.content_hash,
                     document_version_id = excluded.document_version_id,
                     active = 0
                 """,
@@ -859,6 +1017,7 @@ class MetadataStore:
                         chunk.chunk_hash,
                         None,
                         chunk.content_kind,
+                        chunk.content_hash,
                         document_version_id,
                     )
                     for chunk in chunks
@@ -888,11 +1047,14 @@ class MetadataStore:
             conn.executemany(
                 """
                 INSERT INTO version_doc_entities (
-                    document_version_id, doc_id, entity_id, canonical_name, aliases, active
-                ) VALUES (?, ?, ?, ?, ?, 0)
+                    document_version_id, doc_id, entity_id, canonical_name, aliases, active,
+                    entity_types_json, coarse_class
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(document_version_id, entity_id) DO UPDATE SET
                     canonical_name = excluded.canonical_name,
                     aliases = excluded.aliases,
+                    entity_types_json = excluded.entity_types_json,
+                    coarse_class = excluded.coarse_class,
                     active = 0
                 """,
                 [
@@ -902,6 +1064,8 @@ class MetadataStore:
                         str(entity["entity_id"]),
                         str(entity["canonical_name"]),
                         json.dumps(entity.get("aliases", [])),
+                        json.dumps(entity.get("entity_types", {}), sort_keys=True),
+                        str(entity.get("coarse_class") or "UNKNOWN"),
                     )
                     for entity in doc_entities
                 ],
@@ -1077,12 +1241,12 @@ class MetadataStore:
             conn.execute(
                 """
                 INSERT INTO documents (
-                    doc_id, source_path, format, checksum, word_count,
+                    doc_id, source_path, format, word_count,
                     ingested_at, status, pipeline_stage, last_error,
                     active_checksum, desired_checksum, last_completed_stage,
                     target_stage, active_pipeline_fingerprint,
                     desired_pipeline_fingerprint, current_run_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_path) DO UPDATE SET
                     doc_id = excluded.doc_id,
                     format = excluded.format,
@@ -1098,7 +1262,6 @@ class MetadataStore:
                     doc_id,
                     source_path,
                     doc_format,
-                    None,
                     0,
                     utc_now_iso(),
                     "processing",
@@ -1125,7 +1288,7 @@ class MetadataStore:
                     status = ?,
                     pipeline_stage = ?,
                     last_completed_stage = ?,
-                    active_checksum = coalesce(desired_checksum, active_checksum, checksum),
+                    active_checksum = coalesce(desired_checksum, active_checksum),
                     active_pipeline_fingerprint = coalesce(
                         desired_pipeline_fingerprint,
                         active_pipeline_fingerprint
@@ -1135,6 +1298,37 @@ class MetadataStore:
                 """,
                 (word_count, utc_now_iso(), "complete", pipeline_stage, pipeline_stage, doc_id),
             )
+
+    def record_chunk_extraction_failure(
+        self,
+        *,
+        document_version_id: str,
+        chunk_id: str,
+        attempts: int,
+        error: str,
+    ) -> None:
+        """Quarantine one chunk that could not be extracted (WP3-C)."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO chunk_extraction_failures (
+                    document_version_id, chunk_id, attempts, error, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(document_version_id, chunk_id) DO UPDATE SET
+                    attempts = excluded.attempts,
+                    error = excluded.error
+                """,
+                (document_version_id, chunk_id, max(0, int(attempts)), error, utc_now_iso()),
+            )
+
+    def list_chunk_extraction_failures(self, document_version_id: str) -> list[sqlite3.Row]:
+        """Chunks withheld from the graph for one version."""
+        with self._connection() as conn:
+            return conn.execute(
+                "SELECT * FROM chunk_extraction_failures WHERE document_version_id = ?"
+                " ORDER BY created_at",
+                (document_version_id,),
+            ).fetchall()
 
     def record_ingestion_stage_metric(
         self,
@@ -1236,6 +1430,32 @@ class MetadataStore:
                 ("failed", "FAILED", error_message, doc_id),
             )
 
+    def get_content_hashes(
+        self,
+        doc_id: str,
+        document_version_id: str | None = None,
+        *,
+        active_only: bool = True,
+    ) -> dict[str, str]:
+        """Map content_hash -> chunk_id for one document (WP2-D).
+
+        Position-free, so it still matches after text is inserted earlier in the file.
+        This is what WP7 will use to reuse assertions instead of re-extracting.
+        """
+        clauses = ["doc_id = ?", "content_hash IS NOT NULL", "content_hash <> ''"]
+        params: list[object] = [doc_id]
+        if document_version_id is not None:
+            clauses.append("document_version_id = ?")
+            params.append(document_version_id)
+        if active_only:
+            clauses.append("active = 1")
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT content_hash, chunk_id FROM chunks WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchall()
+        return {str(row["content_hash"]): str(row["chunk_id"]) for row in rows}
+
     def get_chunk_ids_by_hash(
         self,
         doc_id: str,
@@ -1333,9 +1553,9 @@ class MetadataStore:
                 """
                 INSERT INTO chunks (
                     chunk_id, doc_id, text, token_count, position, section, page,
-                    chunk_hash, embedding_version, content_kind,
+                    chunk_hash, embedding_version, content_kind, content_hash,
                     document_version_id, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
@@ -1344,6 +1564,7 @@ class MetadataStore:
                     page = excluded.page,
                     chunk_hash = excluded.chunk_hash,
                     content_kind = excluded.content_kind,
+                    content_hash = excluded.content_hash,
                     document_version_id = excluded.document_version_id,
                     active = excluded.active
                 """,
@@ -1359,6 +1580,7 @@ class MetadataStore:
                         chunk.chunk_hash,
                         None,
                         chunk.content_kind,
+                        chunk.content_hash,
                         document_version_id,
                         int(active),
                     )
@@ -1433,18 +1655,6 @@ class MetadataStore:
                 ],
             )
 
-    def delete_doc_entities(self, doc_id: str, entity_ids: Sequence[str]) -> None:
-        """Delete canonical entity records for a document."""
-        if not entity_ids:
-            return
-        placeholders = ",".join(["?"] * len(entity_ids))
-        params = [doc_id, *entity_ids]
-        with self._connection() as conn:
-            conn.execute(
-                f"DELETE FROM doc_entities WHERE doc_id = ? AND entity_id IN ({placeholders})",
-                params,
-            )
-
     def get_doc_entities(
         self,
         doc_id: str,
@@ -1514,128 +1724,6 @@ class MetadataStore:
                 (key,),
             ).fetchone()
         return str(row["value"]) if row else None
-
-    def upsert_entity_mentions(
-        self,
-        mentions: Sequence[tuple[str, str, str, float]],
-        document_version_id: str | None = None,
-        *,
-        active: bool = True,
-    ) -> None:
-        """Insert entity mention rows (entity_id, chunk_id, doc_id, confidence)."""
-        if not mentions:
-            return
-        with self._connection() as conn:
-            conn.executemany(
-                """
-                INSERT INTO entity_mentions (
-                    entity_id, chunk_id, doc_id, confidence, document_version_id, active
-                )
-                SELECT :entity_id, :chunk_id, :doc_id, :confidence, :version_id, :active
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM entity_mentions
-                    WHERE entity_id = :entity_id AND chunk_id = :chunk_id AND doc_id = :doc_id
-                      AND ((:version_id IS NULL AND document_version_id IS NULL)
-                           OR document_version_id = :version_id)
-                )
-                """,
-                [
-                    {
-                        "entity_id": entity_id,
-                        "chunk_id": chunk_id,
-                        "doc_id": doc_id,
-                        "confidence": confidence,
-                        "version_id": document_version_id,
-                        "active": int(active),
-                    }
-                    for entity_id, chunk_id, doc_id, confidence in mentions
-                ],
-            )
-
-    def get_entity_mentions_map(
-        self,
-        doc_id: str,
-        chunk_ids: Sequence[str] | None = None,
-        document_version_id: str | None = None,
-        *,
-        active_only: bool = False,
-    ) -> dict[str, list[str]]:
-        """Return mapping chunk_id -> mentioned canonical entity IDs."""
-        params: list[str] = [doc_id]
-        chunk_filter = ""
-        if chunk_ids:
-            placeholders = ",".join(["?"] * len(chunk_ids))
-            chunk_filter = f"AND chunk_id IN ({placeholders})"
-            params.extend(chunk_ids)
-        version_filter = ""
-        if document_version_id is not None:
-            version_filter = "AND document_version_id = ?"
-            params.append(document_version_id)
-        active_filter = "AND active = 1" if active_only else ""
-        with self._connection() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT chunk_id, entity_id
-                FROM entity_mentions
-                WHERE doc_id = ?
-                {chunk_filter}
-                {version_filter}
-                {active_filter}
-                """,
-                params,
-            ).fetchall()
-        mapping: dict[str, list[str]] = {}
-        for row in rows:
-            chunk_id = str(row["chunk_id"])
-            mapping.setdefault(chunk_id, []).append(str(row["entity_id"]))
-        return mapping
-
-    def delete_entity_mentions_for_chunks(self, doc_id: str, chunk_ids: Sequence[str]) -> None:
-        """Delete entity mention rows for specific chunks."""
-        if not chunk_ids:
-            return
-        placeholders = ",".join(["?"] * len(chunk_ids))
-        params = [doc_id, *chunk_ids]
-        with self._connection() as conn:
-            conn.execute(
-                f"DELETE FROM entity_mentions WHERE doc_id = ? AND chunk_id IN ({placeholders})",
-                params,
-            )
-
-    def get_entity_ids_for_chunks(self, doc_id: str, chunk_ids: Sequence[str]) -> set[str]:
-        """Get entity IDs mentioned in specific chunks."""
-        if not chunk_ids:
-            return set()
-        placeholders = ",".join(["?"] * len(chunk_ids))
-        params = [doc_id, *chunk_ids]
-        with self._connection() as conn:
-            rows = conn.execute(
-                f"SELECT DISTINCT entity_id FROM entity_mentions WHERE doc_id = ? AND chunk_id IN ({placeholders})",
-                params,
-            ).fetchall()
-        return {str(row["entity_id"]) for row in rows}
-
-    def get_entity_ids_with_mentions(
-        self,
-        doc_id: str,
-        document_version_id: str | None = None,
-        *,
-        active_only: bool = False,
-    ) -> set[str]:
-        """Get entity IDs still mentioned in any chunk for a document."""
-        clauses = ["doc_id = ?"]
-        params: list[object] = [doc_id]
-        if document_version_id is not None:
-            clauses.append("document_version_id = ?")
-            params.append(document_version_id)
-        if active_only:
-            clauses.append("active = 1")
-        with self._connection() as conn:
-            rows = conn.execute(
-                f"SELECT DISTINCT entity_id FROM entity_mentions WHERE {' AND '.join(clauses)}",
-                params,
-            ).fetchall()
-        return {str(row["entity_id"]) for row in rows}
 
     def log_ingestion_run(
         self,

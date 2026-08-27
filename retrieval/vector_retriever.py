@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+
+import numpy as np
 from typing import Any
 
 from config import Settings
 from ingestion.embedder import GeminiEmbedder
 from ingestion.state_store import MetadataStore
-from ingestion.vector_indexer import build_active_version_filter
+from ingestion.sparse_encoder import encode_query
+from ingestion.vector_indexer import SPARSE_VECTOR_NAME, build_active_version_filter
 from models.query import RetrieverResult
 
 logger = logging.getLogger(__name__)
@@ -29,6 +32,8 @@ class VectorRetriever:
         self.settings = settings
         self.embedder = embedder or GeminiEmbedder(settings)
         self.store = store
+        self._sparse_ready: bool | None = None
+        self._sparse_models = None
         if client is not None:
             self._client = client
             self._async_client = None
@@ -68,6 +73,13 @@ class VectorRetriever:
         )[0]
         hits = self._search_chunks(
             query_vector=query_vector,
+            limit=candidate_limit,
+            with_vectors=mmr_enabled,
+            active_version_ids=active_version_ids,
+        )
+        hits = self._fuse_with_sparse(
+            clean_query,
+            hits,
             limit=candidate_limit,
             with_vectors=mmr_enabled,
             active_version_ids=active_version_ids,
@@ -134,15 +146,11 @@ class VectorRetriever:
                 fallback_reason = "missing_vectors"
             else:
                 selected_results = []
+                mmr_scores = self._mmr_scores(query_vector, candidates, mmr_indices)
                 for rank, index in enumerate(mmr_indices):
                     item = candidates[index][0]
                     item.provenance["mmr_rank"] = rank
-                    item.provenance["mmr_score"] = self._mmr_score_for_index(
-                        index=index,
-                        selected_indices=mmr_indices[:rank],
-                        query_vector=query_vector,
-                        candidates=candidates,
-                    )
+                    item.provenance["mmr_score"] = mmr_scores[rank]
                     selected_results.append(item)
 
         logger.info(
@@ -207,17 +215,99 @@ class VectorRetriever:
         if self._async_client is not None:
             await self._async_client.close()
 
+    def _sparse_available(self) -> bool:
+        """Whether a sparse query can actually be served, decided once per retriever."""
+        if not self.settings.query_sparse_enabled:
+            return False
+        if self._sparse_ready is None:
+            try:
+                from qdrant_client import models
+
+                self._sparse_models = models
+                info = self._client.get_collection(self.settings.qdrant_chunks_collection)
+                params = getattr(getattr(info, "config", None), "params", None)
+                sparse = getattr(params, "sparse_vectors", None) or {}
+                self._sparse_ready = SPARSE_VECTOR_NAME in sparse
+            except Exception:
+                # A dense-only collection, or a client that cannot answer: fall back
+                # silently. Hybrid retrieval is an improvement, not a precondition.
+                self._sparse_ready = False
+            if not self._sparse_ready:
+                logger.info("sparse_retrieval_unavailable falling_back_to_dense_only")
+        return bool(self._sparse_ready)
+
+    def _fuse_with_sparse(
+        self,
+        query: str,
+        dense_hits: list[Any],
+        *,
+        limit: int,
+        with_vectors: bool,
+        active_version_ids: list[str] | None,
+    ) -> list[Any]:
+        """Reciprocal-rank fusion of the dense and lexical channels (WP6, finding `A5`).
+
+        RRF is used rather than score blending because the two channels' scores are not
+        comparable: cosine similarity is bounded and dense, BM25 is unbounded and depends
+        on collection statistics. Rank is the only quantity both produce on the same
+        scale. MMR then runs over the fused pool, so diversification still sees every
+        candidate either channel found.
+        """
+        if not self._sparse_available():
+            return dense_hits
+        sparse_query = encode_query(query)
+        if not sparse_query:
+            return dense_hits
+        try:
+            sparse_hits = self._search_chunks(
+                query_vector=self._sparse_models.SparseVector(
+                    indices=sparse_query.indices, values=sparse_query.values
+                ),
+                limit=limit,
+                with_vectors=with_vectors,
+                active_version_ids=active_version_ids,
+                using=SPARSE_VECTOR_NAME,
+            )
+        except Exception as exc:
+            logger.warning("sparse_query_failed error=%s", type(exc).__name__)
+            return dense_hits
+        if not sparse_hits:
+            return dense_hits
+
+        k = max(1.0, float(self.settings.query_rrf_k))
+        fused: dict[str, float] = {}
+        best_hit: dict[str, Any] = {}
+        for channel in (dense_hits, sparse_hits):
+            for rank, hit in enumerate(channel):
+                payload = self._extract_payload(hit)
+                key = self._extract_point_id(hit, payload)
+                fused[key] = fused.get(key, 0.0) + 1.0 / (k + rank + 1)
+                # Keep whichever copy carries a vector, so MMR is not starved.
+                incumbent = best_hit.get(key)
+                if incumbent is None or (
+                    self._extract_vector(incumbent) is None
+                    and self._extract_vector(hit) is not None
+                ):
+                    best_hit[key] = hit
+        ordered = sorted(fused.items(), key=lambda item: (-item[1], item[0]))
+        return [best_hit[key] for key, _ in ordered[:limit]]
+
     def _search_chunks(
         self,
-        query_vector: list[float],
+        query_vector: Any,
         limit: int,
         with_vectors: bool,
         active_version_ids: list[str] | None = None,
+        using: str | None = None,
     ) -> list[Any]:
         query_filter = build_active_version_filter(
             active_version_ids,
             exclude_reference_chunks=not self.settings.query_include_reference_chunks,
         )
+        # WP6: only `query_points` can address a named sparse channel. The older
+        # `search` APIs below are dense-only, so a sparse request must fail here rather
+        # than silently fall through and be answered as a dense query.
+        named = {"using": using} if using else {}
         if hasattr(self._client, "query_points"):
             try:
                 try:
@@ -228,6 +318,7 @@ class VectorRetriever:
                         limit=limit,
                         with_payload=True,
                         with_vectors=with_vectors,
+                        **named,
                     )
                 except TypeError:
                     response = self._client.query_points(
@@ -236,10 +327,14 @@ class VectorRetriever:
                         limit=limit,
                         with_payload=True,
                         with_vectors=with_vectors,
+                        **named,
                     )
                 return self._extract_points(response)
             except Exception:
-                pass
+                if using:
+                    raise
+        if using:
+            raise RuntimeError("Qdrant client cannot query a named sparse vector.")
 
         if hasattr(self._client, "search"):
             try:
@@ -348,67 +443,92 @@ class VectorRetriever:
             point_id = getattr(point, "id", None)
         return str(payload.get("chunk_id") or point_id or "")
 
+    def _mmr_matrices(
+        self,
+        query_vector: list[float],
+        candidates: list[tuple[RetrieverResult, list[float] | None]],
+    ) -> tuple[Any, Any] | None:
+        """Precompute relevance and pairwise similarity once.
+
+        The previous implementation recomputed both inside the greedy loop in pure
+        Python: roughly 3e7 float operations per sub-query at 3072 dimensions, measured
+        at a 9.8s p50 against a 15s budget (REVIEW1 finding B4). Normalising once and
+        letting NumPy do two matrix products makes it a few milliseconds.
+        """
+        query_dim = len(query_vector)
+        if not candidates or query_dim == 0:
+            return None
+        for _, vector in candidates:
+            if not isinstance(vector, list) or len(vector) != query_dim:
+                return None
+
+        matrix = np.asarray([vector for _, vector in candidates], dtype=np.float64)
+        query = np.asarray(query_vector, dtype=np.float64)
+
+        # Normalise so a dot product is the cosine. Zero vectors stay zero, matching
+        # _cosine_similarity's guard rather than producing NaN.
+        row_norms = np.linalg.norm(matrix, axis=1)
+        row_norms[row_norms == 0.0] = 1.0
+        matrix = matrix / row_norms[:, np.newaxis]
+        query_norm = float(np.linalg.norm(query))
+        query = query / (query_norm or 1.0)
+
+        relevance = np.clip(matrix @ query, -1.0, 1.0)
+        similarity = np.clip(matrix @ matrix.T, -1.0, 1.0)
+        return relevance, similarity
+
     def _select_mmr_indices(
         self,
         query_vector: list[float],
         candidates: list[tuple[RetrieverResult, list[float] | None]],
         limit: int,
     ) -> list[int]:
-        if not candidates:
+        matrices = self._mmr_matrices(query_vector, candidates)
+        if matrices is None:
             return []
-        vectors: list[list[float]] = []
-        query_dim = len(query_vector)
-        for _, vector in candidates:
-            if not isinstance(vector, list) or len(vector) != query_dim:
-                return []
-            vectors.append(vector)
+        relevance, similarity = matrices
 
         lambda_mult = max(0.0, min(1.0, float(self.settings.query_mmr_lambda)))
+        count = len(candidates)
         selected: list[int] = []
-        remaining = set(range(len(candidates)))
+        # Running max similarity to anything already selected; -inf until the first pick,
+        # so the first selection is driven purely by relevance.
+        penalty = np.full(count, -np.inf)
+        available = np.ones(count, dtype=bool)
 
-        while remaining and len(selected) < limit:
-            best_index: int | None = None
-            best_value = float("-inf")
-            for index in remaining:
-                relevance = self._cosine_similarity(query_vector, vectors[index])
-                diversity_penalty = 0.0
-                if selected:
-                    diversity_penalty = max(
-                        self._cosine_similarity(vectors[index], vectors[chosen])
-                        for chosen in selected
-                    )
-                mmr_value = (lambda_mult * relevance) - ((1.0 - lambda_mult) * diversity_penalty)
-                if best_index is None or mmr_value > best_value:
-                    best_index = index
-                    best_value = mmr_value
-
-            if best_index is None:
+        for _ in range(min(limit, count)):
+            diversity = np.where(np.isneginf(penalty), 0.0, penalty)
+            scores = (lambda_mult * relevance) - ((1.0 - lambda_mult) * diversity)
+            scores = np.where(available, scores, -np.inf)
+            best_index = int(np.argmax(scores))  # ties resolve to the lowest index
+            if not available[best_index]:
                 break
             selected.append(best_index)
-            remaining.remove(best_index)
+            available[best_index] = False
+            penalty = np.maximum(penalty, similarity[best_index])
 
         return selected
 
-    def _mmr_score_for_index(
+    def _mmr_scores(
         self,
-        index: int,
-        selected_indices: list[int],
         query_vector: list[float],
         candidates: list[tuple[RetrieverResult, list[float] | None]],
-    ) -> float:
-        vector = candidates[index][1]
-        if not isinstance(vector, list):
-            return 0.0
+        selected: list[int],
+    ) -> list[float]:
+        """MMR score each selection had at the moment it was chosen."""
+        matrices = self._mmr_matrices(query_vector, candidates)
+        if matrices is None:
+            return [0.0] * len(selected)
+        relevance, similarity = matrices
+
         lambda_mult = max(0.0, min(1.0, float(self.settings.query_mmr_lambda)))
-        relevance = self._cosine_similarity(query_vector, vector)
-        diversity_penalty = 0.0
-        if selected_indices:
-            diversity_penalty = max(
-                self._cosine_similarity(vector, candidates[chosen][1] or [])
-                for chosen in selected_indices
-            )
-        return (lambda_mult * relevance) - ((1.0 - lambda_mult) * diversity_penalty)
+        scores: list[float] = []
+        penalty = np.full(len(candidates), -np.inf)
+        for index in selected:
+            diversity = 0.0 if np.isneginf(penalty[index]) else float(penalty[index])
+            scores.append((lambda_mult * float(relevance[index])) - ((1.0 - lambda_mult) * diversity))
+            penalty = np.maximum(penalty, similarity[index])
+        return scores
 
     def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
         if not left or not right or len(left) != len(right):

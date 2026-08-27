@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from config import Settings
-from ingestion.relation_normalizer import sanitize_rel_type
 from models.refactor import AssertionRecord
 
 
@@ -40,17 +39,6 @@ def normalize_aliases(value: Any) -> list[str]:
     else:
         values = [str(value)]
     return list(dict.fromkeys(item.strip() for item in values if item.strip()))
-
-
-def build_source_ref(doc_id: str, source_chunk: str) -> str:
-    """Legacy two-part source reference retained for compatibility."""
-    return f"{doc_id}:{source_chunk}"
-
-
-def build_edge_key(head_id: str, relation: str, tail_id: str, properties_json: str) -> str:
-    """Legacy direct-edge key retained for migration tests/read compatibility."""
-    payload = f"{head_id}|{relation}|{tail_id}|{properties_json}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 ENTITY_BATCH_QUERY = """
@@ -124,6 +112,7 @@ MERGE (assertion:Assertion {id: row.id})
 SET assertion.claim_key = row.claim_key,
     assertion.subject_local_entity_id = row.subject_local_entity_id,
     assertion.predicate_raw = row.predicate_raw,
+    assertion.predicate_canonical = row.predicate_canonical,
     assertion.predicate_normalized = row.predicate_normalized,
     assertion.object_kind = row.object_kind,
     assertion.object_local_entity_id = row.object_local_entity_id,
@@ -154,6 +143,7 @@ MERGE (assertion:Assertion {id: row.id})
 SET assertion.claim_key = row.claim_key,
     assertion.subject_local_entity_id = row.subject_local_entity_id,
     assertion.predicate_raw = row.predicate_raw,
+    assertion.predicate_canonical = row.predicate_canonical,
     assertion.predicate_normalized = row.predicate_normalized,
     assertion.object_kind = row.object_kind,
     assertion.object_local_entity_id = NULL,
@@ -177,6 +167,32 @@ WITH assertion
 OPTIONAL MATCH (assertion)-[legacyObject:OBJECT]->()
 DELETE legacyObject
 """
+
+
+ROLLBACK_SELECT_QUERY = """
+        MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {document_version_id: $version_id})
+        OPTIONAL MATCH (a)-[:OBJECT]->(object:Entity)
+        // The filter must run AFTER the optional match, not inside it. Attached to
+        // OPTIONAL MATCH, Cypher treats it as part of that pattern: rows failing the
+        // predicate are kept with `object` bound to null rather than discarded, so this
+        // returned *every* assertion in the version (REVIEW1 finding B3).
+        WITH a, subject, object
+        WHERE (a.subject_local_entity_id = $local_id AND subject.id = $merged_id)
+           OR (a.object_local_entity_id = $local_id AND object.id = $merged_id)
+        RETURN a.id AS id, subject.id AS subject_entity_id,
+               a.subject_local_entity_id AS subject_local_entity_id,
+               a.predicate_raw AS predicate_raw,
+               a.predicate_canonical AS predicate_canonical,
+               a.object_kind AS object_kind,
+               object.id AS object_entity_id,
+               a.object_local_entity_id AS object_local_entity_id,
+               a.literal_value_json AS literal_value_json,
+               a.properties_json AS properties_json, a.confidence AS confidence,
+               a.chunk_id AS chunk_id, a.extractor_model AS extractor_model,
+               a.extraction_prompt_version AS extraction_prompt_version,
+               a.valid_from AS valid_from, a.valid_until AS valid_until,
+               a.active AS active, a.review_status AS review_status
+        """
 
 
 class GraphWriter:
@@ -267,51 +283,6 @@ class GraphWriter:
                 execute_write(write_transaction)
             else:  # compatible test doubles and older drivers
                 write_transaction(session)
-
-    def write_nodes(self, doc_id: str, nodes: list[dict[str, Any]]) -> None:
-        """Legacy compatibility wrapper; Refactor 1 pipeline uses write_graph_version."""
-        self.write_graph_version(
-            doc_id=doc_id,
-            document_version_id=f"legacy:{doc_id}",
-            nodes=nodes,
-            assertions=[],
-        )
-
-    def write_edges(self, doc_id: str, edges: list[dict[str, Any]]) -> None:
-        """Legacy direct-edge writer retained only for old-store compatibility."""
-        with self._driver.session() as session:
-            for edge in edges:
-                rel_type = sanitize_rel_type(edge["relation"])
-                source_chunk = str(edge.get("source_chunk") or "unknown")
-                properties_json = normalize_properties(edge.get("properties", {}))
-                edge_key = build_edge_key(
-                    str(edge["head_id"]),
-                    str(edge["relation"]),
-                    str(edge["tail_id"]),
-                    properties_json,
-                )
-                query = (
-                    "MATCH (h:Entity {id: $head_id}) MATCH (t:Entity {id: $tail_id}) "
-                    f"MERGE (h)-[r:{rel_type} {{edge_key: $edge_key}}]->(t) "
-                    "SET r.type=$relation, r.raw_relations=[$raw_relation], "
-                    "r.properties=$properties, r.weight=$weight, r.sources=[$doc_id], "
-                    "r.source_chunks=[$source_chunk], r.source_refs=[$source_ref]"
-                )
-                session.run(
-                    query,
-                    {
-                        "head_id": edge["head_id"],
-                        "tail_id": edge["tail_id"],
-                        "edge_key": edge_key,
-                        "relation": edge["relation"],
-                        "raw_relation": str(edge.get("raw_relation") or edge["relation"]),
-                        "properties": properties_json,
-                        "weight": float(edge.get("weight", 0.0)),
-                        "source_chunk": source_chunk,
-                        "source_ref": build_source_ref(doc_id, source_chunk),
-                        "doc_id": doc_id,
-                    },
-                )
 
     def verify_document_version(self, document_version_id: str) -> dict[str, int]:
         """Return staged count/integrity metrics for an assertion version."""
@@ -510,45 +481,6 @@ class GraphWriter:
                 {"version_id": document_version_id, "chunk_ids": chunk_list},
             ).consume()
 
-    def retract_chunks(self, doc_id: str, chunk_ids: Iterable[str]) -> None:
-        """Retract legacy direct edges plus assertion evidence for selected chunks."""
-        chunk_list = sorted(set(str(item) for item in chunk_ids if str(item)))
-        if not chunk_list:
-            return
-        with self._driver.session() as session:
-            session.run(
-                "MATCH (a:Assertion {doc_id: $doc_id}) WHERE a.chunk_id IN $chunk_ids DETACH DELETE a",
-                {"doc_id": doc_id, "chunk_ids": chunk_list},
-            ).consume()
-            session.run(
-                "MATCH ()-[r]->() WHERE r.source_chunk IN $chunk_ids DELETE r",
-                {"chunk_ids": chunk_list},
-            ).consume()
-
-    def retract_entities(self, doc_id: str, entity_ids: Iterable[str]) -> set[str]:
-        """Remove a document source and delete only assertion-free orphan entities."""
-        entity_list = sorted(set(str(item) for item in entity_ids if str(item)))
-        if not entity_list:
-            return set()
-        update_query = """
-        MATCH (n:Entity)
-        WHERE n.id IN $entity_ids
-        SET n.sources = [s IN coalesce(n.sources, []) WHERE s <> $doc_id]
-        WITH n
-        OPTIONAL MATCH (n)-[:SUBJECT_OF]->(subjectAssertion:Assertion)
-        OPTIONAL MATCH (objectAssertion:Assertion)-[:OBJECT]->(n)
-        WITH n, count(DISTINCT subjectAssertion) + count(DISTINCT objectAssertion) AS assertion_count
-        RETURN n.id AS entity_id,
-               size(coalesce(n.sources, [])) = 0 AND assertion_count = 0 AS orphaned
-        """
-        delete_query = "MATCH (n:Entity) WHERE n.id IN $entity_ids DETACH DELETE n"
-        with self._driver.session() as session:
-            rows = session.run(update_query, {"entity_ids": entity_list, "doc_id": doc_id})
-            orphaned = {str(row["entity_id"]) for row in rows if bool(row["orphaned"])}
-            if orphaned:
-                session.run(delete_query, {"entity_ids": sorted(orphaned)}).consume()
-        return orphaned
-
     def get_entities_for_doc(self, doc_id: str) -> list[dict[str, Any]]:
         query = """
         MATCH (n:Entity)
@@ -567,6 +499,7 @@ class GraphWriter:
                subject.id AS subject_entity_id, subject.name AS subject_name,
                a.subject_local_entity_id AS subject_local_entity_id,
                a.predicate_raw AS predicate_raw,
+               a.predicate_canonical AS predicate_canonical,
                a.predicate_normalized AS predicate_normalized,
                a.object_kind AS object_kind,
                object.id AS object_entity_id, object.name AS object_name,
@@ -581,6 +514,63 @@ class GraphWriter:
         """
         with self._driver.session() as session:
             return [dict(record) for record in session.run(query, {"doc_id": doc_id})]
+
+    def get_assertions_for_version_chunks(
+        self,
+        document_version_id: str,
+        chunk_ids: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        """Assertions of one version, restricted to named chunks (WP7).
+
+        Read-only. The caller rebuilds these onto a new version rather than paying for
+        extraction again on text whose content hash did not change.
+        """
+        chunk_list = sorted({str(item) for item in chunk_ids if str(item)})
+        if not chunk_list:
+            return []
+        query = """
+        MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {document_version_id: $version_id})
+        WHERE a.chunk_id IN $chunk_ids
+        OPTIONAL MATCH (a)-[:OBJECT]->(object:Entity)
+        RETURN a.id AS id, a.claim_key AS claim_key,
+               subject.id AS subject_entity_id,
+               a.subject_local_entity_id AS subject_local_entity_id,
+               a.predicate_raw AS predicate_raw,
+               a.predicate_canonical AS predicate_canonical,
+               a.object_kind AS object_kind,
+               object.id AS object_entity_id,
+               a.object_local_entity_id AS object_local_entity_id,
+               a.literal_value_json AS literal_value_json,
+               a.properties_json AS properties_json,
+               a.confidence AS confidence,
+               a.chunk_id AS chunk_id,
+               a.extractor_model AS extractor_model,
+               a.extraction_prompt_version AS extraction_prompt_version,
+               a.valid_from AS valid_from, a.valid_until AS valid_until,
+               a.review_status AS review_status
+        ORDER BY a.chunk_id, a.claim_key
+        """
+        with self._driver.session() as session:
+            return [
+                dict(record)
+                for record in session.run(
+                    query, {"version_id": document_version_id, "chunk_ids": chunk_list}
+                )
+            ]
+
+    def get_entities_by_ids(self, entity_ids: Iterable[str]) -> list[dict[str, Any]]:
+        """Read canonical entity nodes by id, for reuse into a new version (WP7)."""
+        id_list = sorted({str(item) for item in entity_ids if str(item)})
+        if not id_list:
+            return []
+        query = """
+        MATCH (n:Entity) WHERE n.id IN $entity_ids
+        RETURN n.id AS id, n.name AS name, n.type AS type,
+               n.aliases AS aliases, n.properties AS properties,
+               n.confidence AS confidence, n.coarse_class AS coarse_class
+        """
+        with self._driver.session() as session:
+            return [dict(record) for record in session.run(query, {"entity_ids": id_list})]
 
     def find_contradictions(self, doc_id: str | None = None) -> list[dict[str, Any]]:
         """Surface active claims with one subject/predicate and multiple object values."""
@@ -599,6 +589,25 @@ class GraphWriter:
         with self._driver.session() as session:
             return [dict(record) for record in session.run(query, {"doc_id": doc_id})]
 
+    def preview_rollback(
+        self,
+        *,
+        document_version_id: str,
+        local_entity_id: str,
+        merged_entity_id: str,
+    ) -> list[str]:
+        """Assertion ids a rollback would rewrite. Read-only."""
+        with self._driver.session() as session:
+            rows = session.run(
+                ROLLBACK_SELECT_QUERY,
+                {
+                    "version_id": document_version_id,
+                    "local_id": local_entity_id,
+                    "merged_id": merged_entity_id,
+                },
+            )
+            return [str(record["id"]) for record in rows]
+
     def rollback_merged_entity(
         self,
         *,
@@ -611,23 +620,8 @@ class GraphWriter:
         entity_type: str,
     ) -> int:
         """Rewrite only assertion endpoints carrying one local merge provenance key."""
-        query = """
-        MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {document_version_id: $version_id})
-        OPTIONAL MATCH (a)-[:OBJECT]->(object:Entity)
-        WHERE (a.subject_local_entity_id = $local_id AND subject.id = $merged_id)
-           OR (a.object_local_entity_id = $local_id AND object.id = $merged_id)
-        RETURN a.id AS id, subject.id AS subject_entity_id,
-               a.subject_local_entity_id AS subject_local_entity_id,
-               a.predicate_raw AS predicate_raw, a.object_kind AS object_kind,
-               object.id AS object_entity_id,
-               a.object_local_entity_id AS object_local_entity_id,
-               a.literal_value_json AS literal_value_json,
-               a.properties_json AS properties_json, a.confidence AS confidence,
-               a.chunk_id AS chunk_id, a.extractor_model AS extractor_model,
-               a.extraction_prompt_version AS extraction_prompt_version,
-               a.valid_from AS valid_from, a.valid_until AS valid_until,
-               a.active AS active, a.review_status AS review_status
-        """
+        query = ROLLBACK_SELECT_QUERY
+
         with self._driver.session() as session:
             rows = [
                 dict(record)
@@ -660,6 +654,8 @@ class GraphWriter:
                     subject_entity_id=subject_id,
                     subject_local_entity_id=self._optional_text(row.get("subject_local_entity_id")),
                     predicate_raw=str(row["predicate_raw"]),
+                    predicate_canonical=self._optional_text(row.get("predicate_canonical"))
+                    or str(row["predicate_raw"]),
                     object_kind=str(row["object_kind"]),
                     object_entity_id=object_id,
                     object_local_entity_id=self._optional_text(row.get("object_local_entity_id")),
@@ -695,11 +691,17 @@ class GraphWriter:
             ],
             assertions=rewritten,
         )
-        if old_ids:
+        # Belt and braces against the recreate-then-delete failure mode: an assertion
+        # whose endpoints did not actually change keeps its id, so deleting it here would
+        # destroy the row `write_graph_version` just wrote. Only retire ids that the
+        # rewrite genuinely superseded.
+        rewritten_ids = {item.id for item in rewritten}
+        superseded = [item for item in old_ids if item not in rewritten_ids]
+        if superseded:
             with self._driver.session() as session:
                 session.run(
                     "MATCH (a:Assertion) WHERE a.id IN $assertion_ids DETACH DELETE a",
-                    {"assertion_ids": old_ids},
+                    {"assertion_ids": superseded},
                 ).consume()
         return len(rewritten)
 

@@ -66,8 +66,13 @@ class AnswerGenerator:
         if self._types is not None:
             self._response_schema = self._types.Schema(
                 type="OBJECT",
-                required=["claims"],
+                # WP5-B: the model writes the prose answer itself. Concatenating claim
+                # sentences produced grammatically disconnected text that read as a list
+                # of assertions rather than an answer (REVIEW1 finding `B9`); the claims
+                # remain the validated unit, the answer is what a reader sees.
+                required=["answer", "claims"],
                 properties={
+                    "answer": self._types.Schema(type="STRING"),
                     "claims": self._types.Schema(
                         type="ARRAY",
                         items=self._types.Schema(
@@ -105,26 +110,36 @@ class AnswerGenerator:
         }
         warnings: list[str] = []
         claims: list[AnswerClaim]
+        model_answer = ""
+        claims_were_dropped = False
         if self._client is None:
             claims = self._fallback_claims(evidence)
             warnings.append("generation_model_unavailable_or_failed")
         else:
-            claims, validation_warning = self._generate_validated_claims(
-                question=question,
-                analysis=analysis,
-                fusion=fusion,
-                evidence=evidence,
+            claims, validation_warning, model_answer, claims_were_dropped = (
+                self._generate_validated_claims(
+                    question=question,
+                    analysis=analysis,
+                    fusion=fusion,
+                    evidence=evidence,
+                )
             )
             if validation_warning:
                 warnings.append(validation_warning)
             if not claims:
                 claims = []
 
-        if claims:
-            answer = " ".join(claim.text.strip() for claim in claims if claim.text.strip())
-        else:
+        if not claims:
             answer = "I do not have enough validated evidence to answer this question."
             warnings.append("insufficient_validated_evidence")
+        elif claims_were_dropped:
+            # The model's prose was written against claims that did not survive
+            # validation, so it cannot be trusted verbatim. One constrained re-synthesis
+            # over the surviving claims; if that call fails, fall back to their text.
+            warnings.append("unsupported_claims_removed")
+            answer = self._resynthesize(question, claims) or self._join_claims(claims)
+        else:
+            answer = model_answer.strip() or self._join_claims(claims)
 
         used_evidence = {
             evidence_id
@@ -172,17 +187,23 @@ class AnswerGenerator:
         analysis: QueryAnalysis,
         fusion: FusionOutput,
         evidence: dict[str, RetrieverResult],
-    ) -> tuple[list[AnswerClaim], str | None]:
+    ) -> tuple[list[AnswerClaim], str | None, str, bool]:
+        """Return validated claims, a warning, the model's prose, and whether any claim was dropped."""
         prompt, temperature = self.prompt_builder.build_prompt(
             question=question,
             analysis=analysis,
             fusion=fusion,
         )
         prompt += (
-            "\n\nReturn JSON with a claims array. Each claim requires text and evidence_ids. "
+            "\n\nReturn JSON with two fields. `answer` is a direct prose answer to the "
+            "question, written in complete sentences and using only the retrieved evidence. "
+            "`claims` is an array in which each claim requires text and evidence_ids, and "
+            "together the claims must account for every factual statement in `answer`. "
             "Use only evidence IDs shown in the retrieved evidence."
         )
         last_valid: list[AnswerClaim] = []
+        last_answer = ""
+        last_dropped = False
         invalid_reference_found = False
         for attempt in range(2):
             attempt_prompt = prompt
@@ -199,11 +220,14 @@ class AnswerGenerator:
             raw_claims = payload.get("claims")
             if not isinstance(raw_claims, list):
                 continue
+            raw_answer = str(payload.get("answer") or "").strip()
+            offered_claims = 0
             validated: list[AnswerClaim] = []
             invalid_reference_found = False
             for index, raw_claim in enumerate(raw_claims):
                 if not isinstance(raw_claim, dict):
                     continue
+                offered_claims += 1
                 text = str(raw_claim.get("text") or "").strip()
                 ids = raw_claim.get("evidence_ids")
                 if not text or not isinstance(ids, list):
@@ -231,9 +255,56 @@ class AnswerGenerator:
                     )
                 )
             last_valid = validated
+            last_answer = raw_answer
+            last_dropped = len(validated) != offered_claims
             if not invalid_reference_found:
-                return validated, None
-        return last_valid, "invalid_or_unsupported_claim_evidence_references"
+                return validated, None, raw_answer, last_dropped
+        return (
+            last_valid,
+            "invalid_or_unsupported_claim_evidence_references",
+            last_answer,
+            last_dropped or bool(last_valid),
+        )
+
+    @staticmethod
+    def _join_claims(claims: list[AnswerClaim]) -> str:
+        return " ".join(claim.text.strip() for claim in claims if claim.text.strip())
+
+    def _resynthesize(self, question: str, claims: list[AnswerClaim]) -> str:
+        """One prose pass constrained to claims that already passed validation.
+
+        No evidence is re-packed and no new facts can enter: the model may only rewrite
+        statements this process already accepted. A failure here is not an error — the
+        caller falls back to the claim text.
+        """
+        if self._client is None or not claims:
+            return ""
+        numbered = "\n".join(f"{index + 1}. {claim.text}" for index, claim in enumerate(claims))
+        prompt = (
+            "Rewrite the following verified statements as a direct, coherent prose answer to "
+            "the question. Use only these statements. Do not add facts, qualifications, or "
+            "conclusions that are not stated. Return the answer text alone, with no preamble, "
+            "list markers, or JSON.\n\n"
+            f"Question: {question}\n\nVerified statements:\n{numbered}"
+        )
+        config = None
+        if self._types is not None:
+            config = build_generate_config(
+                self._types,
+                self.settings.gemini_model,
+                temperature=0.0,
+                system_instruction=SYSTEM_INSTRUCTION,
+            )
+        try:
+            response = self._client.models.generate_content(
+                model=self.settings.gemini_model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception:
+            return ""
+        self.last_usage = add_usage(self.last_usage, extract_usage_metadata(response))
+        return str(getattr(response, "text", "") or "").strip()
 
     def _claim_matches_literal_assertions(
         self,

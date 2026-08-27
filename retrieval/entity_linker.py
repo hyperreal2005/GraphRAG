@@ -91,19 +91,6 @@ class EntityLinker:
             for index, (mention, mention_points) in enumerate(zip(clean_mentions, mention_groups))
         ]
 
-    def _link_single_mention(
-        self,
-        mention: str,
-        query_vector: list[float],
-        active_version_ids: list[str] | None,
-    ) -> LinkedEntity:
-        points = self._search_entities(
-            query_vector,
-            limit=int(self.settings.entity_link_candidate_k),
-            active_version_ids=active_version_ids,
-        )
-        return self._link_from_points(mention, points, active_version_ids)
-
     def _link_from_points(
         self,
         mention: str,
@@ -117,6 +104,7 @@ class EntityLinker:
                 self._extract_payload(point), active_version_ids
             )
         ]
+        points = self._dedupe_by_entity(points)
         if not points:
             return LinkedEntity(mention=mention, status="unresolved", similarity=0.0)
 
@@ -228,6 +216,25 @@ class EntityLinker:
             for mention in mentions
         ]
         return [*mentions, *context_inputs]
+
+    def _dedupe_by_entity(self, points: list[Any]) -> list[Any]:
+        """Keep the best-scoring point per graph entity, preserving score order.
+
+        REVIEW1 finding `B7`, first half: one entity can hold several vector points — an
+        alias embedding, a re-embedding under a later version — so the raw candidate list
+        could carry the same `neo4j_node_id` at ranks 1 and 2. `score_margin` was then
+        near zero and a perfectly unambiguous mention was reported `ambiguous`. Only the
+        context-fusion path deduplicated; the plain path did not.
+        """
+        best_by_entity: dict[str, Any] = {}
+        for point in points:
+            entity_id = self._extract_point_id(point, self._extract_payload(point))
+            if not entity_id:
+                continue
+            incumbent = best_by_entity.get(entity_id)
+            if incumbent is None or self._extract_score(point) > self._extract_score(incumbent):
+                best_by_entity[entity_id] = point
+        return sorted(best_by_entity.values(), key=self._extract_score, reverse=True)
 
     def _merge_candidate_points(
         self,

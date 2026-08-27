@@ -40,6 +40,38 @@ class DocumentMetadata:
 
 
 @dataclass
+class SectionProvenance:
+    """Where one parser item came from, preserved when items are grouped.
+
+    Docling emits one item per layout element and WP2-A merges consecutive items into a
+    logical section. Without this the merge would erase the page and bounding box that
+    exact citation depends on. ``char_start``/``char_end`` are item-local, exactly as
+    Docling reports them; they are not offsets into the grouped section.
+    """
+
+    section_id: str
+    page: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    heading: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"section_id": self.section_id}
+        if self.heading is not None:
+            payload["heading"] = self.heading
+        if self.page is not None:
+            payload["page"] = self.page
+        if self.char_start is not None:
+            payload["char_start"] = self.char_start
+        if self.char_end is not None:
+            payload["char_end"] = self.char_end
+        if self.bbox is not None:
+            payload["bbox"] = list(self.bbox)
+        return payload
+
+
+@dataclass
 class Section:
     """Structured section emitted by parser stage."""
 
@@ -53,6 +85,7 @@ class Section:
     char_start: int | None = None
     char_end: int | None = None
     bbox: tuple[float, float, float, float] | None = None
+    provenance: list[SectionProvenance] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -75,6 +108,8 @@ class Section:
             payload["char_end"] = self.char_end
         if self.bbox is not None:
             payload["bbox"] = list(self.bbox)
+        if self.provenance:
+            payload["provenance"] = [item.to_dict() for item in self.provenance]
         return payload
 
 
@@ -114,7 +149,12 @@ class Chunk:
     char_start: int | None
     char_end: int | None
     chunk_hash: str
+    # Position-free identity of the text itself (WP2-D). chunk_hash stays the
+    # occurrence identity; this one survives an edit elsewhere in the document.
+    content_hash: str = ""
     content_kind: str = "body"
+    provenance: list[SectionProvenance] = field(default_factory=list)
+    pages: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,7 +168,10 @@ class Chunk:
             "char_start": self.char_start,
             "char_end": self.char_end,
             "chunk_hash": self.chunk_hash,
+            "content_hash": self.content_hash,
             "content_kind": self.content_kind,
+            "pages": list(self.pages),
+            "provenance": [item.to_dict() for item in self.provenance],
         }
 
 
@@ -159,6 +202,8 @@ class FileIngestionResult:
     skipped: bool = False
     error: str | None = None
     delta: DeltaSummary = field(default_factory=DeltaSummary)
+    # WP3-C: chunks withheld from the graph without failing the document.
+    degraded_chunks: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -169,6 +214,7 @@ class FileIngestionResult:
             "skipped": self.skipped,
             "error": self.error,
             "delta": self.delta.to_dict(),
+            "degraded_chunks": self.degraded_chunks,
         }
 
 

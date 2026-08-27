@@ -13,6 +13,11 @@ from config import Settings
 from generation.model_adapter import build_generate_config
 from generation.usage import extract_usage_metadata
 from ingestion.embedder import GeminiEmbedder
+from ingestion.entity_types import (
+    UNKNOWN,
+    coarse_class,
+    coarse_classes_compatible,
+)
 from ingestion.vector_indexer import build_active_version_filter, build_entity_summary
 from models.refactor import MergeDecision
 
@@ -607,26 +612,20 @@ class CrossDocumentMerger:
         }
 
     def _types_compatible(self, entity_type: str, candidate_type: str) -> bool:
+        """Compare coarse classes, not the model's free-form strings (WP2-B).
+
+        The previous exact-string comparison rejected 115 of 172 candidates scoring
+        >= 0.90 similarity purely on type, including ("RAG", System Component) against
+        ("RAG", System) at 0.956.
+        """
         if not self.settings.cross_doc_same_type_required_for_auto:
             return True
-        aliases = {
-            "org": "organization",
-            "organisation": "organization",
-            "company": "organization",
-            "business": "organization",
-            "institution": "organization",
-            "university": "organization",
-            "human": "person",
-        }
-        incoming = entity_type.strip().lower()
-        candidate = candidate_type.strip().lower()
-        if incoming == "entity" or candidate == "entity":
-            return True
-        return aliases.get(incoming, incoming) == aliases.get(candidate, candidate)
+        return coarse_classes_compatible(coarse_class(entity_type), coarse_class(candidate_type))
 
     @staticmethod
     def _weak_type(entity_type: str, candidate_type: str) -> bool:
-        return entity_type.strip().lower() == "entity" or candidate_type.strip().lower() == "entity"
+        """Type carries no usable signal for either side."""
+        return UNKNOWN in {coarse_class(entity_type), coarse_class(candidate_type)}
 
     @staticmethod
     def _is_document_local_reference(name: str) -> bool:

@@ -1,4 +1,13 @@
-"""Gemini embedding service for vector indexing."""
+"""Gemini embedding service for vector indexing.
+
+WP2-E (REVIEW1 finding B10): behaviour is selected by explicit capability flags rather
+than by comparing the configured model id against a literal. The previous code branched
+on `embedding_model_id != "gemini-embedding-2"`, so setting the id Google actually
+documents — `gemini-embedding-2-preview` — silently reverted the pipeline to legacy
+behaviour: it began sending a `task_type` the model rejects and stopped applying the
+instruction prefixes the model requires. A config change that looks correct should not
+corrupt the corpus.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +46,29 @@ class GeminiEmbedder:
                 )
             ),
         )
+        if self.settings.embedding_probe_on_startup:
+            self.probe()
+
+    def probe(self) -> None:
+        """Fail closed before any corpus write if the embedding contract is wrong.
+
+        A wrong model id or dimensionality otherwise surfaces thousands of calls later,
+        or worse, silently produces vectors in a different space.
+        """
+        try:
+            vectors = self.embed_texts(["probe"], task_type=self.settings.query_embedding_task_type)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Embedding probe failed for model {self.settings.embedding_model_id!r}: {exc}. "
+                "Google documents this model as 'gemini-embedding-2-preview'; check "
+                "EMBEDDING_MODEL_ID and the EMBEDDING_MODEL_* capability flags."
+            ) from exc
+        if not vectors or len(vectors[0]) != int(self.settings.embedding_dim):
+            actual = len(vectors[0]) if vectors else 0
+            raise RuntimeError(
+                f"Embedding probe returned {actual} dimensions, expected "
+                f"{self.settings.embedding_dim} for {self.settings.embedding_model_id!r}."
+            )
 
     def embed_texts(
         self,
@@ -64,13 +96,14 @@ class GeminiEmbedder:
         task_type: str | None,
         title: str | None,
     ) -> list[str]:
-        if self.settings.embedding_model_id != "gemini-embedding-2":
+        """Apply the asymmetric retrieval instruction when the model expects one."""
+        if not self.settings.embedding_model_uses_instruction_prefix:
             return list(texts)
         query_mode = str(task_type or "").upper() == str(self.settings.query_embedding_task_type).upper()
         if query_mode:
             prefix = self.settings.embedding_query_prefix
         else:
-            prefix = self.settings.embedding_document_prefix.format(title=title or "none")
+            prefix = self.settings.embedding_document_prefix.format(title=title or "untitled")
         return [f"{prefix}{text}" for text in texts]
 
     def _embed_batch(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
@@ -128,9 +161,9 @@ class GeminiEmbedder:
         kwargs: dict[str, Any] = {
             "output_dimensionality": int(self.settings.embedding_dim),
         }
-        # gemini-embedding-2 uses instructions in the content; the legacy
-        # task_type parameter is only sent to models that support it.
-        if self.settings.embedding_model_id != "gemini-embedding-2":
+        # Sent only to models that accept it. gemini-embedding-2 rejects task_type and
+        # takes its instruction from the content instead.
+        if self.settings.embedding_model_supports_task_type:
             kwargs["task_type"] = task_type or self.settings.gemini_embedding_task_type
         return self._types.EmbedContentConfig(**kwargs)
 

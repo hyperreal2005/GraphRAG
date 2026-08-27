@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Iterable
 
 from config import Settings
 from models.extraction import ExtractedEntity
 from models.refactor import AssertionRecord
+
+
+logger = logging.getLogger(__name__)
 
 
 class AssertionBuilder:
@@ -26,16 +31,26 @@ class AssertionBuilder:
         raw_to_local_entity_id: dict[str, str] | None = None,
         raw_entity_chunk_ids: dict[str, str],
     ) -> list[AssertionRecord]:
-        """Build all assertions and keep the strongest duplicate per source claim."""
+        """Build all assertions and keep the strongest duplicate per source claim.
+
+        An assertion the contract rejects is dropped and counted, never raised: one
+        impossible value from the model must not discard every other fact in the document
+        (REVIEW1 finding `B11`, downstream of the WP3-C extraction guard). `rejected` is
+        reported by the caller so a systemic problem still surfaces as a number.
+        """
         assertions: dict[str, AssertionRecord] = {}
         local_map = raw_to_local_entity_id or {}
+        self.rejected: list[str] = []
 
         for relation in mapped_relations:
             confidence = float(relation.get("weight", relation.get("confidence", 0.0)))
-            assertion = AssertionRecord.create(
+            assertion = self._safe_create(
+                f"relation {relation.get('head_id')} -> {relation.get('tail_id')}",
+                AssertionRecord.create,
                 subject_entity_id=str(relation["head_id"]),
                 subject_local_entity_id=self._optional_text(relation.get("head_local_id")),
                 predicate_raw=str(relation.get("raw_relation") or relation.get("relation") or ""),
+                predicate_canonical=str(relation.get("relation") or relation.get("raw_relation") or ""),
                 object_kind="entity",
                 object_entity_id=str(relation["tail_id"]),
                 object_local_entity_id=self._optional_text(relation.get("tail_local_id")),
@@ -52,7 +67,8 @@ class AssertionBuilder:
                 active=False,
                 review_status=self._review_status(confidence),
             )
-            self._keep_strongest(assertions, assertion)
+            if assertion is not None:
+                self._keep_strongest(assertions, assertion)
 
         for entity in extracted_entities:
             final_entity_id = raw_to_final_entity_id.get(entity.entity_id)
@@ -63,10 +79,13 @@ class AssertionBuilder:
                 raw_predicate = str(property_name).strip()
                 if not raw_predicate:
                     continue
-                assertion = AssertionRecord.create(
+                assertion = self._safe_create(
+                    f"property {raw_predicate} of {final_entity_id}",
+                    AssertionRecord.create,
                 subject_entity_id=final_entity_id,
                 subject_local_entity_id=local_map.get(entity.entity_id),
                     predicate_raw=raw_predicate,
+                    predicate_canonical=raw_predicate,
                     object_kind="literal",
                 object_entity_id=None,
                 object_local_entity_id=None,
@@ -81,9 +100,23 @@ class AssertionBuilder:
                     active=False,
                     review_status=self._review_status(float(entity.confidence)),
                 )
-                self._keep_strongest(assertions, assertion)
+                if assertion is not None:
+                    self._keep_strongest(assertions, assertion)
 
         return sorted(assertions.values(), key=lambda item: (item.chunk_id, item.claim_key, item.id))
+
+    def _safe_create(self, label: str, factory, **kwargs):  # noqa: ANN001, ANN201
+        """Build one assertion, recording a contract rejection instead of raising."""
+        try:
+            return factory(**kwargs)
+        except Exception as exc:
+            # Pydantic's first line is only "N validation errors for AssertionRecord",
+            # which says nothing about what was actually wrong. The reason lives on the
+            # following lines, so the message is flattened rather than truncated.
+            reason = " ".join(part.strip() for part in str(exc).splitlines() if part.strip())[:200]
+            self.rejected.append(f"{label}: {reason}")
+            logger.warning("assertion_rejected %s: %s", label, reason)
+            return None
 
     @staticmethod
     def _keep_strongest(target: dict[str, AssertionRecord], assertion: AssertionRecord) -> None:

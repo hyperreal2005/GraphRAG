@@ -94,13 +94,28 @@ class RefactorModel(BaseModel):
 
 
 class AssertionRecord(RefactorModel):
-    """One source-specific, evidence-bearing graph assertion."""
+    """One source-specific, evidence-bearing graph assertion.
+
+    Three predicate fields, deliberately:
+
+      predicate_raw         the verbatim phrase from the chunk ("was developed by"),
+                            kept for display and provenance, and *not* part of any hash
+      predicate_canonical   the model's canonical label ("DEVELOPED_BY"), already
+                            validated against ^[A-Z][A-Z0-9_]*$ at the provider boundary
+      predicate_normalized  canonical, mechanically normalized; this is what claim_key
+                            hashes and what graph queries filter on
+
+    Before WP2-C, `predicate_normalized` was derived from `predicate_raw`, so the same
+    fact phrased two ways produced two claim keys and never corroborated. It remains
+    emergent - no fixed ontology is imposed - but it now converges.
+    """
 
     id: str = Field(min_length=64, max_length=64)
     claim_key: str = Field(min_length=64, max_length=64)
     subject_entity_id: str = Field(min_length=1)
     subject_local_entity_id: str | None = None
     predicate_raw: str = Field(min_length=1)
+    predicate_canonical: str = Field(min_length=1)
     predicate_normalized: str = Field(min_length=1)
     object_kind: Literal["entity", "literal"]
     object_entity_id: str | None = None
@@ -128,6 +143,7 @@ class AssertionRecord(RefactorModel):
         subject_entity_id: str,
         subject_local_entity_id: str | None = None,
         predicate_raw: str,
+        predicate_canonical: str | None = None,
         object_kind: Literal["entity", "literal"],
         object_entity_id: str | None,
         object_local_entity_id: str | None = None,
@@ -144,7 +160,12 @@ class AssertionRecord(RefactorModel):
         active: bool = False,
         review_status: Literal["accepted", "flagged", "rejected"] = "accepted",
     ) -> "AssertionRecord":
-        predicate_normalized = normalize_predicate(predicate_raw)
+        # WP2-C: normalize from the model's canonical relation label rather than the
+        # verbatim phrase. Surface-phrase normalization produced predicates like
+        # AGREED_A_TWO_YEAR_CONTRACT_TO_COACH, which never converge across sources -
+        # measured, it discarded 92% of correctly extracted relations (REVIEW1 A3).
+        canonical = str(predicate_canonical or predicate_raw).strip() or predicate_raw
+        predicate_normalized = normalize_predicate(canonical)
         properties_json = canonical_json_object(properties or {})
         literal_value_json = None
         if object_kind == "literal":
@@ -165,6 +186,7 @@ class AssertionRecord(RefactorModel):
             subject_entity_id=subject_entity_id,
             subject_local_entity_id=subject_local_entity_id,
             predicate_raw=predicate_raw,
+            predicate_canonical=canonical,
             predicate_normalized=predicate_normalized,
             object_kind=object_kind,
             object_entity_id=object_entity_id,
@@ -200,9 +222,9 @@ class AssertionRecord(RefactorModel):
             object.__setattr__(self, "literal_value_json", canonical_json_value(self.literal_value_json))
         if self.valid_from and self.valid_until and self.valid_from > self.valid_until:
             raise ValueError("valid_from cannot be after valid_until.")
-        expected_predicate = normalize_predicate(self.predicate_raw)
+        expected_predicate = normalize_predicate(self.predicate_canonical)
         if self.predicate_normalized != expected_predicate:
-            raise ValueError("predicate_normalized does not match predicate_raw.")
+            raise ValueError("predicate_normalized does not match predicate_canonical.")
         expected_claim_key = build_claim_key(
             subject_entity_id=self.subject_entity_id,
             predicate_normalized=self.predicate_normalized,

@@ -11,13 +11,50 @@ from dataclasses import dataclass
 from models.ingestion import Chunk, ParsedDocument, Section, SectionType
 
 
-SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|$)", re.MULTILINE)
-CHUNK_FINGERPRINT_VERSION = "v2"
+# Abbreviations whose trailing period must not end a sentence. Kept explicit rather
+# than inferred: a wrong guess here silently changes chunk boundaries (REVIEW1 B12).
+SENTENCE_ABBREVIATIONS = (
+    "Dr", "Mr", "Mrs", "Ms", "Prof", "Sr", "Jr", "St",
+    "Fig", "Eq", "Sec", "Ch", "No", "Vol", "pp", "p", "al", "Ref", "Refs",
+    "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Sept", "Oct", "Nov", "Dec",
+    "Inc", "Ltd", "Co", "Corp", "Univ", "Dept", "Est", "approx", "cf", "vs",
+    "e.g", "i.e", "etc", "U.S", "U.K", "E.U",
+)
+_ABBREVIATION_SET = {item.casefold() for item in SENTENCE_ABBREVIATIONS}
+# Python's re requires a fixed-width lookbehind, so abbreviations cannot be expressed in
+# the pattern. Find candidate boundaries cheaply, then reject them in code.
+SENTENCE_CANDIDATE_PATTERN = re.compile(
+    r"[.!?][\"'”’)\]]*\s+(?=[\"'“‘(\[]*[A-Z0-9])"
+)
+TRAILING_TOKEN_PATTERN = re.compile(r"([A-Za-z][A-Za-z.]*|\d+)\.$")
+PARAGRAPH_BOUNDARY_PATTERN = re.compile(r"\n\s*\n")
+CHUNK_FINGERPRINT_VERSION = "v3"
 
 
 def normalize_for_hash(text: str) -> str:
     """Normalize insignificant whitespace without changing semantic case."""
     return re.sub(r"\s+", " ", text).strip()
+
+
+def content_hash(text: str, *, section_heading: str | None = None) -> str:
+    """Identity of what a chunk *says*, independent of where it sits.
+
+    REVIEW1 finding A4: `chunk_hash` folds in position and character offsets, so
+    inserting one paragraph changes the hash of every chunk after it. Change detection
+    and the delta summary were therefore meaningless on any real edit, and Principle 4
+    ("surgically updated") could not hold.
+
+    Two identities are needed, not one:
+      content_hash  what the chunk says      -> change detection, assertion reuse (WP7)
+      chunk_hash    which occurrence it is   -> chunk_id derivation, stable ordering
+    """
+    payload = {
+        "version": CHUNK_FINGERPRINT_VERSION,
+        "text": normalize_for_hash(text),
+        "section_heading": normalize_for_hash(section_heading or ""),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def chunk_hash(
@@ -41,6 +78,19 @@ def chunk_hash(
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _pages_of(section: Section) -> list[int]:
+    """Ordered, de-duplicated pages a section spans, for page-range citation."""
+    pages = [item.page for item in section.provenance if item.page is not None]
+    if not pages and section.page is not None:
+        pages = [int(section.page)]
+    ordered: list[int] = []
+    for page in pages:
+        value = int(page)
+        if value not in ordered:
+            ordered.append(value)
+    return ordered
 
 
 def token_count(text: str) -> int:
@@ -108,6 +158,7 @@ class SemanticChunker:
                 page_number=section.page,
                 position=chunk_position,
             )
+            content_digest = content_hash(segment, section_heading=section.heading)
             chunks.append(
                 Chunk(
                     doc_id=doc_id,
@@ -120,6 +171,9 @@ class SemanticChunker:
                     char_start=None,
                     char_end=None,
                     chunk_hash=digest,
+                    content_hash=content_digest,
+                    provenance=list(section.provenance),
+                    pages=_pages_of(section),
                 )
             )
         return chunks
@@ -141,6 +195,7 @@ class SemanticChunker:
                 char_start=absolute_start,
                 char_end=absolute_end,
             )
+            content_digest = content_hash(text, section_heading=section.heading)
             return [
                 Chunk(
                     doc_id=doc_id,
@@ -153,6 +208,9 @@ class SemanticChunker:
                     char_start=absolute_start,
                     char_end=absolute_end,
                     chunk_hash=digest,
+                    content_hash=content_digest,
+                    provenance=list(section.provenance),
+                    pages=_pages_of(section),
                 )
             ]
 
@@ -185,7 +243,7 @@ class SemanticChunker:
             if not current:
                 break
 
-            chunk_text = " ".join(span.text for span in current).strip()
+            chunk_text = self.slice_text(text, current[0].start, current[-1].end)
             chunk_position = base_position + local_position
             section_offset = section.char_start if section.char_start is not None else 0
             absolute_start = section_offset + current[0].start
@@ -198,6 +256,7 @@ class SemanticChunker:
                 char_start=absolute_start,
                 char_end=absolute_end,
             )
+            content_digest = content_hash(chunk_text, section_heading=section.heading)
             chunks.append(
                 Chunk(
                     doc_id=doc_id,
@@ -210,6 +269,9 @@ class SemanticChunker:
                     char_start=absolute_start,
                     char_end=absolute_end,
                     chunk_hash=digest,
+                    content_hash=content_digest,
+                    provenance=list(section.provenance),
+                    pages=_pages_of(section),
                 )
             )
             local_position += 1
@@ -235,33 +297,74 @@ class SemanticChunker:
 
         return chunks
 
+    @staticmethod
+    def slice_text(source: str, start: int, end: int) -> str:
+        """Take chunk text from the source, collapsing only whitespace.
+
+        REVIEW1 finding B13: the previous implementation rebuilt chunk text by joining
+        split sentence fragments with a space, so every split point gained one. Because
+        the splitter broke on every period, `$26.3 billion` was stored as `$26. 3
+        billion` in 11.6% of chunks - and stored text is what gets embedded, retrieved,
+        cited and validated against. Slicing the original removes the mutation
+        regardless of where the boundaries fall.
+        """
+        return " ".join(source[max(0, start):max(0, end)].split())
+
+    @staticmethod
+    def _is_real_boundary(text: str, period_index: int) -> bool:
+        """Reject a period that belongs to a number, an initial, or an abbreviation."""
+        if text[period_index] != ".":
+            return True  # ! and ? are never ambiguous here
+        # A decimal point: digit before and digit after.
+        if period_index + 1 < len(text) and text[period_index + 1].isdigit():
+            if period_index > 0 and text[period_index - 1].isdigit():
+                return False
+        match = TRAILING_TOKEN_PATTERN.search(text[max(0, period_index - 24) : period_index + 1])
+        if match is None:
+            return True
+        token = match.group(1)
+        if token.casefold() in _ABBREVIATION_SET:
+            return False
+        if token.casefold().rstrip(".") in _ABBREVIATION_SET:
+            return False
+        # A single capital letter is an initial (J. Smith), not a sentence end.
+        return not (len(token) == 1 and token.isupper())
+
+    def _sentence_boundaries(self, text: str) -> list[int]:
+        """Offsets where a sentence may end. Paragraph breaks always qualify."""
+        offsets = {match.start() for match in PARAGRAPH_BOUNDARY_PATTERN.finditer(text)}
+        for match in SENTENCE_CANDIDATE_PATTERN.finditer(text):
+            if self._is_real_boundary(text, match.start()):
+                offsets.add(match.end())
+        return sorted(offset for offset in offsets if 0 < offset < len(text))
+
     def _sentence_spans(self, text: str) -> list[SentenceSpan]:
         spans: list[SentenceSpan] = []
-        for match in SENTENCE_PATTERN.finditer(text):
-            sentence_text = re.sub(r"\s+", " ", match.group(0)).strip()
+        cuts = [0, *self._sentence_boundaries(text), len(text)]
+        for index in range(len(cuts) - 1):
+            start, end = cuts[index], cuts[index + 1]
+            sentence_text = self.slice_text(text, start, end)
             if not sentence_text:
                 continue
             sentence_tokens = token_count(sentence_text)
             if sentence_tokens <= self.max_tokens:
                 spans.append(
-                    SentenceSpan(
-                        text=sentence_text,
-                        start=match.start(),
-                        end=match.end(),
-                        tokens=sentence_tokens,
-                    )
+                    SentenceSpan(text=sentence_text, start=start, end=end, tokens=sentence_tokens)
                 )
                 continue
 
-            token_matches = list(re.finditer(r"\S+", match.group(0)))
+            # One sentence longer than the hard ceiling is split on word boundaries,
+            # still by offset so the text is never rebuilt from pieces.
+            token_matches = list(re.finditer(r"\S+", text[start:end]))
             for offset in range(0, len(token_matches), self.max_tokens):
                 token_group = token_matches[offset : offset + self.max_tokens]
-                segment = " ".join(item.group(0) for item in token_group)
+                segment_start = start + token_group[0].start()
+                segment_end = start + token_group[-1].end()
                 spans.append(
                     SentenceSpan(
-                        text=segment,
-                        start=match.start() + token_group[0].start(),
-                        end=match.start() + token_group[-1].end(),
+                        text=self.slice_text(text, segment_start, segment_end),
+                        start=segment_start,
+                        end=segment_end,
                         tokens=len(token_group),
                     )
                 )

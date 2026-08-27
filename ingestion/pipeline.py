@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,7 +16,9 @@ from config import Settings
 from ingestion.chunker import CHUNK_FINGERPRINT_VERSION, SemanticChunker
 from ingestion.coref import CoreferenceResolver
 from ingestion.content_classifier import classify_content_sequence, is_graph_extractable
+from ingestion.entity_types import display_type, dominant_coarse_class
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
+from ingestion.section_grouper import group_sections
 from ingestion.assertion_builder import AssertionBuilder
 from ingestion.outbox import IngestionOutboxProcessor
 from ingestion.state_store import MetadataStore
@@ -28,7 +30,7 @@ from models.ingestion import (
     IngestionRunSummary,
     ParsedDocument,
 )
-from models.refactor import DocumentVersion
+from models.refactor import AssertionRecord, DocumentVersion
 
 
 def utc_now_iso() -> str:
@@ -36,7 +38,21 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-INGESTION_PIPELINE_VERSION = "refactor1-versioned-assertions-v8"
+INGESTION_PIPELINE_VERSION = "refactor2-grouped-sections-v1"
+
+
+@dataclass
+class ExtractionReusePlan:
+    """Chunks whose assertions carry forward unchanged, and the entities they reference."""
+
+    assertions_by_chunk: dict[str, list[dict]] = field(default_factory=dict)
+    mentions_by_chunk: dict[str, list[str]] = field(default_factory=dict)
+    entities: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def assertion_count(self) -> int:
+        return sum(len(rows) for rows in self.assertions_by_chunk.values())
+
 STAGE_ORDER = {"PARSING": 1, "EXTRACTED": 2, "GRAPH_WRITTEN": 3, "VECTORS_WRITTEN": 4, "DONE": 5}
 
 
@@ -86,12 +102,18 @@ class PhaseOnePipeline:
                 graph_writer=self.graph_writer,
                 vector_indexer=self.vector_indexer,
             )
+            # WP3-B: pick up work abandoned by an earlier crashed run before starting a
+            # new one. Without this a partially staged version was never revisited.
+            try:
+                recovered = self.outbox_processor.reconcile(max_events=200)
+                if recovered:
+                    logger.info("startup_reconcile_recovered events=%d", recovered)
+            except Exception as exc:
+                logger.warning("startup_reconcile_failed error=%s", type(exc).__name__)
 
     def ingest_path(self, input_path: Path, recursive: bool = True) -> IngestionRunSummary:
         """Ingest one file or directory."""
         files = self._discover_files(input_path, recursive=recursive)
-        if self.settings.enable_graph and self.settings.auto_backfill_vectors:
-            self._backfill_graph_written_docs()
         summary = IngestionRunSummary()
         for file_path in files:
             summary.add(self.ingest_file(file_path))
@@ -189,6 +211,19 @@ class PhaseOnePipeline:
                 doc_id=doc_id,
                 checksum=checksum,
             )
+            # WP2-A: group parser items into logical sections before coreference, so
+            # coref sees a whole section (reference 3.2) and the chunker has enough text
+            # to window at 700/800 with overlap instead of degenerating to a passthrough.
+            if self.settings.section_group_enabled:
+                parsed = replace(
+                    parsed,
+                    sections=group_sections(
+                        parsed.sections,
+                        target_tokens=self.settings.section_group_target_tokens,
+                        max_tokens=self.settings.section_group_max_tokens,
+                        page_gap_tolerance=self.settings.section_group_page_gap_tolerance,
+                    ),
+                )
             resolved = self.coref.resolve_document(parsed)
             chunks = self.chunker.chunk_document(resolved)
             content_kinds = (
@@ -229,8 +264,18 @@ class PhaseOnePipeline:
                     for chunk in chunks
                 ]
 
-            new_hashes = {chunk.chunk_hash for chunk in chunks}
-            old_hashes = set(old_hash_to_chunk_id)
+            # WP2-D: the delta is about content, not position. Comparing occurrence
+            # hashes reported every chunk after an insertion as changed, which made the
+            # summary useless and blocked assertion reuse.
+            old_content_hashes = set(
+                self.store.get_content_hashes(
+                    doc_id,
+                    active_version.version_id if active_version else None,
+                    active_only=active_version is not None,
+                )
+            )
+            new_hashes = {chunk.content_hash for chunk in chunks}
+            old_hashes = old_content_hashes
             delta = DeltaSummary(
                 added_chunk_hashes=sorted(new_hashes - old_hashes),
                 removed_chunk_hashes=sorted(old_hashes - new_hashes),
@@ -267,8 +312,14 @@ class PhaseOnePipeline:
             entities_created = 0
             entities_merged = 0
             relations_created = 0
+            degraded_chunks = 0
             if document_version_id:
-                entities_created, entities_merged, relations_created = self._stage_graph_generation(
+                (
+                    entities_created,
+                    entities_merged,
+                    relations_created,
+                    degraded_chunks,
+                ) = self._stage_graph_generation(
                     run_id=run_id,
                     doc_id=doc_id,
                     document_version_id=document_version_id,
@@ -308,6 +359,7 @@ class PhaseOnePipeline:
                 chunk_count=len(chunks),
                 skipped=False,
                 delta=delta,
+                degraded_chunks=degraded_chunks,
             )
         except Exception as exc:
             if document_version_id:
@@ -329,6 +381,150 @@ class PhaseOnePipeline:
                 error=str(exc),
             )
 
+    def _plan_extraction_reuse(
+        self,
+        *,
+        doc_id: str,
+        chunks: list,
+        active_version_id: str | None,
+    ) -> ExtractionReusePlan:
+        """Decide which chunks can carry their assertions forward instead of re-extracting.
+
+        Architecture finding `A4`, second half. A chunk qualifies when its position-free
+        `content_hash` matches an active chunk of the previous version — the text is
+        identical, so a second extraction call would buy a re-derivation of facts already
+        held. Reuse is refused, and the chunk extracted normally, whenever an entity the
+        prior assertions reference is no longer readable in the graph: a reused assertion
+        must never point at an endpoint the new version does not contain.
+        """
+        empty = ExtractionReusePlan()
+        if not self.settings.extraction_reuse_enabled or not active_version_id:
+            return empty
+        if self.graph_writer is None:
+            return empty
+
+        prior_by_hash = self.store.get_content_hashes(doc_id, active_version_id, active_only=True)
+        if not prior_by_hash:
+            return empty
+        candidates = {
+            chunk.chunk_id: prior_by_hash[chunk.content_hash]
+            for chunk in chunks
+            if chunk.content_hash and chunk.content_hash in prior_by_hash
+        }
+        if not candidates:
+            return empty
+
+        try:
+            rows = self.graph_writer.get_assertions_for_version_chunks(
+                active_version_id, set(candidates.values())
+            )
+        except Exception as exc:
+            logger.warning("extraction_reuse_lookup_failed error=%s", type(exc).__name__)
+            return empty
+        if not rows:
+            return empty
+
+        by_prior_chunk: dict[str, list[dict]] = {}
+        for row in rows:
+            by_prior_chunk.setdefault(str(row.get("chunk_id") or ""), []).append(row)
+
+        referenced = {
+            str(row[key])
+            for row in rows
+            for key in ("subject_entity_id", "object_entity_id")
+            if row.get(key)
+        }
+        try:
+            available = {
+                str(node["id"]): node for node in self.graph_writer.get_entities_by_ids(referenced)
+            }
+        except Exception as exc:
+            logger.warning("extraction_reuse_entity_lookup_failed error=%s", type(exc).__name__)
+            return empty
+
+        plan = ExtractionReusePlan()
+        for new_chunk_id, prior_chunk_id in candidates.items():
+            prior_rows = by_prior_chunk.get(prior_chunk_id)
+            if not prior_rows:
+                continue
+            endpoints = {
+                str(row[key])
+                for row in prior_rows
+                for key in ("subject_entity_id", "object_entity_id")
+                if row.get(key)
+            }
+            missing = endpoints - available.keys()
+            if missing:
+                logger.info(
+                    "extraction_reuse_declined chunk=%s missing_entities=%d",
+                    new_chunk_id,
+                    len(missing),
+                )
+                continue
+            plan.assertions_by_chunk[new_chunk_id] = prior_rows
+            # The chunk's mentions are reused with it. Without this the entities carried
+            # forward would have no mention rows, and `stage_version_records` would
+            # reject the version for exactly that inconsistency.
+            plan.mentions_by_chunk[new_chunk_id] = sorted(endpoints)
+            for entity_id in endpoints:
+                plan.entities[entity_id] = available[entity_id]
+        return plan
+
+    def _rebuild_reused_assertions(
+        self,
+        *,
+        doc_id: str,
+        document_version_id: str,
+        plan: ExtractionReusePlan,
+    ) -> list:
+        """Re-key prior assertions onto the new version.
+
+        Everything that identifies the *claim* is preserved — subject, object, both
+        predicate forms, properties, confidence, temporal bounds, review status — so
+        `claim_key` is unchanged by construction. Only `assertion_id`, which is per source
+        occurrence, is new.
+        """
+        rebuilt = []
+        for chunk_id, rows in plan.assertions_by_chunk.items():
+            for row in rows:
+                literal_value = None
+                if row.get("literal_value_json") is not None:
+                    literal_value = json.loads(str(row["literal_value_json"]))
+                predicate_raw = str(row["predicate_raw"])
+                rebuilt.append(
+                    AssertionRecord.create(
+                        subject_entity_id=str(row["subject_entity_id"]),
+                        subject_local_entity_id=self._optional_text(row.get("subject_local_entity_id")),
+                        predicate_raw=predicate_raw,
+                        predicate_canonical=self._optional_text(row.get("predicate_canonical"))
+                        or predicate_raw,
+                        object_kind=str(row["object_kind"]),
+                        object_entity_id=self._optional_text(row.get("object_entity_id")),
+                        object_local_entity_id=self._optional_text(row.get("object_local_entity_id")),
+                        literal_value=literal_value,
+                        properties=json.loads(str(row.get("properties_json") or "{}")),
+                        confidence=float(row.get("confidence") or 0.0),
+                        doc_id=doc_id,
+                        document_version_id=document_version_id,
+                        chunk_id=chunk_id,
+                        extractor_model=str(row.get("extractor_model") or self.settings.gemini_model),
+                        extraction_prompt_version=str(
+                            row.get("extraction_prompt_version")
+                            or self.settings.extraction_prompt_version
+                        ),
+                        valid_from=self._optional_text(row.get("valid_from")),
+                        valid_until=self._optional_text(row.get("valid_until")),
+                        active=False,
+                        review_status=str(row.get("review_status") or "accepted"),
+                    )
+                )
+        return rebuilt
+
+    @staticmethod
+    def _optional_text(value) -> str | None:  # noqa: ANN001
+        normalized = str(value or "").strip()
+        return normalized or None
+
     def _stage_graph_generation(
         self,
         *,
@@ -338,8 +534,12 @@ class PhaseOnePipeline:
         doc_format: str,
         chunks: list,
         active_version_id: str | None,
-    ) -> tuple[int, int, int]:
-        """Extract and durably stage a complete immutable graph/vector version."""
+    ) -> tuple[int, int, int, int]:
+        """Extract and durably stage a complete immutable graph/vector version.
+
+        Returns entities created, entities merged, relations created, and the number of
+        chunks quarantined by WP3-C.
+        """
         if any(
             component is None
             for component in (
@@ -352,14 +552,52 @@ class PhaseOnePipeline:
         ):
             raise RuntimeError("Refactor 1 ingestion components are not initialized.")
 
-        def run_extract(chunk):  # noqa: ANN001, ANN202
-            raw_result = self.extractor.extract(chunk.text, doc_format)
-            return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
+        quarantined: list[tuple[str, str]] = []
 
+        def run_extract(chunk):  # noqa: ANN001, ANN202
+            """Extract one chunk, quarantining it rather than failing the document.
+
+            REVIEW1 finding B11: any chunk whose relations referenced an undeclared
+            entity aborted the whole document. That was sized for ~15 chunks per
+            document; at the measured 194 it made a total loss near-certain,
+            discarding 193 good extractions to punish one bad one.
+            """
+            try:
+                raw_result = self.extractor.extract(chunk.text, doc_format)
+                return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
+            except Exception as exc:
+                quarantined.append((chunk.chunk_id, f"{type(exc).__name__}: {exc}"))
+                logger.warning(
+                    "chunk_extraction_quarantined chunk=%s error=%s",
+                    chunk.chunk_id,
+                    type(exc).__name__,
+                )
+                return chunk, None
+
+        graph_chunks = [chunk for chunk in chunks if is_graph_extractable(chunk.content_kind)]
+        skipped_reference_chunks = len(chunks) - len(graph_chunks)
+
+        # Provider spend for one document is bounded here, before the first call is made.
+        # Nothing else in the ingest path limits how many chunks a document may produce,
+        # and a file that is not really a document — a data bundle, a log, an export —
+        # looks exactly like a very long one until the bill arrives. A 3.2 MB annotation
+        # bundle chunked into 987 pieces and spent 999 extraction calls before anyone
+        # noticed (docs/ERRORS.md, 2026-08-27).
+        chunk_cap = int(self.settings.ingestion_max_chunks_per_document)
+        if chunk_cap > 0 and len(graph_chunks) > chunk_cap:
+            raise RuntimeError(
+                f"Document produces {len(graph_chunks)} extractable chunks, above the "
+                f"{chunk_cap}-chunk limit, and would cost about that many provider calls. "
+                "Raise INGESTION_MAX_CHUNKS_PER_DOCUMENT if this really is one document."
+            )
+        reuse = self._plan_extraction_reuse(
+            doc_id=doc_id,
+            chunks=graph_chunks,
+            active_version_id=active_version_id,
+        )
         extractable_chunks = [
-            chunk for chunk in chunks if is_graph_extractable(chunk.content_kind)
+            chunk for chunk in graph_chunks if chunk.chunk_id not in reuse.assertions_by_chunk
         ]
-        skipped_reference_chunks = len(chunks) - len(extractable_chunks)
         stats_before = self._extractor_stats()
         extraction_started = time.perf_counter()
         max_workers = max(1, int(self.settings.gemini_max_workers))
@@ -369,7 +607,9 @@ class PhaseOnePipeline:
         try:
             if max_workers == 1 or len(extractable_chunks) <= 1:
                 for chunk in extractable_chunks:
-                    extraction_results.append(run_extract(chunk))
+                    outcome = run_extract(chunk)
+                    if outcome[1] is not None:
+                        extraction_results.append(outcome)
                     completed_chunks += 1
                     self._log_extraction_progress(
                         completed_chunks,
@@ -383,7 +623,9 @@ class PhaseOnePipeline:
                     futures = [executor.submit(run_extract, chunk) for chunk in extractable_chunks]
                     try:
                         for future in as_completed(futures):
-                            extraction_results.append(future.result())
+                            outcome = future.result()
+                            if outcome[1] is not None:
+                                extraction_results.append(outcome)
                             completed_chunks += 1
                             self._log_extraction_progress(
                                 completed_chunks,
@@ -409,6 +651,40 @@ class PhaseOnePipeline:
             )
             raise
 
+        # A document is lost only when the failure is systemic, not incidental.
+        failure_ratio = (
+            len(quarantined) / len(extractable_chunks) if extractable_chunks else 0.0
+        )
+        if failure_ratio > float(self.settings.extraction_chunk_failure_ratio):
+            first_error = quarantined[0][1] if quarantined else "n/a"
+            message = (
+                f"Extraction failed for {len(quarantined)} of "
+                f"{len(extractable_chunks)} chunks ({failure_ratio:.1%}), above the "
+                f"{self.settings.extraction_chunk_failure_ratio:.0%} quarantine limit. "
+                f"First error: {first_error}"
+            )
+            self._record_extraction_metric(
+                run_id=run_id,
+                doc_id=doc_id,
+                document_version_id=document_version_id,
+                started=extraction_started,
+                status="failed",
+                stats_before=stats_before,
+                chunks_completed=completed_chunks,
+                chunks_total=len(extractable_chunks),
+                reference_chunks_skipped=skipped_reference_chunks,
+                error=message,
+                degraded_chunks=len(quarantined),
+            )
+            raise RuntimeError(message)
+        for chunk_id, error in quarantined:
+            self.store.record_chunk_extraction_failure(
+                document_version_id=document_version_id,
+                chunk_id=chunk_id,
+                attempts=int(self.settings.extraction_max_attempts),
+                error=error,
+            )
+
         self._record_extraction_metric(
             run_id=run_id,
             doc_id=doc_id,
@@ -419,6 +695,8 @@ class PhaseOnePipeline:
             chunks_completed=completed_chunks,
             chunks_total=len(extractable_chunks),
             reference_chunks_skipped=skipped_reference_chunks,
+            degraded_chunks=len(quarantined),
+            reused_chunks=len(reuse.assertions_by_chunk),
         )
         extraction_results.sort(key=lambda item: (item[0].position, item[0].chunk_id))
 
@@ -487,7 +765,14 @@ class PhaseOnePipeline:
             confidence_values[local_id].append(entity.confidence)
         for local_id, counts in type_counts.items():
             if counts:
-                canonical_nodes[local_id]["type"] = max(counts, key=counts.get)
+                # WP2-B: the display label and the coarse class are both decided once
+                # per canonical entity from every observed type, never per mention.
+                observed = [
+                    raw for raw, count in counts.items() for _ in range(count)
+                ]
+                canonical_nodes[local_id]["type"] = display_type(observed)
+                canonical_nodes[local_id]["coarse_class"] = dominant_coarse_class(observed)
+                canonical_nodes[local_id]["entity_types"] = dict(counts)
             values = confidence_values[local_id]
             if values:
                 canonical_nodes[local_id]["confidence"] = sum(values) / len(values)
@@ -502,23 +787,44 @@ class PhaseOnePipeline:
         local_to_final = {node_id: node_id for node_id in canonical_nodes}
         local_to_final.update(merge_result.local_to_final_id)
         canonical_nodes = self._remap_canonical_nodes(canonical_nodes, local_to_final)
+
+        # WP7: entities referenced only by reused assertions are already canonical — they
+        # came from the previous version of this document and went through cross-document
+        # resolution then. They are added under their existing ids so the new version
+        # contains every endpoint its assertions point at.
+        for entity_id, node in reuse.entities.items():
+            if entity_id in canonical_nodes:
+                continue
+            canonical_nodes[entity_id] = {
+                "id": entity_id,
+                "name": str(node.get("name") or entity_id),
+                "type": str(node.get("type") or "Entity"),
+                "aliases": list(node.get("aliases") or [str(node.get("name") or entity_id)]),
+                "properties": node.get("properties") or {},
+                "confidence": float(node.get("confidence") or 0.0),
+                "coarse_class": str(node.get("coarse_class") or "UNKNOWN"),
+            }
         raw_to_final = {
             raw_id: local_to_final.get(local_id, local_id)
             for raw_id, local_id in disamb.entity_id_map.items()
         }
 
-        mapped_mentions = sorted(
-            {
-                (
-                    raw_to_final.get(entity_id, entity_id),
-                    chunk_id,
-                    mention_doc_id,
-                    confidence,
-                    disamb.entity_id_map.get(entity_id, entity_id),
-                )
-                for entity_id, chunk_id, mention_doc_id, confidence in raw_mentions
-            }
-        )
+        mention_rows = {
+            (
+                raw_to_final.get(entity_id, entity_id),
+                chunk_id,
+                mention_doc_id,
+                confidence,
+                disamb.entity_id_map.get(entity_id, entity_id),
+            )
+            for entity_id, chunk_id, mention_doc_id, confidence in raw_mentions
+        }
+        # WP7: a reused chunk brings its mentions with it. These entities are already
+        # canonical, so the final and local ids are the same.
+        for chunk_id, entity_ids in reuse.mentions_by_chunk.items():
+            for entity_id in entity_ids:
+                mention_rows.add((entity_id, chunk_id, doc_id, 1.0, entity_id))
+        mapped_mentions = sorted(mention_rows)
         mentions_by_chunk: dict[str, list[str]] = {}
         for entity_id, chunk_id, _, _, _ in mapped_mentions:
             mentions_by_chunk.setdefault(chunk_id, []).append(entity_id)
@@ -553,6 +859,13 @@ class PhaseOnePipeline:
             raw_to_local_entity_id=disamb.entity_id_map,
             raw_entity_chunk_ids=raw_entity_chunk_ids,
         )
+        assertions.extend(
+            self._rebuild_reused_assertions(
+                doc_id=doc_id,
+                document_version_id=document_version_id,
+                plan=reuse,
+            )
+        )
         merge_stats_after = self._merger_stats()
 
         def merge_delta(key: str) -> int:
@@ -579,6 +892,9 @@ class PhaseOnePipeline:
                 "assertions": len(assertions),
                 "auto_or_llm_merges": merge_result.merged_total,
                 "llm_adjudication_calls": merge_call_count,
+                "reused_chunks": len(reuse.assertions_by_chunk),
+                "reused_assertions": reuse.assertion_count,
+                "rejected_assertions": len(getattr(self.assertion_builder, "rejected", [])),
             },
         )
         node_rows = [canonical_nodes[key] for key in sorted(canonical_nodes)]
@@ -588,6 +904,8 @@ class PhaseOnePipeline:
                 "entity_id": node["id"],
                 "canonical_name": node["name"],
                 "aliases": node.get("aliases", []),
+                "entity_types": node.get("entity_types", {}),
+                "coarse_class": node.get("coarse_class", "UNKNOWN"),
             }
             for node in node_rows
         ]
@@ -665,7 +983,12 @@ class PhaseOnePipeline:
             or completed_version.last_completed_stage != "DONE"
         ):
             raise RuntimeError("Document version did not reach the DONE activation checkpoint.")
-        return merge_result.new_nodes, merge_result.merged_total, len(assertions)
+        return (
+            merge_result.new_nodes,
+            merge_result.merged_total,
+            len(assertions),
+            len(quarantined),
+        )
 
     def _extractor_stats(self) -> dict[str, int]:
         snapshot = getattr(self.extractor, "snapshot_stats", None)
@@ -712,6 +1035,8 @@ class PhaseOnePipeline:
         chunks_total: int,
         reference_chunks_skipped: int,
         error: str | None = None,
+        degraded_chunks: int = 0,
+        reused_chunks: int = 0,
     ) -> None:
         stats_after = self._extractor_stats()
 
@@ -736,6 +1061,8 @@ class PhaseOnePipeline:
                 "chunks_completed": chunks_completed,
                 "chunks_total": chunks_total,
                 "reference_chunks_skipped": reference_chunks_skipped,
+                "degraded_chunks": degraded_chunks,
+                "reused_chunks": reused_chunks,
                 "entities": delta("entities_count"),
                 "relations": delta("relations_count"),
                 "error": error,
@@ -761,6 +1088,10 @@ class PhaseOnePipeline:
             "chunk_target_tokens": self.settings.chunk_target_tokens,
             "chunk_max_tokens": self.settings.chunk_max_tokens,
             "chunk_overlap_tokens": self.settings.chunk_overlap_tokens,
+            "section_group_enabled": self.settings.section_group_enabled,
+            "section_group_target_tokens": self.settings.section_group_target_tokens,
+            "section_group_max_tokens": self.settings.section_group_max_tokens,
+            "section_group_page_gap_tolerance": self.settings.section_group_page_gap_tolerance,
             "gemini_model": self.settings.gemini_model if self.settings.enable_graph else None,
             "extraction_prompt_version": self.settings.extraction_prompt_version if self.settings.enable_graph else None,
             "graph_exclude_reference_sections": (
@@ -792,7 +1123,7 @@ class PhaseOnePipeline:
         target_stage: str,
         pipeline_fingerprint: str,
     ) -> bool:
-        active_checksum = str(row["active_checksum"] or row["checksum"] or "")
+        active_checksum = str(row["active_checksum"] or "")
         active_fingerprint = str(row["active_pipeline_fingerprint"] or "")
         completed_stage = str(row["last_completed_stage"] or row["pipeline_stage"] or "")
         return (
@@ -800,18 +1131,6 @@ class PhaseOnePipeline:
             and active_checksum == checksum
             and active_fingerprint == pipeline_fingerprint
             and STAGE_ORDER.get(completed_stage, 0) >= STAGE_ORDER[target_stage]
-        )
-
-    @staticmethod
-    def _needs_full_reprocess(row, checksum: str, pipeline_fingerprint: str) -> bool:  # noqa: ANN001
-        if row is None:
-            return False
-        active_checksum = str(row["active_checksum"] or row["checksum"] or "")
-        desired_checksum = str(row["desired_checksum"] or "")
-        active_fingerprint = str(row["active_pipeline_fingerprint"] or "")
-        same_attempted_content = checksum in {active_checksum, desired_checksum}
-        return same_attempted_content and (
-            str(row["status"] or "") != "complete" or active_fingerprint != pipeline_fingerprint
         )
 
     @staticmethod
@@ -900,58 +1219,6 @@ class PhaseOnePipeline:
             encoding="utf-8",
         )
 
-    def _backfill_graph_written_docs(self) -> None:
-        """Backfill vectors for complete docs that reached GRAPH_WRITTEN before Stage 7 existed."""
-        if self.graph_writer is None or self.vector_indexer is None:
-            return
-        rows = self.store.list_documents(status="complete", pipeline_stage="GRAPH_WRITTEN")
-        for row in rows:
-            doc_id = str(row["doc_id"])
-            try:
-                chunks = self.store.get_chunks_for_doc(doc_id)
-                mentions_by_chunk = self.store.get_entity_mentions_map(doc_id)
-                chunk_inputs = [
-                    ChunkVectorInput(
-                        chunk_id=str(chunk["chunk_id"]),
-                        doc_id=str(chunk["doc_id"]),
-                        text=str(chunk["text"] or ""),
-                        section_heading=str(chunk["section"]) if chunk["section"] is not None else None,
-                        page=int(chunk["page"]) if chunk["page"] is not None else None,
-                        entity_ids_mentioned=mentions_by_chunk.get(str(chunk["chunk_id"]), []),
-                    )
-                    for chunk in chunks
-                ]
-                entity_rows = self.graph_writer.get_entities_for_doc(doc_id)
-                entity_inputs = [
-                    EntityVectorInput(
-                        neo4j_node_id=str(entity_row.get("id") or ""),
-                        name=str(entity_row.get("name") or ""),
-                        entity_type=str(entity_row.get("type") or "Entity"),
-                        summary=build_entity_summary(
-                            name=str(entity_row.get("name") or ""),
-                            entity_type=str(entity_row.get("type") or "Entity"),
-                            properties=entity_row.get("properties"),
-                        ),
-                    )
-                    for entity_row in entity_rows
-                    if str(entity_row.get("id") or "").strip()
-                ]
-                self.vector_indexer.upsert_chunk_vectors(chunk_inputs)
-                self.vector_indexer.upsert_entity_vectors(entity_inputs)
-                self.store.set_chunk_embedding_version(
-                    [item.chunk_id for item in chunk_inputs],
-                    self.settings.embedding_version,
-                )
-                self.store.update_pipeline_stage(doc_id, "VECTORS_WRITTEN")
-                self.store.finish_document(
-                    doc_id=doc_id,
-                    word_count=int(row["word_count"] or 0),
-                    pipeline_stage="DONE",
-                )
-            except Exception as exc:
-                self.store.fail_document(doc_id=doc_id, error_message=f"Vector backfill failed: {exc}")
-                raise RuntimeError(f"Vector backfill failed for doc_id={doc_id}: {exc}") from exc
-
     def _ensure_embedding_metadata(self) -> None:
         expected = {
             "embedding_model_id": self.settings.embedding_model_id,
@@ -1012,10 +1279,14 @@ class PhaseOnePipeline:
                         existing_props[key] = value
             existing["properties"] = existing_props
 
-            existing_type = str(existing.get("type", "Entity"))
-            incoming_type = str(node.get("type", "Entity"))
-            if existing_type.strip().lower() == "entity" and incoming_type.strip():
-                existing["type"] = incoming_type
+            merged_types = dict(existing.get("entity_types", {}))
+            for raw_type, count in (node.get("entity_types", {}) or {}).items():
+                merged_types[raw_type] = merged_types.get(raw_type, 0) + int(count)
+            if merged_types:
+                observed = [raw for raw, count in merged_types.items() for _ in range(count)]
+                existing["entity_types"] = merged_types
+                existing["type"] = display_type(observed)
+                existing["coarse_class"] = dominant_coarse_class(observed)
 
             existing_name = str(existing.get("name", "")).strip()
             incoming_name = str(node.get("name", "")).strip()
