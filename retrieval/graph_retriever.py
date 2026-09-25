@@ -757,6 +757,13 @@ class GraphRetriever:
         score /= 1.0 + (0.15 * float(hop_count - 1))
         if anchor_status == "ambiguous":
             score *= max(0.0, min(1.0, float(self.settings.query_graph_ambiguous_score_penalty)))
+        # Refactor 3: a low-confidence assertion is admitted but ranked below a confident
+        # one, rather than being dropped at ingest or trusted as if it were certain. This
+        # is what makes raising extraction recall safe: uncertain facts stay reachable and
+        # stay marked, instead of the choice being admit-as-true or discard.
+        review_status = str(row.get("review_status") or "accepted")
+        if review_status != "accepted":
+            score *= max(0.0, min(1.0, float(self.settings.query_flagged_assertion_penalty)))
         evidence_id = f"assertion:{assertion_id}"
         provenance: dict[str, Any] = {
             "evidence_id": evidence_id,
@@ -782,6 +789,7 @@ class GraphRetriever:
             "source_ref": row.get("source_ref"),
             "valid_from": row.get("valid_from"),
             "valid_until": row.get("valid_until"),
+            "review_status": review_status,
             "section_heading": chunk["section"] if chunk is not None else None,
             "page": chunk["page"] if chunk is not None else None,
             "evidence_text": evidence_text,

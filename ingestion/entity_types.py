@@ -42,6 +42,67 @@ COARSE_CLASSES = frozenset({PERSON, ORGANIZATION, LOCATION, TIME, NUMBER, MISC, 
 # Classes that never constrain a merge. See the module docstring.
 PERMISSIVE_CLASSES = frozenset({MISC, UNKNOWN})
 
+# Classes identified by their *value* rather than by a name. A name has variants and so
+# tolerates fuzzy matching; a quantity or a date does not - two different values are two
+# different things however similar their surface forms. Measured against Re-DocRED, fuzzy
+# matching on these merged 908 with 919 and July 18 2007 with July 30 2008.
+VALUE_COARSE_CLASSES = frozenset({TIME, NUMBER})
+
+# Tokens whose whole job is to tell two otherwise identical names apart. Embedding
+# similarity treats them as noise - they are short, and they sit in names that are
+# identical everywhere else - which is exactly backwards.
+#
+# Confirmed in two unrelated domains: on arXiv, `Qwen3-4B` merged into `Qwen3-14B` and
+# `Gemma 3 1B` into `Gemma 3 27B` (REFACTOR2 section 8.6); on Re-DocRED's human-validated
+# clusters, `First Division` merged with `Second Division`, `Angleton High School` with
+# `Angleton Intermediate School`, and `Paul Desmarais` with `Paul Desmarais Sr`.
+_ORDINAL_TOKENS = frozenset({
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+    "ninth", "tenth", "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+})
+_GENERATION_TOKENS = frozenset({"jr", "junior", "sr", "senior", "elder", "younger"})
+_LEVEL_TOKENS = frozenset({
+    "high", "intermediate", "primary", "secondary", "elementary", "middle",
+    "upper", "lower", "north", "south", "east", "west", "old", "new",
+})
+
+DISCRIMINATIVE_TOKENS = _ORDINAL_TOKENS | _GENERATION_TOKENS | _LEVEL_TOKENS
+
+
+_DIGIT_RUN = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _numbers_in(name: str) -> list[str]:
+    """Every numeric run in a name, punctuation-independent.
+
+    Comparing whole tokens made `GPT-4o-mini` and `GPT4o-mini` look different - they
+    tokenize as {gpt, 4o, mini} against {gpt4o, mini} - and blocked a merge of one model
+    with itself. The numbers are what carry the distinction, so compare those directly:
+    both yield ["4"], while `Llama-2-70b` and `Llama-2-7b` yield ["2","70"] and ["2","7"].
+    """
+    return sorted(_DIGIT_RUN.findall(name.lower()))
+
+
+def names_differ_discriminatively(left: str, right: str) -> bool:
+    """True when two names differ by something that exists to tell them apart.
+
+    Two independent checks. The numbers a name carries must match, punctuation aside, so
+    `Qwen3-4B` against `Qwen3-14B` is refused while `Qwen2.5-14B` against `Qwen-2.5-14B`
+    is not. Beyond that, a differing word must be one that distinguishes rather than
+    describes, so `John Hopkins` against `John Hopkins University` is allowed through.
+    """
+    if _numbers_in(left) != _numbers_in(right):
+        return True
+
+    left_tokens = set(TOKEN_PATTERN.findall(left.lower()))
+    right_tokens = set(TOKEN_PATTERN.findall(right.lower()))
+    if not left_tokens or not right_tokens:
+        return False
+    differing = left_tokens.symmetric_difference(right_tokens)
+    if not differing:
+        return False
+    return any(token in DISCRIMINATIVE_TOKENS for token in differing)
+
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 
 # Collective nouns sit genuinely between PERSON and ORGANIZATION — a "user group" is

@@ -44,7 +44,10 @@ LEVEL_MATCH = (
     "assertion.properties_json AS properties_json, assertion.confidence AS confidence, "
     "assertion.doc_id AS doc_id, assertion.document_version_id AS document_version_id, "
     "assertion.chunk_id AS chunk_id, assertion.source_ref AS source_ref, "
-    "assertion.valid_from AS valid_from, assertion.valid_until AS valid_until "
+    "assertion.valid_from AS valid_from, assertion.valid_until AS valid_until, "
+    # Refactor 3: carried so retrieval can prefer accepted evidence over flagged rather
+    # than treating the two alike. The field was written at ingest and read by nothing.
+    "assertion.review_status AS review_status "
     "ORDER BY assertion.confidence DESC, assertion.id ASC "
     "LIMIT $level_limit"
 )

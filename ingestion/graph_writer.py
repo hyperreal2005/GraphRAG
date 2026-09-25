@@ -572,8 +572,71 @@ class GraphWriter:
         with self._driver.session() as session:
             return [dict(record) for record in session.run(query, {"entity_ids": id_list})]
 
+    def find_value_conflicts(
+        self,
+        doc_id: str | None = None,
+        min_single_ratio: float = 0.9,
+        min_subjects: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Contradictions, as opposed to predicates that are simply multi-valued.
+
+        `find_contradictions` treats any subject/predicate with more than one object as a
+        conflict. In a schema-free graph that is mostly wrong: HAS_SHAREHOLDER with five
+        values is a company with five shareholders, not a disagreement. Run against the
+        working corpus it returned 1,520 pairs, almost none of them contradictions.
+
+        Cardinality is not declared anywhere, so it is inferred from the corpus: a
+        predicate whose subjects almost always carry exactly one value is single-valued by
+        observation, and a subject with two values for it is a genuine conflict.
+        `min_subjects` stops a predicate used twice from qualifying on one example.
+        """
+        query = """
+        MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {active: true})
+        WHERE $doc_id IS NULL OR a.doc_id = $doc_id
+        OPTIONAL MATCH (a)-[:OBJECT]->(object:Entity)
+        WITH subject.id AS subject_id,
+             subject.name AS subject_name,
+             a.predicate_normalized AS predicate,
+             collect(DISTINCT coalesce(object.name, object.id, a.literal_value_json)) AS values,
+             collect(DISTINCT a.id) AS assertion_ids
+        WITH predicate,
+             collect({subject_id: subject_id, subject_name: subject_name,
+                      values: values, assertion_ids: assertion_ids}) AS rows,
+             count(*) AS subject_count,
+             sum(CASE WHEN size(values) = 1 THEN 1 ELSE 0 END) AS single_valued
+        WHERE subject_count >= $min_subjects
+          AND (single_valued * 1.0 / subject_count) >= $min_single_ratio
+        WITH predicate, rows, (single_valued * 1.0 / subject_count) AS single_ratio
+        UNWIND rows AS row
+        WITH predicate, single_ratio, row
+        WHERE size(row.values) > 1
+        RETURN row.subject_id AS subject_id,
+               row.subject_name AS subject_name,
+               predicate,
+               row.values AS values,
+               row.assertion_ids AS assertion_ids,
+               single_ratio
+        ORDER BY single_ratio DESC, predicate, subject_id
+        """
+        with self._driver.session() as session:
+            return [
+                dict(record)
+                for record in session.run(
+                    query,
+                    {
+                        "doc_id": doc_id,
+                        "min_single_ratio": float(min_single_ratio),
+                        "min_subjects": int(min_subjects),
+                    },
+                )
+            ]
+
     def find_contradictions(self, doc_id: str | None = None) -> list[dict[str, Any]]:
-        """Surface active claims with one subject/predicate and multiple object values."""
+        """Every subject/predicate carrying more than one object value.
+
+        The raw primitive. Most results are ordinary one-to-many relations rather than
+        contradictions; prefer `find_value_conflicts`, which infers cardinality first.
+        """
         query = """
         MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {active: true})
         WHERE $doc_id IS NULL OR a.doc_id = $doc_id

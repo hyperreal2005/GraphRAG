@@ -17,6 +17,10 @@ class Settings:
     chunk_target_tokens: int = 700
     chunk_max_tokens: int = 800
     chunk_overlap_tokens: int = 100
+    # Table rows are grouped into blocks up to this many tokens; prose keeps
+    # chunk_target_tokens. Defaults to the prose target (the wp2g behaviour) until the
+    # smaller-block experiment is measured - see docs/REFACTOR3.md WP12/WP14.
+    chunk_table_block_target_tokens: int = 700
     # WP2-A: merge parser items into logical sections before coref/chunking (B1).
     section_group_enabled: bool = True
     section_group_target_tokens: int = 700
@@ -58,8 +62,10 @@ class Settings:
     )
     disamb_model: str = "all-MiniLM-L6-v2"
     disamb_threshold: float = 0.92
-    # WP2-B: identity is name-first; type only blocks on a coarse-class conflict.
-    entity_identity_name_first: bool = True
+    # WP2-B: identity is name-first, unconditionally - the disambiguator matches on the
+    # normalized name and its aliases, and type only blocks on a coarse-class conflict.
+    # An `entity_identity_name_first` flag stood here until 2026-09-01 and was never read
+    # by anything, so it advertised a switch that did not exist.
     entity_coarse_class_blocking: bool = True
     entity_same_type_bonus: float = 0.02
     cross_doc_auto_merge_threshold: float = 0.95
@@ -70,10 +76,21 @@ class Settings:
     cross_doc_llm_confidence_threshold: float = 0.90
     cross_doc_same_type_required_for_auto: bool = True
     cross_doc_llm_enabled: bool = True
-    embedding_model_id: str = "gemini-embedding-2"
+    # Switched from `gemini-embedding-2` on 2026-09-05. That model sheds load
+    # server-side regardless of billing tier: measured interleaved against -001 on one key
+    # in one minute, it failed 8 of 30 calls where -001 failed 0 of 30, and it failed even
+    # at a paced 30 requests/minute - 0.6% of the project's 5,000 RPM limit, with the
+    # dashboard showing peak 214/5K. The 429 carries no quota metric and no Retry-After,
+    # and points at Vertex capacity docs. It cost five judged runs before it was diagnosed.
+    #
+    # Retrieval quality is a wash on this corpus (49 judged questions, same 1,233 chunks):
+    # -2 recall@10 1.000 / MRR 0.708 / median rank 2; -001 recall@10 0.980 / MRR 0.740 /
+    # median rank 1. Each wins one metric by one question, which is noise at this n.
+    # Reliability is not a wash, so -001 wins.
+    embedding_model_id: str = "gemini-embedding-001"
     embedding_dim: int = 3072
-    embedding_version: str = "embedding2-3072-r2"
-    embedding_prompt_version: str = "embedding2-r2-v1"
+    embedding_version: str = "embedding001-3072-r4"
+    embedding_prompt_version: str = "embedding001-tasktype-v1"
     embedding_normalization_policy: str = "provider-default"
     # WP2-E: aligned to the documented asymmetric form. The document side carries no
     # `task:` component; only the query side does.
@@ -83,10 +100,26 @@ class Settings:
     # WP2-E: model behaviour is selected by explicit capability, never by matching a
     # model-name string. Setting the documented `gemini-embedding-2-preview` id used
     # to silently flip the pipeline back to legacy behaviour (REVIEW1 B10).
-    embedding_model_supports_task_type: bool = False
-    embedding_model_uses_instruction_prefix: bool = True
+    # -001 takes task_type natively and needs no instruction prefix; -2 took the
+    # opposite convention. WP2-E exists so this is configuration, not a code branch.
+    embedding_model_supports_task_type: bool = True
+    embedding_model_uses_instruction_prefix: bool = False
     embedding_probe_on_startup: bool = True
     embedding_batch_size: int = 32
+    # Retry a *throttled* embedding call rather than letting it fail the whole vector
+    # stage: the outbox's three attempts re-embed every chunk in the document to recover
+    # one 429. A rebuild hit 26 of them in six documents and lost a document that way.
+    embedding_rate_limit_attempts: int = 5
+    embedding_rate_limit_base_seconds: float = 1.0
+    # Total backoff ceiling, not just an attempt count. The query path gives the vector
+    # stage 15s and entity linking 20s, so an unbounded 2+4+8+16s backoff converts a
+    # recoverable 429 into a stage timeout - worse than one failed call. Slow retries
+    # belong at the outbox, which has no deadline.
+    embedding_rate_limit_max_total_seconds: float = 6.0
+    # Process-wide minimum gap between embedding requests. Default 0 (off). Concurrency is
+    # the wrong lever against a per-minute quota, and the query path has no worker count to
+    # turn down - its three retrieval stages are dispatched by one asyncio.gather.
+    embedding_min_interval_seconds: float = 0.0
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
     qdrant_timeout_seconds: float = 30.0
@@ -97,8 +130,48 @@ class Settings:
     qdrant_chunks_collection: str = "chunks"
     qdrant_entities_collection: str = "entities"
     qdrant_communities_collection: str = "communities"
+    # Phase 8 (built 2026-09-01). The entity graph is sparse - 9,141 active entities joined
+    # by 3,819 distinct pairs - so Louvain returns 973 communities of which 296 hold one or
+    # two members. A two-entity cluster carries no theme, so the floor is a correctness
+    # control first and a cost control second: >=10 members keeps 218 communities covering
+    # 4,596 entities, against 973 summary calls for all of them.
+    community_min_size: int = 10
+    community_seed: int = 17
+    community_summary_max_entities: int = 40
+    community_summary_max_relations: int = 60
+    # Phase 9 healer. The graph is schema-free, so which predicates are single-valued is
+    # not declared anywhere: it is inferred from the corpus. A predicate whose subjects
+    # almost always carry exactly one object is treated as functional, and a subject with
+    # several is then a contradiction. Without this, all 1,528 subject/predicate pairs with
+    # multiple objects report as conflicts, most of them legitimately multi-valued.
+    # Matches GraphWriter.find_value_conflicts, which the healer delegates to and whose
+    # 0.9 / 5 defaults are already measured and documented (1,520 raw conflicts -> 75).
+    heal_functional_threshold: float = 0.9
+    heal_functional_min_support: int = 5
+    # The Refactor 2 prompt, retained after Refactor 3 measured three variants against it
+    # and rejected all three (docs/REFACTOR3.md WP2 and WP3):
+    #
+    #   r3-v1  entity categories stated unconditionally. Re-DocRED entity recall 52.7% ->
+    #          60.6%, but on arXiv it traded the subject matter for scenery: added UK,
+    #          NASA and bibliography surnames, dropped RAG, BM25, TF-IDF, MRR@10.
+    #   r3-v2  the same categories made conditional. Protected arXiv, fell to 50.6% on
+    #          Re-DocRED - below baseline. One global entity instruction cannot serve both.
+    #   r3-v3  relation density. Recall 5.3% -> 5.5% (~7 relations in 3,655) bought with
+    #          precision 20.3% -> 18.2%, and the confidence instruction that was meant to
+    #          route uncertain relations to review produced 0 of 1,100 below 0.5.
     extraction_prompt_version: str = "assertion-r2-v1"
+    # WP7: the extraction, embedding and judge prompts were all versioned; the generation
+    # prompt was not, so two runs with different answer instructions produced reports that
+    # claimed to be comparable. "attribution" marks the rule added after the judge found
+    # the generator asserting which publication reported a fact the evidence only stated.
+    generation_prompt_version: str = "answer-r3-attribution-v1"
     assertion_review_confidence_threshold: float = 0.50
+    # Refactor 3: an assertion whose predicate the corpus uses fewer than this many
+    # times is flagged for review, unless a second document corroborates the claim.
+    # Measured against gold, predicates used 1-4 times match a gold relation about 1%
+    # of the time against 43.6% for those used 20+ times. Absolute count, so a small
+    # corpus flags more - see ingestion/review_status.py.
+    review_rare_predicate_below: int = 5
     extraction_max_attempts: int = 3
     # WP7: reuse a chunk assertions when its content hash is unchanged (A4).
     extraction_reuse_enabled: bool = True
@@ -112,9 +185,22 @@ class Settings:
     # WP3-B: age at which a mid-build version is treated as abandoned by the sweeper.
     outbox_orphan_sweep_hours: float = 24.0
     query_embedding_task_type: str = "RETRIEVAL_QUERY"
-    entity_link_resolve_threshold: float = 0.85
+    # WP8 calibration, 2026-08-27 (REVIEW1 `B7`, second half). Swept together over 60
+    # exact-name positives and 12 absent-name negatives on the WP2-F corpus; see
+    # docs/REFACTOR2.md section 8.6. The margin was the damaging parameter, not the
+    # threshold: at 0.05 only 44 of 60 exact names resolved, at 0.00 it is 57, and the
+    # absent names are still refused (0 false links). After WP2-B a technical corpus is
+    # full of legitimate near-neighbours ("Qwen3-4B-Instruct" beside "Qwen3-4B"), so a
+    # top-2 gap requirement mostly punishes correct answers rather than catching ambiguity.
+    # Recalibrated 2026-09-16 for gemini-embedding-001; the 0.75 above was measured on
+    # gemini-embedding-2, whose cosine distribution sits higher. On -001 the 12 absent
+    # names in the fixture top out at 0.711 and the 57 reachable positives bottom at
+    # 0.724, so 0.72 links every reachable positive with zero false links. At 0.75 it lost
+    # 12 of 57 - and that, not chunking, is why graph retrieval fell silent on wp2g
+    # (33 -> 8 of 50 questions with graph evidence). This value is per embedding model.
+    entity_link_resolve_threshold: float = 0.72
     entity_link_ambiguous_threshold: float = 0.70
-    entity_link_resolve_margin: float = 0.05
+    entity_link_resolve_margin: float = 0.00
     entity_link_candidate_k: int = 5
     entity_link_mention_weight: float = 0.60
     enforce_embedding_metadata: bool = True
@@ -144,8 +230,13 @@ class Settings:
     query_vector_timeout_seconds: float = 15.0
     query_rerank_timeout_seconds: float = 15.0
     query_generation_timeout_seconds: float = 45.0
-    # Raw LLM-generated Cypher is intentionally opt-in. The default query path
-    # uses application-owned, bounded Cypher templates.
+    # NOT raw generated Cypher, despite the name. Since WP4-B the traversal is a constant
+    # level-wise BFS in retrieval/graph_traversal.py; enabling this asks the model for one
+    # thing only - which relationship types to follow - validated against the live schema
+    # and clamped by _compile_logical_plan. Nothing model-authored is ever executed, so
+    # finding A7 (Neo4j Community has no RBAC) is not an argument against it.
+    # It stays off because it costs an extra provider call on every query and has never
+    # been measured to help, not because it is dangerous.
     query_graph_dynamic_enabled: bool = False
     query_graph_dynamic_fallback_to_static: bool = True
     query_graph_schema_cache_ttl_seconds: int = 300
@@ -156,11 +247,29 @@ class Settings:
     query_graph_allow_ambiguous_fallback: bool = True
     query_graph_ambiguous_min_similarity: float = 0.75
     query_graph_ambiguous_score_penalty: float = 0.85
+    # Refactor 3: score multiplier for an assertion flagged for review at ingest.
+    # Admitted to retrieval but ranked below confident evidence, so that raising
+    # extraction recall does not mean trusting uncertain facts equally.
+    query_flagged_assertion_penalty: float = 0.60
     query_context_max_items: int = 20
-    query_context_max_chars: int = 12000
+    # The single biggest retrieval win in the project, and it was a config value.
+    # At 12,000 the packed context held roughly three 700-word chunks, and
+    # `_pack_context` stops at the first item that will not fit - so gold evidence
+    # that retrieval had already found, at median rank 7, was discarded before the
+    # model ever saw it. Measured on the judged set: recall@10 0.653 at 12,000,
+    # 0.878 at 24,000, 0.918 at 40,000, against a 0.85 gate that had never been met.
+    query_context_max_chars: int = 40000
     query_filter_boilerplate_chunks: bool = True
     query_include_reference_chunks: bool = False
     query_citation_max: int = 8
+    # Refactor 3 WP5/WP6. When the model judges the retrieved evidence does not
+    # address the question, route to the insufficient-evidence response instead of
+    # answering. Measured on the 50-question judged set: claim faithfulness 0.941
+    # -> 1.000 and abstention 0.000 -> 1.000, but questions answered fell 49 -> 30.
+    # That trade is a product judgement - trustworthiness against answer rate - so
+    # it is a setting rather than a fixed behaviour. False restores the previous
+    # behaviour of always answering.
+    generation_refuse_when_unanswerable: bool = True
     query_temperature_local: float = 0.1
     query_temperature_multihop: float = 0.1
     query_temperature_comparative: float = 0.2
@@ -170,10 +279,46 @@ class Settings:
     query_rerank_enabled: bool = True
     query_rerank_model: str = "rerank-v3.5"
     query_rerank_top_n: int = 15
+    # Phase 6 shipped a Cohere adapter and a "deterministic fallback" that returned the
+    # input order unchanged. No Cohere key has ever been configured here, so reranking has
+    # never actually run. This is the architecture's own stated alternative (5.5): a local
+    # cross-encoder, no key, no per-query cost, ~0.65 s for 60 candidates on CPU. Default
+    # is decided by measurement, not by preference.
+    query_rerank_local_enabled: bool = False
+    query_rerank_local_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    query_rerank_local_max_items: int = 60
+    # LLM-as-reranker: the generation model orders the top candidates, one call per query.
+    # Enabled 2026-09-25 on measurement. Every cross-encoder tried made retrieval worse on
+    # this corpus's long compositional questions; the model that answers them orders them
+    # well. Swept on wp2g, 49 judged questions, recall@10 / MRR / offered-p@8 / ms per query:
+    #   rank fusion only              0.959  0.629  0.253      29
+    #   ms-marco-MiniLM-L-6 (named)   0.918  0.543  0.218   2,783
+    #   bge-reranker-base             0.816  0.427  0.237  15,911
+    #   bge-reranker-v2-m3            0.898  0.659  0.254  76,337
+    #   LLM (gemini-3.5-flash-lite)   0.980  0.682  0.272   1,315
+    #
+    # DEFAULT OFF. The offline sweep above ranks the tiers correctly but overstates the
+    # LLM's gain: its baseline reads recall 0.959 / MRR 0.629 where the live pipeline reads
+    # 0.980 / 0.662 for the same configuration, so its deltas do not transfer. Measured
+    # live on the judged set, the LLM tier is net-neutral on the gates - MRR +0.018,
+    # recall -0.020, citation precision -0.005, faithfulness -0.003, all inside the
+    # ~0.02 that one question is worth at n=49 - while costing one generation call and
+    # 1.3 s per query and raising degraded_rate 0.220 -> 0.260. It does lift graph path
+    # utility 0.610 -> 0.780, which is the one real effect and the reason to revisit it if
+    # graph evidence is ever the thing being optimised.
+    query_rerank_llm_enabled: bool = False
+    query_rerank_llm_top_n: int = 20
+    query_rerank_llm_snippet_chars: int = 400
     query_cache_enabled: bool = False
     query_cache_ttl_seconds: int = 3600
     # WP1 evaluation harness (docs/REFACTOR2.md section 3)
     eval_judge_model: str = "gemini-3.5-flash-lite"
+    # Phase 10.1. Off by default so nothing needs a collector; enable to send every query
+    # and ingestion stage to Phoenix at the endpoint below (`python -m phoenix.server.main
+    # serve` runs one locally on :6006). Provider calls nest under their stage.
+    tracing_enabled: bool = False
+    tracing_endpoint: str = "http://localhost:6006/v1/traces"
+    tracing_project: str = "graphrag"
     eval_judge_prompt_version: str = "judge-r2-v1"
 
     def ensure_directories(self) -> None:
@@ -444,6 +589,10 @@ class Settings:
             "QDRANT_COMMUNITIES_COLLECTION",
             self.qdrant_communities_collection,
         )
+        try:
+            self.community_min_size = int(os.getenv("COMMUNITY_MIN_SIZE", self.community_min_size))
+        except (TypeError, ValueError):
+            self.community_min_size = self.community_min_size
         self.embedding_model_id = os.getenv("EMBEDDING_MODEL_ID", self.embedding_model_id)
         for attribute, environment_name in (
             ("embedding_model_supports_task_type", "EMBEDDING_MODEL_SUPPORTS_TASK_TYPE"),
@@ -471,6 +620,10 @@ class Settings:
             "EXTRACTION_PROMPT_VERSION",
             self.extraction_prompt_version,
         )
+        self.generation_prompt_version = os.getenv(
+            "GENERATION_PROMPT_VERSION",
+            self.generation_prompt_version,
+        )
         try:
             self.assertion_review_confidence_threshold = float(
                 os.getenv(
@@ -496,6 +649,11 @@ class Settings:
             )
         except ValueError:
             pass
+        refuse_env = os.getenv("GENERATION_REFUSE_WHEN_UNANSWERABLE")
+        if refuse_env is not None:
+            self.generation_refuse_when_unanswerable = (
+                refuse_env.strip().lower() not in {"0", "false", "no"}
+            )
         sparse_env = os.getenv("QUERY_SPARSE_ENABLED")
         if sparse_env is not None:
             self.query_sparse_enabled = sparse_env.strip().lower() not in {"0", "false", "no"}
@@ -536,6 +694,44 @@ class Settings:
         except ValueError:
             self.extraction_retry_base_seconds = self.extraction_retry_base_seconds
         self.query_rerank_model = os.getenv("QUERY_RERANK_MODEL", self.query_rerank_model)
+        self.query_rerank_local_model = os.getenv(
+            "QUERY_RERANK_LOCAL_MODEL", self.query_rerank_local_model
+        )
+        tracing_env = os.getenv("TRACING_ENABLED")
+        if tracing_env is not None:
+            self.tracing_enabled = tracing_env.strip().lower() not in {"0", "false", "no"}
+        self.tracing_endpoint = os.getenv("TRACING_ENDPOINT", self.tracing_endpoint)
+        self.tracing_project = os.getenv("TRACING_PROJECT", self.tracing_project)
+        try:
+            self.embedding_min_interval_seconds = float(
+                os.getenv("EMBEDDING_MIN_INTERVAL_SECONDS", self.embedding_min_interval_seconds)
+            )
+        except (TypeError, ValueError):
+            self.embedding_min_interval_seconds = self.embedding_min_interval_seconds
+        try:
+            self.embedding_rate_limit_max_total_seconds = float(
+                os.getenv(
+                    "EMBEDDING_RATE_LIMIT_MAX_TOTAL_SECONDS",
+                    self.embedding_rate_limit_max_total_seconds,
+                )
+            )
+        except (TypeError, ValueError):
+            self.embedding_rate_limit_max_total_seconds = self.embedding_rate_limit_max_total_seconds
+        try:
+            self.embedding_rate_limit_attempts = int(
+                os.getenv("EMBEDDING_RATE_LIMIT_ATTEMPTS", self.embedding_rate_limit_attempts)
+            )
+        except (TypeError, ValueError):
+            self.embedding_rate_limit_attempts = self.embedding_rate_limit_attempts
+        local_rerank_env = os.getenv("QUERY_RERANK_LOCAL_ENABLED")
+        if local_rerank_env is not None:
+            self.query_rerank_local_enabled = local_rerank_env.strip().lower() not in {"0", "false", "no"}
+        try:
+            self.query_rerank_local_max_items = int(
+                os.getenv("QUERY_RERANK_LOCAL_MAX_ITEMS", self.query_rerank_local_max_items)
+            )
+        except (TypeError, ValueError):
+            self.query_rerank_local_max_items = self.query_rerank_local_max_items
         self.eval_judge_model = os.getenv("EVAL_JUDGE_MODEL", self.eval_judge_model)
         self.eval_judge_prompt_version = os.getenv(
             "EVAL_JUDGE_PROMPT_VERSION",

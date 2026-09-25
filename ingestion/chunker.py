@@ -109,11 +109,24 @@ class SentenceSpan:
 class SemanticChunker:
     """Chunk text with sentence boundaries and token overlap."""
 
-    def __init__(self, target_tokens: int = 700, max_tokens: int = 800, overlap_tokens: int = 100) -> None:
+    def __init__(
+        self,
+        target_tokens: int = 700,
+        max_tokens: int = 800,
+        overlap_tokens: int = 100,
+        table_block_target_tokens: int | None = None,
+    ) -> None:
         if target_tokens <= 0 or max_tokens <= 0:
             raise ValueError("target_tokens and max_tokens must be positive")
         if target_tokens > max_tokens:
             raise ValueError("target_tokens cannot exceed max_tokens")
+        # Tables get their own target. At the prose target (700) a table becomes one diffuse
+        # block: measured on wp2g, that took MRR 0.749 to 0.678 and graph utility 0.610 to
+        # 0.171 against row-per-chunk, while cutting extraction calls 3.3x. A smaller block
+        # keeps most of the saving and leaves a table granular enough to rank.
+        self.table_block_target_tokens = (
+            int(table_block_target_tokens) if table_block_target_tokens else target_tokens
+        )
         if overlap_tokens < 0:
             raise ValueError("overlap_tokens cannot be negative")
         if overlap_tokens >= max_tokens:
@@ -127,18 +140,111 @@ class SemanticChunker:
         chunks: list[Chunk] = []
         position = 0
 
+        # Consecutive table rows under one heading are accumulated and emitted as a block
+        # rather than one chunk per row. Measured on the working corpus: 72.2% of PDF body
+        # chunks were single rows under 100 tokens, which is why the mean active chunk size
+        # reads 153.8 against a 600-800 gate, and why extraction costs one provider call
+        # per row - 2,000 calls for PDF bodies against 676 for blocks, a 3.0x difference.
+        #
+        # A row is not the right unit for either job. For extraction, batching rows into
+        # one call without merging them would need per-assertion provenance the schema does
+        # not carry, so an assertion could silently land on the wrong row and break the
+        # exactness gate 6 protects. For retrieval, a 44-token row carries no context: the
+        # column meanings live in the header and the comparison lives in the sibling rows.
+        # Merging keeps one chunk to one extraction and one citation, by construction.
+        pending_rows: list[Section] = []
+
+        def flush_rows() -> None:
+            nonlocal position
+            if not pending_rows:
+                return
+            block_chunks = self._chunk_table_block(document.doc_id, list(pending_rows), position)
+            chunks.extend(block_chunks)
+            position += len(block_chunks)
+            pending_rows.clear()
+
         for section in document.sections:
             if section.section_type is SectionType.TABLE_ROW:
-                table_chunks = self._chunk_table_row(document.doc_id, section, position)
-                chunks.extend(table_chunks)
-                position += len(table_chunks)
+                if pending_rows and section.heading != pending_rows[-1].heading:
+                    flush_rows()
+                pending_rows.append(section)
                 continue
 
+            flush_rows()
             if section.section_type is SectionType.TEXT:
                 text_chunks = self._chunk_text_section(document.doc_id, section, position)
                 chunks.extend(text_chunks)
                 position += len(text_chunks)
 
+        flush_rows()
+        return chunks
+
+    def _chunk_table_block(
+        self, doc_id: str, rows: list[Section], position: int
+    ) -> list[Chunk]:
+        """One chunk per run of table rows, split at the token target.
+
+        Falls back to the per-row path for a single row, so a lone row in a section is
+        unchanged and the existing behaviour is preserved where there is nothing to group.
+        """
+        if len(rows) == 1:
+            return self._chunk_table_row(doc_id, rows[0], position)
+
+        rendered_rows: list[str] = []
+        for section in rows:
+            headers = section.table_headers or []
+            values = section.table_row or []
+            if not headers and not values:
+                continue
+            rendered_rows.append(
+                " | ".join(f"{header}: {value}" for header, value in zip(headers, values))
+            )
+        if not rendered_rows:
+            return []
+
+        blocks: list[list[str]] = []
+        current: list[str] = []
+        running = 0
+        for rendered in rendered_rows:
+            tokens = token_count(rendered)
+            if current and running + tokens > self.table_block_target_tokens:
+                blocks.append(current)
+                current, running = [], 0
+            current.append(rendered)
+            running += tokens
+        if current:
+            blocks.append(current)
+
+        anchor = rows[0]
+        provenance: list[Any] = []
+        for section in rows:
+            provenance.extend(section.provenance)
+
+        chunks: list[Chunk] = []
+        for offset, block in enumerate(blocks):
+            text = "\n".join(block)
+            chunk_position = position + offset
+            chunks.append(
+                Chunk(
+                    doc_id=doc_id,
+                    chunk_id=str(uuid.uuid4()),
+                    position=chunk_position,
+                    section_heading=anchor.heading,
+                    page_number=anchor.page,
+                    text=text,
+                    token_count=token_count(text),
+                    char_start=None,
+                    char_end=None,
+                    chunk_hash=chunk_hash(
+                        text,
+                        section_heading=anchor.heading,
+                        page_number=anchor.page,
+                        position=chunk_position,
+                    ),
+                    content_hash=content_hash(text, section_heading=anchor.heading),
+                    provenance=provenance,
+                )
+            )
         return chunks
 
     def _chunk_table_row(self, doc_id: str, section: Section, position: int) -> list[Chunk]:

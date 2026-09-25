@@ -12,9 +12,37 @@ corrupt the corpus.
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
+import threading
+import time
 from typing import Any
 
 from config import Settings
+
+logger = logging.getLogger(__name__)
+
+_PACE_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
+
+
+def _pace(min_interval: float) -> None:
+    """Hold a process-wide minimum interval between embedding requests.
+
+    Lowering concurrency does not help against a *per-minute* quota, and on the query path
+    there is no worker count to lower anyway: entity linking, vector retrieval and
+    community retrieval are dispatched together by one `asyncio.gather`, and
+    `gemini_max_workers` governs ingestion only. Pacing is the lever that actually reduces
+    requests per minute, and it applies wherever the call comes from.
+    """
+    if min_interval <= 0:
+        return
+    global _LAST_REQUEST_AT
+    with _PACE_LOCK:
+        wait = _LAST_REQUEST_AT + min_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQUEST_AT = time.monotonic()
 
 
 class GeminiEmbedder:
@@ -106,19 +134,68 @@ class GeminiEmbedder:
             prefix = self.settings.embedding_document_prefix.format(title=title or "untitled")
         return [f"{prefix}{text}" for text in texts]
 
+    @staticmethod
+    def _is_rate_limited(exc: Exception) -> bool:
+        """A throttle, as opposed to a real failure.
+
+        Matched on the response rather than the exception class because the SDK raises the
+        same `ClientError` for a bad request as for a throttle, and retrying a bad request
+        forever is worse than not retrying a throttle.
+        """
+        status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        if status == 429:
+            return True
+        text = str(exc)
+        return "429" in text or "RESOURCE_EXHAUSTED" in text
+
     def _embed_batch(self, texts: list[str], task_type: str | None = None) -> list[list[float]]:
         config = self._build_config(task_type)
 
-        try:
-            response = self._client.models.embed_content(
-                model=self.settings.embedding_model_id,
-                contents=texts,
-                config=config,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Gemini embedding request failed: {exc}") from exc
-
-        return self._parse_response(response)
+        # A throttled batch used to raise straight out, failing the whole VECTOR_STAGE
+        # event and burning one of the outbox's three coarse attempts - which re-embeds
+        # every chunk in the document to recover one rate-limited call. A rebuild hit 26
+        # of these in six documents and lost a document to it (docs/ERRORS.md 2026-09-04).
+        # Retry the call, not the document.
+        # The backoff is bounded in *total*, not just in attempts. This same embedder is
+        # called from the query path, where the vector stage has a 15s deadline and entity
+        # linking 20s: an unbounded 2+4+8+16s backoff turns a recoverable 429 into a stage
+        # timeout, which is strictly worse than one failed call. Measured: a judged run
+        # with attempt-only limits failed retrieval on 38% of questions, 8 of them as
+        # outright TimeoutErrors. Slow retries belong at the outbox, which has no deadline.
+        attempts = max(1, int(self.settings.embedding_rate_limit_attempts))
+        base = max(0.0, float(self.settings.embedding_rate_limit_base_seconds))
+        budget = max(0.0, float(self.settings.embedding_rate_limit_max_total_seconds))
+        spent = 0.0
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                _pace(float(self.settings.embedding_min_interval_seconds))
+                response = self._client.models.embed_content(
+                    model=self.settings.embedding_model_id,
+                    contents=texts,
+                    config=config,
+                )
+                return self._parse_response(response)
+            except Exception as exc:
+                last = exc
+                delay = base * (2**attempt) + random.uniform(0.0, base)
+                if (
+                    not self._is_rate_limited(exc)
+                    or attempt + 1 >= attempts
+                    or spent + delay > budget
+                ):
+                    raise RuntimeError(f"Gemini embedding request failed: {exc}") from exc
+                logger.warning(
+                    "embedding_rate_limited attempt=%d/%d sleeping=%.1fs spent=%.1f/%.1fs",
+                    attempt + 1,
+                    attempts,
+                    delay,
+                    spent,
+                    budget,
+                )
+                time.sleep(delay)
+                spent += delay
+        raise RuntimeError(f"Gemini embedding request failed: {last}") from last
 
     async def aembed_texts(
         self,

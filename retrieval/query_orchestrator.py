@@ -20,6 +20,7 @@ from retrieval.entity_linker import EntityLinker
 from retrieval.fusion import FusionEngine
 from retrieval.graph_retriever import GraphRetriever
 from retrieval.vector_retriever import VectorRetriever
+from observability import tracing
 
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,57 @@ class QueryOrchestrator:
         self.community_retriever = community_retriever or CommunityRetriever(settings)
         self.fusion_engine = fusion_engine or FusionEngine(settings, store=self.store)
         self.generator = generator or AnswerGenerator(settings)
+        tracing.configure_tracing(settings)
+
+    @staticmethod
+    def _traced(stage: str, fn: Any, **attributes: Any) -> Any:
+        """Wrap a stage callable in a span named after the stage. No-op when tracing is off.
+
+        Applied to the callable rather than around the await so the existing timeout and
+        timing logic is untouched; `asyncio.to_thread` copies contextvars, so the span
+        nests under the query's root span even though the stage runs on a worker thread.
+        """
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            with tracing.span(f"graphrag.{stage}", **attributes) as current:
+                result = fn(*args, **kwargs)
+                if current is not None and isinstance(result, list):
+                    tracing.annotate(current, **{"result.count": len(result)})
+                return result
+
+        async def awrapped(*args: Any, **kwargs: Any) -> Any:
+            with tracing.span(f"graphrag.{stage}", **attributes) as current:
+                result = await fn(*args, **kwargs)
+                if current is not None and isinstance(result, list):
+                    tracing.annotate(current, **{"result.count": len(result)})
+                return result
+
+        import inspect
+
+        return awrapped if inspect.iscoroutinefunction(fn) else wrapped
 
     async def query(self, user_query: str, session_id: str = "default") -> GraphRAGResponse:
+        """Execute analyze -> retrieve -> fuse -> generate, as one trace."""
+        with tracing.span(
+            "graphrag.query",
+            **{"session.id": session_id, "query.chars": len(user_query or "")},
+        ) as root:
+            response = await self._query(user_query, session_id)
+            tracing.annotate(
+                root,
+                **{
+                    "query.type": response.query_type,
+                    "retrieval.sources": response.retrieval_sources,
+                    "response.degraded": response.degraded,
+                    "response.warnings": response.warnings,
+                    "response.claims": len(response.claims),
+                    "response.citations": len(response.citations),
+                    "response.confidence": response.confidence,
+                },
+            )
+            return response
+
+    async def _query(self, user_query: str, session_id: str = "default") -> GraphRAGResponse:
         """Execute analyze -> retrieve -> fuse -> generate."""
         cache_key = self._build_cache_key(user_query=user_query, session_id=session_id)
         if self.settings.query_cache_enabled:
@@ -69,7 +119,7 @@ class QueryOrchestrator:
         stage_started = time.perf_counter()
         try:
             analysis = await asyncio.wait_for(
-                asyncio.to_thread(self.analyzer.analyze, user_query),
+                asyncio.to_thread(self._traced("analysis", self.analyzer.analyze), user_query),
                 timeout=max(0.1, float(self.settings.query_analysis_timeout_seconds)),
             )
         except Exception as exc:
@@ -88,10 +138,12 @@ class QueryOrchestrator:
         try:
             async_link = getattr(self.entity_linker, "alink_entities", None)
             link_operation = (
-                async_link(analysis.mentioned_entities, query_context=user_query)
+                self._traced("entity_linking", async_link)(
+                    analysis.mentioned_entities, query_context=user_query
+                )
                 if callable(async_link)
                 else asyncio.to_thread(
-                    self.entity_linker.link_entities,
+                    self._traced("entity_linking", self.entity_linker.link_entities),
                     analysis.mentioned_entities,
                     user_query,
                 )
@@ -109,7 +161,7 @@ class QueryOrchestrator:
         graph_task = self._to_thread_or_empty(
             component="graph_retrieval",
             enabled=bool(analysis.retrieval_flags.get("graph")),
-            fn=getattr(self.graph_retriever, "aretrieve", self.graph_retriever.retrieve),
+            fn=self._traced("graph_retrieval", getattr(self.graph_retriever, "aretrieve", self.graph_retriever.retrieve)),
             analysis=analysis,
             linked_entities=linked_entities,
             user_query=user_query,
@@ -118,10 +170,11 @@ class QueryOrchestrator:
         vector_task = self._to_thread_or_empty(
             component="vector_retrieval",
             enabled=bool(analysis.retrieval_flags.get("vector", True)),
-            fn=(
+            fn=self._traced(
+                "vector_retrieval",
                 self._aretrieve_vector_queries
                 if callable(getattr(self.vector_retriever, "aretrieve", None))
-                else self._retrieve_vector_queries
+                else self._retrieve_vector_queries,
             ),
             query=user_query,
             sub_queries=analysis.sub_queries,
@@ -130,7 +183,7 @@ class QueryOrchestrator:
         community_task = self._to_thread_or_empty(
             component="community_retrieval",
             enabled=bool(analysis.retrieval_flags.get("community")),
-            fn=self.community_retriever.retrieve,
+            fn=self._traced("community_retrieval", self.community_retriever.retrieve),
             query=user_query,
             timeout_seconds=self.settings.query_vector_timeout_seconds,
         )
@@ -161,7 +214,7 @@ class QueryOrchestrator:
         try:
             fusion_output = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.fusion_engine.fuse,
+                    self._traced("fusion", self.fusion_engine.fuse),
                     graph_results,
                     vector_results,
                     community_results,
@@ -178,7 +231,7 @@ class QueryOrchestrator:
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.generator.generate,
+                    self._traced("generation", self.generator.generate),
                     user_query,
                     analysis,
                     fusion_output,

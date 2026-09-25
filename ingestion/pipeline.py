@@ -19,6 +19,7 @@ from ingestion.content_classifier import classify_content_sequence, is_graph_ext
 from ingestion.entity_types import display_type, dominant_coarse_class
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
 from ingestion.section_grouper import group_sections
+from observability import tracing
 from ingestion.assertion_builder import AssertionBuilder
 from ingestion.outbox import IngestionOutboxProcessor
 from ingestion.state_store import MetadataStore
@@ -71,10 +72,12 @@ class PhaseOnePipeline:
             profile=self.settings.coref_profile,
             strict=self.settings.strict_coref,
         )
+        tracing.configure_tracing(settings)
         self.chunker = SemanticChunker(
             target_tokens=self.settings.chunk_target_tokens,
             max_tokens=self.settings.chunk_max_tokens,
             overlap_tokens=self.settings.chunk_overlap_tokens,
+            table_block_target_tokens=self.settings.chunk_table_block_target_tokens,
         )
         self.extractor = None
         self.disambiguator = None
@@ -137,6 +140,27 @@ class PhaseOnePipeline:
 
     def ingest_file(self, source_path: Path) -> FileIngestionResult:
         """Ingest one file, preserving the last active version until activation succeeds."""
+        # One span per document. The extraction and embedding calls it makes are
+        # auto-instrumented and nest underneath, which is what architecture 10.1 meant by
+        # "extraction outputs during ingestion": what the model returned for *this* file.
+        with tracing.span(
+            "graphrag.ingest_file",
+            **{"document.source": source_path.name, "document.format": detect_format(source_path.resolve())},
+        ) as current:
+            result = self._ingest_file(source_path)
+            tracing.annotate(
+                current,
+                **{
+                    "document.action": getattr(getattr(result, "action", None), "value", None),
+                    "document.chunks": int(getattr(result, "chunk_count", 0) or 0),
+                    "document.degraded_chunks": int(getattr(result, "degraded_chunks", 0) or 0),
+                    "document.skipped": bool(getattr(result, "skipped", False)),
+                    "document.error": getattr(result, "error", None),
+                },
+            )
+            return result
+
+    def _ingest_file(self, source_path: Path) -> FileIngestionResult:
         started_at = utc_now_iso()
         run_id = str(uuid.uuid4())
         absolute_path = source_path.resolve()

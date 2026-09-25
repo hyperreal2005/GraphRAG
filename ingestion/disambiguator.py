@@ -31,6 +31,8 @@ from ingestion.entity_types import (
     coarse_classes_compatible,
     display_type,
     dominant_coarse_class,
+    names_differ_discriminatively,
+    VALUE_COARSE_CLASSES,
 )
 from models.extraction import ExtractedEntity
 
@@ -83,7 +85,9 @@ class EntityDisambiguator:
             name = entity.name.strip()
             matched = self._match_exact_alias(name, entity.entity_type, canonical_clusters)
             if matched is None:
-                matched = self._match_cluster(embedding, canonical_clusters, entity.entity_type)
+                matched = self._match_cluster(
+                    embedding, canonical_clusters, entity.entity_type, name
+                )
             if matched is None:
                 new_cluster = CanonicalEntity(
                     entity_id=str(uuid.uuid4()),
@@ -160,6 +164,7 @@ class EntityDisambiguator:
         embedding: np.ndarray,
         clusters: list[CanonicalEntity],
         entity_type: str,
+        name: str = "",
     ) -> CanonicalEntity | None:
         """Nearest compatible cluster above the threshold.
 
@@ -167,9 +172,19 @@ class EntityDisambiguator:
         coarse-class disagreement (a person against a place), and otherwise contributes a
         small bonus when the raw types agree.
         """
+        incoming_class = coarse_class(entity_type)
+
+        # Refactor 3 WP4. A quantity or a date is identified by its *value*, and embedding
+        # similarity says nothing about whether two values are equal: measured against
+        # Re-DocRED's human-validated clusters, this merged 908 with 919, 94 million with
+        # 96 million, and July 18 2007 with July 30 2008. Names tolerate fuzzy matching
+        # because a name has variants; a number does not. Exact match has already been
+        # tried by the caller, so for these classes there is nothing further to try.
+        if incoming_class in VALUE_COARSE_CLASSES:
+            return None
+
         best = None
         best_score = -1.0
-        incoming_class = coarse_class(entity_type)
         normalized_type = self._normalize_type(entity_type)
         blocking = bool(self.settings.entity_coarse_class_blocking)
 
@@ -177,6 +192,15 @@ class EntityDisambiguator:
             if cluster.embedding is None:
                 continue
             if blocking and not coarse_classes_compatible(incoming_class, cluster.coarse_class):
+                continue
+            # Refactor 3 WP4: refuse when the two names differ by a token whose whole
+            # purpose is to tell them apart - an ordinal, a generation suffix, a level,
+            # or anything carrying a digit. Embedding similarity washes those out
+            # because they are short and everything around them matches.
+            if name and any(
+                names_differ_discriminatively(name, alias)
+                for alias in (cluster.canonical_name, *cluster.aliases)
+            ):
                 continue
             score = float(np.dot(embedding, cluster.embedding))
             if normalized_type and normalized_type in {
@@ -209,6 +233,15 @@ class EntityDisambiguator:
         blocking = bool(self.settings.entity_coarse_class_blocking)
         for cluster in clusters:
             if blocking and not coarse_classes_compatible(incoming_class, cluster.coarse_class):
+                continue
+            # Refactor 3 WP4: refuse when the two names differ by a token whose whole
+            # purpose is to tell them apart - an ordinal, a generation suffix, a level,
+            # or anything carrying a digit. Embedding similarity washes those out
+            # because they are short and everything around them matches.
+            if name and any(
+                names_differ_discriminatively(name, alias)
+                for alias in (cluster.canonical_name, *cluster.aliases)
+            ):
                 continue
             if any(self._normalize_name(alias) == normalized_name for alias in cluster.aliases):
                 return cluster

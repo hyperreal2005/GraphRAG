@@ -146,6 +146,7 @@ def command_run(args: argparse.Namespace) -> int:
         result.outcomes,
         linked_by_record=result.linked_by_record,
         faithfulness=faithfulness.summary if faithfulness else None,
+        store=MetadataStore(settings.metadata_db_path),
     )
     health = corpus_health.collect(settings, include_graph=not args.no_graph) if args.health else None
 
