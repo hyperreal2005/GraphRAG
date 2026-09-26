@@ -140,6 +140,7 @@ class FusionEngine:
             top_scores=top_scores,
             context_text=context_text,
             community_fallback_used=community_fallback_used,
+            rerank_mode=rerank_mode,
         )
 
     def _apply_rerank(self, user_query: str, ranked: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
@@ -305,6 +306,17 @@ class FusionEngine:
             )
             citations.append(citation)
             by_chunk[chunk_id] = citation
+        # A graph block that displayed its source passage makes that passage citable as
+        # `chunk:<id>`. Without this alias a claim citing the passage it was shown maps to
+        # no citation, and the claim is discarded as unsupported.
+        for item in citable_items:
+            if item.source_type != "graph" or not item.provenance.get("source_chunk_shown"):
+                continue
+            chunk_id = str(item.provenance.get("chunk_id") or "")
+            citation = by_chunk.get(chunk_id)
+            alias = f"chunk:{chunk_id}"
+            if citation is not None and alias not in citation.evidence_ids:
+                citation.evidence_ids.append(alias)
         return citations
 
     def _ensure_evidence_ids(self, results: list[RetrieverResult]) -> None:
@@ -396,6 +408,11 @@ class FusionEngine:
             packed.append(item)
             if graph_chunk_id and include_graph_source:
                 hydrated_graph_chunks.add(graph_chunk_id)
+                if str(item.provenance.get("evidence_text") or "").strip():
+                    # The block displayed its source passage, not just the assertion. The
+                    # generator treats that passage as citable in its own right; see
+                    # AnswerGenerator._alias_shown_source_chunks.
+                    item.provenance["source_chunk_shown"] = True
             total = projected
         return packed, "\n".join(lines)
 

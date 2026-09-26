@@ -124,8 +124,9 @@ class SemanticChunker:
         # block: measured on wp2g, that took MRR 0.749 to 0.678 and graph utility 0.610 to
         # 0.171 against row-per-chunk, while cutting extraction calls 3.3x. A smaller block
         # keeps most of the saving and leaves a table granular enough to rank.
+        # None -> the prose target; <= 0 -> one chunk per row (no grouping at all).
         self.table_block_target_tokens = (
-            int(table_block_target_tokens) if table_block_target_tokens else target_tokens
+            target_tokens if table_block_target_tokens is None else int(table_block_target_tokens)
         )
         if overlap_tokens < 0:
             raise ValueError("overlap_tokens cannot be negative")
@@ -158,7 +159,16 @@ class SemanticChunker:
             nonlocal position
             if not pending_rows:
                 return
-            block_chunks = self._chunk_table_block(document.doc_id, list(pending_rows), position)
+            if self.table_block_target_tokens <= 0:
+                block_chunks = []
+                for row in pending_rows:
+                    block_chunks.extend(
+                        self._chunk_table_row(document.doc_id, row, position + len(block_chunks))
+                    )
+            else:
+                block_chunks = self._chunk_table_block(
+                    document.doc_id, list(pending_rows), position
+                )
             chunks.extend(block_chunks)
             position += len(block_chunks)
             pending_rows.clear()

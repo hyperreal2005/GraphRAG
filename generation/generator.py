@@ -125,6 +125,7 @@ class AnswerGenerator:
             for item in fusion.context_items
             if str(item.provenance.get("evidence_id") or "").strip()
         }
+        self._alias_shown_source_chunks(evidence, fusion.context_items)
         warnings: list[str] = []
         claims: list[AnswerClaim]
         model_answer = ""
@@ -377,6 +378,47 @@ class AnswerGenerator:
         self.last_usage = add_usage(self.last_usage, extract_usage_metadata(response))
         return str(getattr(response, "text", "") or "").strip()
 
+    @staticmethod
+    def _alias_shown_source_chunks(
+        evidence: dict[str, RetrieverResult], items: list[RetrieverResult]
+    ) -> None:
+        """Make a graph block's displayed source passage citable as `chunk:<id>`.
+
+        A graph evidence block shows two things: the assertion, and - for the first block
+        drawn from each chunk - the exact source passage it was extracted from, with that
+        passage's chunk id on its Source line. The model reads the passage and cites it as
+        `chunk:<id>`, the form every other passage uses. No evidence item carried that id,
+        so the citation was rejected as unknown and a correct answer discarded.
+
+        Measured on the PDF/table arm: 4 of 48 answerable questions lost every claim this
+        way with the gold passage in the context - twice at rank 1 - while the news arm
+        lost none, because table rows are what become literal-bearing graph assertions.
+        """
+        for item in items:
+            if item.source_type != "graph" or not item.provenance.get("source_chunk_shown"):
+                continue
+            chunk_id = str(item.provenance.get("chunk_id") or "").strip()
+            alias = f"chunk:{chunk_id}"
+            if not chunk_id or alias in evidence:
+                continue
+            evidence[alias] = RetrieverResult(
+                source_type="vector",
+                source_id=chunk_id,
+                text_or_path=str(item.provenance.get("evidence_text") or ""),
+                score_raw=float(item.score_raw),
+                score_fused=float(item.score_fused),
+                score_reranked=item.score_reranked,
+                provenance={
+                    "chunk_id": chunk_id,
+                    "doc_id": item.provenance.get("doc_id"),
+                    "section_heading": item.provenance.get("section_heading"),
+                    "page": item.provenance.get("page"),
+                    "document_version_id": item.provenance.get("document_version_id"),
+                    "evidence_id": alias,
+                    "shown_via_graph_evidence": str(item.provenance.get("evidence_id") or ""),
+                },
+            )
+
     def _claim_matches_literal_assertions(
         self,
         text: str,
@@ -388,9 +430,38 @@ class AnswerGenerator:
             if item.source_type != "graph" or item.provenance.get("object_kind") != "literal":
                 continue
             raw_value = item.provenance.get("literal_value_json")
-            if raw_value is None or not self._literal_value_appears_in_claim(text, raw_value):
-                return False
+            if raw_value is not None and self._literal_value_appears_in_claim(text, raw_value):
+                continue
+            if self._numbers_grounded_in_shown_source(text, item):
+                continue
+            return False
         return True
+
+    @staticmethod
+    def _numbers_grounded_in_shown_source(text: str, item: RetrieverResult) -> bool:
+        """A numeric claim citing a graph block, grounded in the passage that block showed.
+
+        The literal rule stops a claim citing "X -[FOUNDED_IN]-> 1998" from asserting a
+        different year. But a block that displayed its source passage offers that passage
+        too, and the model cites the block for it: a table row whose assertion carries one
+        cell (100,915) while the claim states another cell from the same row (18,245).
+        Accepted only when the claim contains at least one number and **every** number in
+        it appears in the displayed passage; a claim without numbers keeps the strict rule.
+        """
+        if not item.provenance.get("source_chunk_shown"):
+            return False
+        source = str(item.provenance.get("evidence_text") or "")
+        pattern = re.compile(r"\d+(?:\.\d+)?")
+
+        def numbers(value: str) -> set[float]:
+            cleaned = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", value)
+            # PDF extraction can space out a decimal point ("0 . 85"); a claim that states
+            # it correctly as 0.85 must still match. Found on the PDF/table judged arm.
+            cleaned = re.sub(r"(?<=\d)\s+\.\s+(?=\d)", ".", cleaned)
+            return {float(n) for n in pattern.findall(cleaned)}
+
+        claimed = numbers(text)
+        return bool(claimed) and claimed <= numbers(source)
 
     @staticmethod
     def _literal_value_appears_in_claim(text: str, raw_value: Any) -> bool:

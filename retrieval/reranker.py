@@ -11,12 +11,46 @@ normal path.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Any
 
 from config import Settings
 from models.query import RetrieverResult
 
 logger = logging.getLogger(__name__)
+
+_COHERE_PACE_LOCK = threading.Lock()
+_COHERE_LAST_CALL_AT = 0.0
+
+
+def _pace_cohere(min_interval: float, *, max_wait: float = float("inf")) -> bool:
+    """Process-wide minimum gap between Cohere calls. Off (0) by default.
+
+    Trial keys are rate-limited per minute. Pacing keeps a run under the limit instead of
+    relying on 429s, each of which would otherwise degrade that query to no reranking.
+    Returns False - without sleeping or taking the slot - when the required wait exceeds
+    `max_wait`, so a caller with a deadline can degrade instead of overrunning it.
+    """
+    if min_interval <= 0:
+        return max_wait >= 0
+    global _COHERE_LAST_CALL_AT
+    with _COHERE_PACE_LOCK:
+        wait = _COHERE_LAST_CALL_AT + min_interval - time.monotonic()
+        if wait > max_wait:
+            return False
+        if wait > 0:
+            time.sleep(wait)
+        _COHERE_LAST_CALL_AT = time.monotonic()
+        return True
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status == 429:
+        return True
+    text = f"{type(exc).__name__} {exc}"
+    return "429" in text or "TooManyRequests" in text or "rate limit" in text.lower()
 
 # Loading a cross-encoder costs seconds, and a FusionEngine is constructed per query in
 # some paths. Keyed by model name so a settings change is still honoured.
@@ -199,13 +233,50 @@ class QueryReranker:
 
         top_n = min(len(items), max(1, int(self.settings.query_rerank_top_n)))
         documents = [self._document_text(item) for item in items]
+        # A throttled call is retried inside a small total budget, then degrades. The
+        # budget must sit well under the fusion stage's deadline: overrunning it loses the
+        # whole fused context, which is far worse than one unreranked query. The same
+        # mistake was made once already, in the embedder (docs/ERRORS.md 2026-09-05).
+        budget = max(0.0, float(self.settings.query_rerank_rate_limit_max_total_seconds))
+        request_timeout = max(1.0, float(self.settings.query_rerank_request_timeout_seconds))
+        # One deadline for pacing, requests and retries together, fixed at entry. The
+        # fusion stage that contains this call has its own deadline, and overrunning it
+        # discards the whole fused context: better to return fused order unreranked than
+        # to lose the answer. Each step checks it can still finish before starting.
+        deadline = time.monotonic() + max(1.0, float(self.settings.query_rerank_total_budget_seconds))
+        spent = 0.0
+        response = None
+        for attempt in range(4):
+            remaining = deadline - time.monotonic()
+            if not _pace_cohere(
+                float(self.settings.query_rerank_min_interval_seconds),
+                max_wait=remaining - request_timeout,
+            ):
+                logger.warning("cohere_rerank_degraded reason=pacing_would_exceed_deadline")
+                return self._degrade(clean_query, items)
+            try:
+                response = self._client.rerank(
+                    model=self.settings.query_rerank_model,
+                    query=clean_query,
+                    documents=documents,
+                    top_n=top_n,
+                )
+                break
+            except Exception as exc:
+                delay = 1.0 * (2**attempt)
+                too_late = time.monotonic() + delay + request_timeout > deadline
+                if not _is_rate_limited(exc) or spent + delay > budget or too_late:
+                    logger.warning(
+                        "cohere_rerank_degraded error_type=%s rate_limited=%s",
+                        type(exc).__name__,
+                        _is_rate_limited(exc),
+                    )
+                    return self._degrade(clean_query, items)
+                time.sleep(delay)
+                spent += delay
+        if response is None:
+            return self._degrade(clean_query, items)
         try:
-            response = self._client.rerank(
-                model=self.settings.query_rerank_model,
-                query=clean_query,
-                documents=documents,
-                top_n=top_n,
-            )
             ranking = self._extract_ranking(response)
         except Exception:
             return self._degrade(clean_query, items)
@@ -235,7 +306,13 @@ class QueryReranker:
         client_v2 = getattr(self._cohere_module, "ClientV2", None)
         if client_v2 is not None:
             try:
-                return client_v2(api_key=api_key)
+                # A per-request ceiling. Without one a stalled call waits on the SDK's own
+                # default, the fusion stage's deadline fires first, and the whole fused
+                # context is discarded - seven questions in one judged run, 2026-09-26.
+                return client_v2(
+                    api_key=api_key,
+                    timeout=max(1.0, float(self.settings.query_rerank_request_timeout_seconds)),
+                )
             except TypeError:
                 try:
                     return client_v2(api_key)

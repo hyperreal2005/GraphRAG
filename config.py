@@ -17,10 +17,12 @@ class Settings:
     chunk_target_tokens: int = 700
     chunk_max_tokens: int = 800
     chunk_overlap_tokens: int = 100
-    # Table rows are grouped into blocks up to this many tokens; prose keeps
-    # chunk_target_tokens. Defaults to the prose target (the wp2g behaviour) until the
-    # smaller-block experiment is measured - see docs/REFACTOR3.md WP12/WP14.
-    chunk_table_block_target_tokens: int = 700
+    # 0 = one chunk per table row (the wp2f corpus of record). A positive value groups
+    # consecutive rows into blocks of up to that many tokens (the wp2g rebuild).
+    # Measured on the PDF/table judged arm with Cohere reranking, 2026-09-26: rows answered
+    # 48/48, blocks 44/48 - a row is a precise match for a single cell, a block dilutes it.
+    # Blocks cost 3.3x fewer extraction calls; answers are the product. See REFACTOR3 WP19.
+    chunk_table_block_target_tokens: int = 0
     # WP2-A: merge parser items into logical sections before coref/chunking (B1).
     section_group_enabled: bool = True
     section_group_target_tokens: int = 700
@@ -277,13 +279,29 @@ class Settings:
     query_temperature_hybrid: float = 0.2
     cohere_api_key: str | None = None
     query_rerank_enabled: bool = True
-    query_rerank_model: str = "rerank-v3.5"
+    # rerank-v4.0-pro on measurement (REFACTOR3 WP17, WP19). Swept offline on the judged
+    # news questions, recall@10 / MRR: rank fusion 0.959 / 0.629, rerank-v3.5 0.918 / 0.755,
+    # rerank-v4.0-pro 0.980 / 0.809. Live on the corpus of record it reads MRR 0.820 on the
+    # tuned set and 0.813 on 60 held-out questions, against a 0.75 gate.
+    query_rerank_model: str = "rerank-v4.0-pro"
     query_rerank_top_n: int = 15
-    # Phase 6 shipped a Cohere adapter and a "deterministic fallback" that returned the
-    # input order unchanged. No Cohere key has ever been configured here, so reranking has
-    # never actually run. This is the architecture's own stated alternative (5.5): a local
-    # cross-encoder, no key, no per-query cost, ~0.65 s for 60 candidates on CPU. Default
-    # is decided by measurement, not by preference.
+    # Cohere rate limiting. Pacing is off by default; set it for a trial key (limited per
+    # minute) so a run stays under the limit rather than degrading queries on 429. The
+    # retry budget must stay well under query_rerank_timeout_seconds, which bounds the
+    # whole fusion stage: overrunning it loses the fused context entirely.
+    query_rerank_min_interval_seconds: float = 0.0
+    query_rerank_rate_limit_max_total_seconds: float = 3.0
+    # Per-request ceiling on a Cohere call, and one deadline for pacing + requests +
+    # retries together. Both sit inside query_rerank_timeout_seconds, which bounds the
+    # whole fusion stage: a stalled call used to outlive it and discard the fused context
+    # (seven questions in one judged run). Now reranking degrades to fused order instead.
+    query_rerank_request_timeout_seconds: float = 5.0
+    query_rerank_total_budget_seconds: float = 10.0
+    # The architecture's stated alternative to Cohere (5.5): a local cross-encoder, no key,
+    # no per-query cost, ~0.65 s for 60 candidates on CPU. Phase 6's "fallback" returned the
+    # input order unchanged, so until WP17 no reranker had ever run. Measured, every
+    # cross-encoder made retrieval worse than no reranking (table below). It stays a
+    # fallback tier behind Cohere, off by default.
     query_rerank_local_enabled: bool = False
     query_rerank_local_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     query_rerank_local_max_items: int = 60
@@ -694,6 +712,12 @@ class Settings:
         except ValueError:
             self.extraction_retry_base_seconds = self.extraction_retry_base_seconds
         self.query_rerank_model = os.getenv("QUERY_RERANK_MODEL", self.query_rerank_model)
+        try:
+            self.query_rerank_min_interval_seconds = float(
+                os.getenv("QUERY_RERANK_MIN_INTERVAL_SECONDS", self.query_rerank_min_interval_seconds)
+            )
+        except (TypeError, ValueError):
+            self.query_rerank_min_interval_seconds = self.query_rerank_min_interval_seconds
         self.query_rerank_local_model = os.getenv(
             "QUERY_RERANK_LOCAL_MODEL", self.query_rerank_local_model
         )

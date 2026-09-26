@@ -112,6 +112,12 @@ class FusionOutput(QueryModel):
     top_scores: list[float] = Field(default_factory=list)
     context_text: str = ""
     community_fallback_used: bool = False
+    # Which reranking tier actually ordered this context: "cohere", "llm",
+    # "local_cross_encoder", "unranked_passthrough", "disabled" or "empty". Recorded
+    # because every tier degrades silently to the next on error, so a rate-limited or
+    # failing reranker produces a plausible result from a component that never ran -
+    # which is how Phase 6's reranking went unexecuted for four phases unnoticed.
+    rerank_mode: str = ""
 
 
 class GraphRAGResponse(QueryModel):
