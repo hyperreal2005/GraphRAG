@@ -18,16 +18,29 @@ class Settings:
     chunk_max_tokens: int = 800
     chunk_overlap_tokens: int = 100
     # 0 = one chunk per table row (the wp2f corpus of record). A positive value groups
-    # consecutive rows into blocks of up to that many tokens (the wp2g rebuild).
+    # consecutive rows into blocks of up to that many tokens (wp2g was built with 700).
     # Measured on the PDF/table judged arm with Cohere reranking, 2026-09-26: rows answered
-    # 48/48, blocks 44/48 - a row is a precise match for a single cell, a block dilutes it.
+    # 47/47, blocks 44/47 - a row is a precise match for a single cell, a block dilutes it.
     # Blocks cost 3.3x fewer extraction calls; answers are the product. See REFACTOR3 WP19.
+    # Part of the pipeline fingerprint: ingesting into a corpus built with another value
+    # rebuilds it (env CHUNK_TABLE_BLOCK_TARGET_TOKENS).
     chunk_table_block_target_tokens: int = 0
     # WP2-A: merge parser items into logical sections before coref/chunking (B1).
     section_group_enabled: bool = True
     section_group_target_tokens: int = 700
     section_group_max_tokens: int = 2000
     section_group_page_gap_tolerance: int = 1
+    # Coreference annotates the text extraction reads - "it [Rusnano]" - and never the
+    # stored text (ingestion.coref). Until 2026-09-27 the stage ran and changed nothing: it
+    # read a resolved text fastcoref never returns (REFACTOR3 WP20).
+    # OFF BY MEASUREMENT. Re-DocRED, 100 documents, two runs off and one on, compared per
+    # document: overall entity recall -17 +/- 16 gold entities, connected pairs -11 +/- 15,
+    # relation precision unchanged - no gain. ORG and TIME rose and MISC and LOC fell,
+    # within noise except on list-heavy documents, where annotation systematically cost
+    # entities: Ramey Idriss's songs 13/14 found in 3 of 3 plain extractions, 3-9 annotated.
+    # Off means the model is not loaded. On, it joins the pipeline fingerprint, so enabling
+    # it re-ingests a corpus built without it (env COREF_ENABLED).
+    coref_enabled: bool = False
     coref_profile: str = "balanced"
     strict_coref: bool = True
     enable_graph: bool = True
@@ -360,6 +373,16 @@ class Settings:
             )
         except ValueError:
             pass
+        try:
+            self.chunk_table_block_target_tokens = max(
+                0,
+                int(os.getenv("CHUNK_TABLE_BLOCK_TARGET_TOKENS", self.chunk_table_block_target_tokens)),
+            )
+        except ValueError:
+            pass
+        coref_raw = os.getenv("COREF_ENABLED")
+        if coref_raw is not None:
+            self.coref_enabled = coref_raw.strip().lower() not in {"0", "false", "no", "off", ""}
         try:
             self.section_group_page_gap_tolerance = max(
                 0,

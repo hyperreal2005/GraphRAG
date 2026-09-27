@@ -86,6 +86,10 @@ class Section:
     char_end: int | None = None
     bbox: tuple[float, float, float, float] | None = None
     provenance: list[SectionProvenance] = field(default_factory=list)
+    # Coreference annotations: (offset, text) insertions into `text.strip()`, applied only
+    # to the text extraction reads. The section's own text is never rewritten, so stored,
+    # embedded and cited chunks stay verbatim.
+    coref_annotations: list[tuple[int, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -110,6 +114,8 @@ class Section:
             payload["bbox"] = list(self.bbox)
         if self.provenance:
             payload["provenance"] = [item.to_dict() for item in self.provenance]
+        if self.coref_annotations:
+            payload["coref_annotations"] = [list(item) for item in self.coref_annotations]
         return payload
 
 
@@ -155,9 +161,12 @@ class Chunk:
     content_kind: str = "body"
     provenance: list[SectionProvenance] = field(default_factory=list)
     pages: list[int] = field(default_factory=list)
+    # What extraction reads when it differs from `text`: the same words with coreference
+    # annotations inserted. None when there is nothing to annotate.
+    extraction_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "doc_id": self.doc_id,
             "chunk_id": self.chunk_id,
             "position": self.position,
@@ -173,6 +182,9 @@ class Chunk:
             "pages": list(self.pages),
             "provenance": [item.to_dict() for item in self.provenance],
         }
+        if self.extraction_text is not None:
+            payload["extraction_text"] = self.extraction_text
+        return payload
 
 
 @dataclass

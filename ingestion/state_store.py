@@ -381,6 +381,9 @@ class MetadataStore:
                 "content_kind": "TEXT NOT NULL DEFAULT 'body'",
                 # WP2-D: change detection that survives a position shift.
                 "content_hash": "TEXT",
+                # WP20: what extraction read, when it was not `text` (coreference annotations).
+                # Extraction reuse compares inputs, so it needs the old one.
+                "extraction_text": "TEXT",
             },
             "entity_mentions": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
             "doc_entities": {"document_version_id": "TEXT", "active": "INTEGER NOT NULL DEFAULT 1"},
@@ -990,8 +993,8 @@ class MetadataStore:
                 INSERT INTO chunks (
                     chunk_id, doc_id, text, token_count, position, section, page,
                     chunk_hash, embedding_version, content_kind, content_hash,
-                    document_version_id, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    document_version_id, extraction_text, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
@@ -1003,6 +1006,7 @@ class MetadataStore:
                     content_kind = excluded.content_kind,
                     content_hash = excluded.content_hash,
                     document_version_id = excluded.document_version_id,
+                    extraction_text = excluded.extraction_text,
                     active = 0
                 """,
                 [
@@ -1019,6 +1023,7 @@ class MetadataStore:
                         chunk.content_kind,
                         chunk.content_hash,
                         document_version_id,
+                        chunk.extraction_text,
                     )
                     for chunk in chunks
                 ],
@@ -1430,6 +1435,20 @@ class MetadataStore:
                 ("failed", "FAILED", error_message, doc_id),
             )
 
+    def get_extraction_inputs(self, doc_id: str, document_version_id: str) -> dict[str, str]:
+        """Map chunk_id -> the text extraction read, for one version's active chunks: the
+        coreference-annotated copy where there was one, the chunk's text otherwise."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_id, coalesce(extraction_text, text) AS extraction_input
+                FROM chunks
+                WHERE doc_id = ? AND document_version_id = ? AND active = 1
+                """,
+                (doc_id, document_version_id),
+            ).fetchall()
+        return {str(row["chunk_id"]): str(row["extraction_input"] or "") for row in rows}
+
     def get_content_hashes(
         self,
         doc_id: str,
@@ -1554,8 +1573,8 @@ class MetadataStore:
                 INSERT INTO chunks (
                     chunk_id, doc_id, text, token_count, position, section, page,
                     chunk_hash, embedding_version, content_kind, content_hash,
-                    document_version_id, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    document_version_id, extraction_text, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     text = excluded.text,
                     token_count = excluded.token_count,
@@ -1566,6 +1585,7 @@ class MetadataStore:
                     content_kind = excluded.content_kind,
                     content_hash = excluded.content_hash,
                     document_version_id = excluded.document_version_id,
+                    extraction_text = excluded.extraction_text,
                     active = excluded.active
                 """,
                 [
@@ -1582,6 +1602,7 @@ class MetadataStore:
                         chunk.content_kind,
                         chunk.content_hash,
                         document_version_id,
+                        chunk.extraction_text,
                         int(active),
                     )
                     for chunk in chunks

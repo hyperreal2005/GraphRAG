@@ -14,6 +14,7 @@ from pathlib import Path
 
 from config import Settings
 from ingestion.chunker import CHUNK_FINGERPRINT_VERSION, SemanticChunker
+from ingestion.coref import ANNOTATION_VERSION as COREF_ANNOTATION_VERSION
 from ingestion.coref import CoreferenceResolver
 from ingestion.content_classifier import classify_content_sequence, is_graph_extractable
 from ingestion.entity_types import display_type, dominant_coarse_class
@@ -40,6 +41,83 @@ def utc_now_iso() -> str:
 
 
 INGESTION_PIPELINE_VERSION = "refactor2-grouped-sections-v1"
+
+# Fingerprint keys added after corpora were already stamped without them. A stored
+# fingerprint may predate any of these, so reproducing one must be tried without them too.
+FINGERPRINT_KEYS_ADDED_LATER = ("chunk_table_block_target_tokens",)
+
+
+def pipeline_fingerprint_payload(settings: Settings, target_stage: str) -> dict[str, object]:
+    """Every setting that decides what an ingest writes. A document stamped with a different
+    fingerprint is re-ingested, so a setting missing here can change the output silently.
+
+    `chunk_table_block_target_tokens` was missing until 2026-09-27: one chunk per table row
+    and merged table blocks produce different chunks from the same file, yet corpora built
+    each way carried the same pipeline identity (REFACTOR3 WP20).
+    """
+    graph = settings.enable_graph
+    payload = _base_fingerprint_payload(settings, target_stage, graph)
+    # Present only when coreference annotation is on, so every corpus built while it was a
+    # no-op keeps its identity, and a corpus built with it gets a different one.
+    if settings.coref_enabled:
+        payload["coref_annotation"] = COREF_ANNOTATION_VERSION
+    return payload
+
+
+def _base_fingerprint_payload(settings: Settings, target_stage: str, graph: bool) -> dict[str, object]:
+    return {
+        "pipeline_version": INGESTION_PIPELINE_VERSION,
+        "chunk_fingerprint_version": CHUNK_FINGERPRINT_VERSION,
+        "target_stage": target_stage,
+        "coref_profile": settings.coref_profile,
+        "strict_coref": settings.strict_coref,
+        "chunk_target_tokens": settings.chunk_target_tokens,
+        "chunk_max_tokens": settings.chunk_max_tokens,
+        "chunk_overlap_tokens": settings.chunk_overlap_tokens,
+        "chunk_table_block_target_tokens": settings.chunk_table_block_target_tokens,
+        "section_group_enabled": settings.section_group_enabled,
+        "section_group_target_tokens": settings.section_group_target_tokens,
+        "section_group_max_tokens": settings.section_group_max_tokens,
+        "section_group_page_gap_tolerance": settings.section_group_page_gap_tolerance,
+        "gemini_model": settings.gemini_model if graph else None,
+        "extraction_prompt_version": settings.extraction_prompt_version if graph else None,
+        "graph_exclude_reference_sections": settings.graph_exclude_reference_sections if graph else None,
+        "disamb_model": settings.disamb_model if graph else None,
+        "disamb_threshold": settings.disamb_threshold if graph else None,
+        "embedding_model_id": settings.embedding_model_id if graph else None,
+        "embedding_version": settings.embedding_version if graph else None,
+        "embedding_prompt_version": settings.embedding_prompt_version if graph else None,
+        "embedding_normalization_policy": settings.embedding_normalization_policy if graph else None,
+        "embedding_document_prefix": settings.embedding_document_prefix if graph else None,
+        "embedding_query_prefix": settings.embedding_query_prefix if graph else None,
+        "graph_schema_version": settings.graph_schema_version if graph else None,
+        "cross_doc_auto_merge_threshold": settings.cross_doc_auto_merge_threshold if graph else None,
+        "cross_doc_auto_merge_margin": settings.cross_doc_auto_merge_margin if graph else None,
+        "cross_doc_llm_confidence_threshold": settings.cross_doc_llm_confidence_threshold if graph else None,
+    }
+
+
+def embedding_contract(settings: Settings) -> dict[str, str]:
+    """The store-level embedding record. A store holds vectors from one embedding only, so
+    ingestion refuses to start when this differs from the settings it runs with."""
+    return {
+        "embedding_model_id": settings.embedding_model_id,
+        "embedding_dim": str(settings.embedding_dim),
+        "embedding_version": settings.embedding_version,
+        "embedding_prompt_version": settings.embedding_prompt_version,
+        "embedding_normalization_policy": settings.embedding_normalization_policy,
+        "embedding_document_prefix": settings.embedding_document_prefix,
+        "embedding_query_prefix": settings.embedding_query_prefix,
+    }
+
+
+def fingerprint_of(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def pipeline_fingerprint(settings: Settings, target_stage: str) -> str:
+    return fingerprint_of(pipeline_fingerprint_payload(settings, target_stage))
 
 
 @dataclass
@@ -71,6 +149,7 @@ class PhaseOnePipeline:
         self.coref = CoreferenceResolver(
             profile=self.settings.coref_profile,
             strict=self.settings.strict_coref,
+            enabled=self.settings.coref_enabled,
         )
         tracing.configure_tracing(settings)
         self.chunker = SemanticChunker(
@@ -330,6 +409,12 @@ class PhaseOnePipeline:
                     "reference_chunks": sum(
                         1 for chunk in chunks if chunk.content_kind == "reference"
                     ),
+                    # Counted so a coreference stage that annotates nothing reads as zero.
+                    # For months it returned every section unchanged and reported success.
+                    "coref_sections": self.coref.last_stats.sections,
+                    "coref_annotations": self.coref.last_stats.annotations,
+                    "coref_failures": self.coref.last_stats.failures,
+                    "annotated_chunks": sum(1 for chunk in chunks if chunk.extraction_text),
                 },
             )
 
@@ -414,12 +499,15 @@ class PhaseOnePipeline:
     ) -> ExtractionReusePlan:
         """Decide which chunks can carry their assertions forward instead of re-extracting.
 
-        Architecture finding `A4`, second half. A chunk qualifies when its position-free
-        `content_hash` matches an active chunk of the previous version — the text is
-        identical, so a second extraction call would buy a re-derivation of facts already
-        held. Reuse is refused, and the chunk extracted normally, whenever an entity the
-        prior assertions reference is no longer readable in the graph: a reused assertion
-        must never point at an endpoint the new version does not contain.
+        Architecture finding `A4`, second half. A chunk qualifies when the text extraction
+        would read is identical to what an active chunk of the previous version was
+        extracted from, so a second call would buy a re-derivation of facts already held.
+        That text is the coreference-annotated copy where there is one (WP20): matching on
+        the stored text alone would carry unannotated extractions forward when annotation is
+        switched on, and it would never take effect. Reuse is refused, and the chunk
+        extracted normally, whenever an entity the prior assertions reference is no longer
+        readable in the graph: a reused assertion must never point at an endpoint the new
+        version does not contain.
         """
         empty = ExtractionReusePlan()
         if not self.settings.extraction_reuse_enabled or not active_version_id:
@@ -427,13 +515,17 @@ class PhaseOnePipeline:
         if self.graph_writer is None:
             return empty
 
-        prior_by_hash = self.store.get_content_hashes(doc_id, active_version_id, active_only=True)
-        if not prior_by_hash:
+        prior_by_input = {
+            text: chunk_id
+            for chunk_id, text in self.store.get_extraction_inputs(doc_id, active_version_id).items()
+            if text
+        }
+        if not prior_by_input:
             return empty
         candidates = {
-            chunk.chunk_id: prior_by_hash[chunk.content_hash]
+            chunk.chunk_id: prior_by_input[chunk.extraction_text or chunk.text]
             for chunk in chunks
-            if chunk.content_hash and chunk.content_hash in prior_by_hash
+            if (chunk.extraction_text or chunk.text) in prior_by_input
         }
         if not candidates:
             return empty
@@ -587,7 +679,9 @@ class PhaseOnePipeline:
             discarding 193 good extractions to punish one bad one.
             """
             try:
-                raw_result = self.extractor.extract(chunk.text, doc_format)
+                # The annotated copy when coreference found something to name; the chunk's
+                # stored text otherwise. Stored text is what gets cited, so it stays verbatim.
+                raw_result = self.extractor.extract(chunk.extraction_text or chunk.text, doc_format)
                 return chunk, self._scope_extraction_result(chunk.chunk_id, raw_result)
             except Exception as exc:
                 quarantined.append((chunk.chunk_id, f"{type(exc).__name__}: {exc}"))
@@ -1103,41 +1197,7 @@ class PhaseOnePipeline:
             )
 
     def _pipeline_fingerprint(self, target_stage: str) -> str:
-        payload = {
-            "pipeline_version": INGESTION_PIPELINE_VERSION,
-            "chunk_fingerprint_version": CHUNK_FINGERPRINT_VERSION,
-            "target_stage": target_stage,
-            "coref_profile": self.settings.coref_profile,
-            "strict_coref": self.settings.strict_coref,
-            "chunk_target_tokens": self.settings.chunk_target_tokens,
-            "chunk_max_tokens": self.settings.chunk_max_tokens,
-            "chunk_overlap_tokens": self.settings.chunk_overlap_tokens,
-            "section_group_enabled": self.settings.section_group_enabled,
-            "section_group_target_tokens": self.settings.section_group_target_tokens,
-            "section_group_max_tokens": self.settings.section_group_max_tokens,
-            "section_group_page_gap_tolerance": self.settings.section_group_page_gap_tolerance,
-            "gemini_model": self.settings.gemini_model if self.settings.enable_graph else None,
-            "extraction_prompt_version": self.settings.extraction_prompt_version if self.settings.enable_graph else None,
-            "graph_exclude_reference_sections": (
-                self.settings.graph_exclude_reference_sections
-                if self.settings.enable_graph
-                else None
-            ),
-            "disamb_model": self.settings.disamb_model if self.settings.enable_graph else None,
-            "disamb_threshold": self.settings.disamb_threshold if self.settings.enable_graph else None,
-            "embedding_model_id": self.settings.embedding_model_id if self.settings.enable_graph else None,
-            "embedding_version": self.settings.embedding_version if self.settings.enable_graph else None,
-            "embedding_prompt_version": self.settings.embedding_prompt_version if self.settings.enable_graph else None,
-            "embedding_normalization_policy": self.settings.embedding_normalization_policy if self.settings.enable_graph else None,
-            "embedding_document_prefix": self.settings.embedding_document_prefix if self.settings.enable_graph else None,
-            "embedding_query_prefix": self.settings.embedding_query_prefix if self.settings.enable_graph else None,
-            "graph_schema_version": self.settings.graph_schema_version if self.settings.enable_graph else None,
-            "cross_doc_auto_merge_threshold": self.settings.cross_doc_auto_merge_threshold if self.settings.enable_graph else None,
-            "cross_doc_auto_merge_margin": self.settings.cross_doc_auto_merge_margin if self.settings.enable_graph else None,
-            "cross_doc_llm_confidence_threshold": self.settings.cross_doc_llm_confidence_threshold if self.settings.enable_graph else None,
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return pipeline_fingerprint(self.settings, target_stage)
 
     @staticmethod
     def _is_active_generation_current(
@@ -1244,15 +1304,7 @@ class PhaseOnePipeline:
         )
 
     def _ensure_embedding_metadata(self) -> None:
-        expected = {
-            "embedding_model_id": self.settings.embedding_model_id,
-            "embedding_dim": str(self.settings.embedding_dim),
-            "embedding_version": self.settings.embedding_version,
-            "embedding_prompt_version": self.settings.embedding_prompt_version,
-            "embedding_normalization_policy": self.settings.embedding_normalization_policy,
-            "embedding_document_prefix": self.settings.embedding_document_prefix,
-            "embedding_query_prefix": self.settings.embedding_query_prefix,
-        }
+        expected = embedding_contract(self.settings)
         stored_model = self.store.get_system_metadata("embedding_model_id")
         if stored_model is None:
             for key, value in expected.items():
@@ -1265,8 +1317,9 @@ class PhaseOnePipeline:
         }
         if mismatches:
             raise RuntimeError(
-                "Embedding corpus metadata mismatch. Rebuild vectors before ingestion: "
-                f"{mismatches}"
+                "Embedding corpus metadata mismatch. Rebuild vectors before ingestion "
+                "(scripts/reembed_corpus.py); if they were already rebuilt, record it with "
+                f"scripts/restamp_after_reembed.py: {mismatches}"
             )
 
     def _remap_canonical_nodes(

@@ -8,6 +8,7 @@ import re
 import uuid
 from dataclasses import dataclass
 
+from ingestion.coref import annotate
 from models.ingestion import Chunk, ParsedDocument, Section, SectionType
 
 
@@ -141,18 +142,17 @@ class SemanticChunker:
         chunks: list[Chunk] = []
         position = 0
 
-        # Consecutive table rows under one heading are accumulated and emitted as a block
-        # rather than one chunk per row. Measured on the working corpus: 72.2% of PDF body
-        # chunks were single rows under 100 tokens, which is why the mean active chunk size
-        # reads 153.8 against a 600-800 gate, and why extraction costs one provider call
-        # per row - 2,000 calls for PDF bodies against 676 for blocks, a 3.0x difference.
+        # Consecutive table rows under one heading are accumulated, then emitted one chunk
+        # per row (table_block_target_tokens <= 0, the default) or merged into blocks.
         #
-        # A row is not the right unit for either job. For extraction, batching rows into
-        # one call without merging them would need per-assertion provenance the schema does
-        # not carry, so an assertion could silently land on the wrong row and break the
-        # exactness gate 6 protects. For retrieval, a 44-token row carries no context: the
-        # column meanings live in the header and the comparison lives in the sibling rows.
-        # Merging keeps one chunk to one extraction and one citation, by construction.
+        # Blocks were built for cost: 72.2% of PDF body chunks were single rows under 100
+        # tokens, and extraction costs one provider call per chunk - 2,000 calls for PDF
+        # bodies against 676 for blocks. They were expected to help retrieval too, on the
+        # argument that a 44-token row carries no context. Measured on a judged arm of table
+        # questions, the opposite held: rows answered 47/47 and blocks 44/47, because a row
+        # is a precise match for a single cell and a block dilutes it (REFACTOR3 WP19). The
+        # cheaper extraction that remains open is batching rows into one call while keeping
+        # row chunks, which needs per-assertion row provenance the schema does not carry yet.
         pending_rows: list[Section] = []
 
         def flush_rows() -> None:
@@ -327,6 +327,7 @@ class SemanticChunker:
                     content_hash=content_digest,
                     provenance=list(section.provenance),
                     pages=_pages_of(section),
+                    extraction_text=self._extraction_text(section, text, 0, len(text)),
                 )
             ]
 
@@ -388,6 +389,9 @@ class SemanticChunker:
                     content_hash=content_digest,
                     provenance=list(section.provenance),
                     pages=_pages_of(section),
+                    extraction_text=self._extraction_text(
+                        section, text, current[0].start, current[-1].end
+                    ),
                 )
             )
             local_position += 1
@@ -412,6 +416,23 @@ class SemanticChunker:
             start_index = max(overlap_start, start_index + 1)
 
         return chunks
+
+    def _extraction_text(self, section: Section, text: str, start: int, end: int) -> str | None:
+        """The chunk's own words with the coreference annotations that fall inside it, for
+        extraction to read. None when there are none, so extraction reads `text` itself.
+
+        Annotations are offsets into the stripped section text - the same `text` sliced
+        here - so a chunk picks up exactly the mentions it contains.
+        """
+        inside = [
+            (offset - start, label)
+            for offset, label in section.coref_annotations
+            if start < offset <= end
+        ]
+        if not inside:
+            return None
+        annotated = annotate(text[start:end], inside)
+        return self.slice_text(annotated, 0, len(annotated))
 
     @staticmethod
     def slice_text(source: str, start: int, end: int) -> str:
