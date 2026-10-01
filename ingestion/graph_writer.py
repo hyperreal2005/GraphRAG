@@ -728,7 +728,7 @@ class GraphWriter:
                     doc_id=doc_id,
                     document_version_id=document_version_id,
                     chunk_id=str(row["chunk_id"]),
-                    extractor_model=str(row.get("extractor_model") or self.settings.gemini_model),
+                    extractor_model=str(row.get("extractor_model") or self.settings.ingestion_model),
                     extraction_prompt_version=str(
                         row.get("extraction_prompt_version") or self.settings.extraction_prompt_version
                     ),

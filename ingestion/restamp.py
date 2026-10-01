@@ -85,11 +85,12 @@ class RestampPlan:
 def declarable_keys(settings: Settings) -> set[str]:
     """Settings a corpus can have been built with differently. Embedding settings are not
     among them: those come from the store's own contract, not from the operator.
-    `coref_enabled` is: it decides whether the fingerprint carries `coref_annotation`."""
+    `coref_enabled` is: it decides whether the fingerprint carries `coref_annotation`. So is
+    `ingestion_model`, which the payload records under its historical key `gemini_model`."""
     keys = {
         key for key in pipeline_fingerprint_payload(settings, "DONE") if hasattr(settings, key)
-    } - _NOT_DECLARABLE
-    return (keys - set(embedding_contract(settings))) | {"coref_enabled"}
+    } - _NOT_DECLARABLE - {"gemini_model"}
+    return (keys - set(embedding_contract(settings))) | {"coref_enabled", "ingestion_model"}
 
 
 def parse_declared(settings: Settings, pairs: Iterable[str]) -> dict[str, Any]:
@@ -272,7 +273,7 @@ def _version_columns(settings: Settings) -> dict[str, Any]:
         doc_id="restamp",
         checksum="0" * 64,
         pipeline_fingerprint="restamp",
-        generative_model=settings.gemini_model,
+        generative_model=settings.ingestion_model,
         embedding_model=settings.embedding_model_id,
         embedding_dim=settings.embedding_dim,
         embedding_prompt_version=settings.embedding_prompt_version,

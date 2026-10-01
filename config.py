@@ -45,7 +45,14 @@ class Settings:
     strict_coref: bool = True
     enable_graph: bool = True
     gemini_api_key: str | None = None
+    # The query-time model: analysis, answer generation, LLM reranking (env GEMINI_MODEL).
     gemini_model: str = "gemini-3.5-flash-lite"
+    # The build-time model: extraction, merge adjudication and community summaries (env
+    # INGESTION_MODEL). Separate since 2026-09-27 so trying another answer model does not
+    # change the graph's identity: it is part of the pipeline fingerprint, and extraction is
+    # reused only across chunks the same model extracted, so changing it re-extracts the
+    # corpus (~2,300 calls for wp2f). Default = the model every current corpus was built with.
+    ingestion_model: str = "gemini-3.5-flash-lite"
     gemini_max_workers: int = 2
     ingestion_provider_timeout_seconds: float = 120.0
     ingestion_progress_interval_chunks: int = 5
@@ -188,8 +195,16 @@ class Settings:
     # corpus flags more - see ingestion/review_status.py.
     review_rare_predicate_below: int = 5
     extraction_max_attempts: int = 3
-    # WP7: reuse a chunk assertions when its content hash is unchanged (A4).
+    # WP7: reuse a chunk's assertions when a re-ingest would extract it identically (A4):
+    # the same text read (coreference annotations included) by the same extractor - the
+    # same extraction prompt version and generative model, per assertion provenance. A
+    # prompt or model change therefore re-extracts; every other fingerprint change reuses.
     extraction_reuse_enabled: bool = True
+    # Opt-in: carry assertions across a prompt or model change anyway, to avoid the cost of
+    # re-extraction (e.g. a cosmetic prompt edit). The reused assertions keep the prompt
+    # version and model that actually produced them. Until 2026-09-27 this was the only
+    # behaviour, so a new prompt never reached text that had not changed (REFACTOR3 WP22).
+    extraction_reuse_across_prompts: bool = False
     # WP3-C: share of chunks that may be quarantined before the document fails.
     extraction_chunk_failure_ratio: float = 0.05
     extraction_retry_base_seconds: float = 1.0
@@ -361,6 +376,9 @@ class Settings:
         """Allow env vars to override sensitive defaults."""
         self.gemini_api_key = self.gemini_api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         self.gemini_model = os.getenv("GEMINI_MODEL", self.gemini_model).strip() or self.gemini_model
+        self.ingestion_model = (
+            os.getenv("INGESTION_MODEL", self.ingestion_model).strip() or self.ingestion_model
+        )
         try:
             self.section_group_target_tokens = max(
                 1, int(os.getenv("SECTION_GROUP_TARGET_TOKENS", self.section_group_target_tokens))
@@ -705,6 +723,9 @@ class Settings:
         reuse_env = os.getenv("EXTRACTION_REUSE_ENABLED")
         if reuse_env is not None:
             self.extraction_reuse_enabled = reuse_env.strip().lower() not in {"0", "false", "no"}
+        across_env = os.getenv("EXTRACTION_REUSE_ACROSS_PROMPTS")
+        if across_env is not None:
+            self.extraction_reuse_across_prompts = across_env.strip().lower() not in {"0", "false", "no", ""}
         try:
             self.extraction_chunk_failure_ratio = max(
                 0.0,

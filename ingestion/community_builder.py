@@ -197,11 +197,11 @@ class CommunityBuilder:
         # already paid for in that run - a whole build lost to one malformed response.
         try:
             response = client.models.generate_content(
-                model=self.settings.gemini_model,
+                model=self.settings.ingestion_model,
                 contents=prompt,
                 config=build_generate_config(
                     self._types,
-                    self.settings.gemini_model,
+                    self.settings.ingestion_model,
                     system_instruction=SUMMARY_INSTRUCTION,
                     temperature=0.2,
                     response_mime_type="application/json",

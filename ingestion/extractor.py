@@ -207,11 +207,11 @@ class GeminiExtractor:
 
     def _generate(self, prompt: str) -> dict[str, Any]:
         response = self._client.models.generate_content(
-            model=self.settings.gemini_model,
+            model=self.settings.ingestion_model,
             contents=prompt,
             config=build_generate_config(
                 self._genai_types,
-                self.settings.gemini_model,
+                self.settings.ingestion_model,
                 response_mime_type="application/json",
                 response_schema=self._response_schema,
             ),

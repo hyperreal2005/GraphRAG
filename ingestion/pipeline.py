@@ -79,7 +79,9 @@ def _base_fingerprint_payload(settings: Settings, target_stage: str, graph: bool
         "section_group_target_tokens": settings.section_group_target_tokens,
         "section_group_max_tokens": settings.section_group_max_tokens,
         "section_group_page_gap_tolerance": settings.section_group_page_gap_tolerance,
-        "gemini_model": settings.gemini_model if graph else None,
+        # Named for when one model did everything; it has always meant the model ingestion
+        # extracts with, which is now `ingestion_model` (same value, so no stamp changed).
+        "gemini_model": settings.ingestion_model if graph else None,
         "extraction_prompt_version": settings.extraction_prompt_version if graph else None,
         "graph_exclude_reference_sections": settings.graph_exclude_reference_sections if graph else None,
         "disamb_model": settings.disamb_model if graph else None,
@@ -127,6 +129,9 @@ class ExtractionReusePlan:
     assertions_by_chunk: dict[str, list[dict]] = field(default_factory=dict)
     mentions_by_chunk: dict[str, list[str]] = field(default_factory=dict)
     entities: dict[str, dict] = field(default_factory=dict)
+    # Unchanged chunks re-extracted because the extractor changed since - counted so a
+    # prompt roll-out shows how much of the corpus it actually reached.
+    declined_extractor_changed: int = 0
 
     @property
     def assertion_count(self) -> int:
@@ -295,7 +300,7 @@ class PhaseOnePipeline:
                         doc_id=doc_id,
                         checksum=checksum,
                         pipeline_fingerprint=pipeline_fingerprint,
-                        generative_model=self.settings.gemini_model,
+                        generative_model=self.settings.ingestion_model,
                         embedding_model=self.settings.embedding_model_id,
                         embedding_dim=self.settings.embedding_dim,
                         embedding_prompt_version=self.settings.embedding_prompt_version,
@@ -504,10 +509,12 @@ class PhaseOnePipeline:
         extracted from, so a second call would buy a re-derivation of facts already held.
         That text is the coreference-annotated copy where there is one (WP20): matching on
         the stored text alone would carry unannotated extractions forward when annotation is
-        switched on, and it would never take effect. Reuse is refused, and the chunk
-        extracted normally, whenever an entity the prior assertions reference is no longer
-        readable in the graph: a reused assertion must never point at an endpoint the new
-        version does not contain.
+        switched on, and it would never take effect. The extractor must be the same too:
+        assertions from another extraction prompt version or model are re-extracted unless
+        `extraction_reuse_across_prompts` opts in (WP22). Reuse is also refused, and the
+        chunk extracted normally, whenever an entity the prior assertions reference is no
+        longer readable in the graph: a reused assertion must never point at an endpoint the
+        new version does not contain.
         """
         empty = ExtractionReusePlan()
         if not self.settings.extraction_reuse_enabled or not active_version_id:
@@ -563,6 +570,9 @@ class PhaseOnePipeline:
             prior_rows = by_prior_chunk.get(prior_chunk_id)
             if not prior_rows:
                 continue
+            if not self._extracted_by_current_extractor(prior_rows):
+                plan.declined_extractor_changed += 1
+                continue
             endpoints = {
                 str(row[key])
                 for row in prior_rows
@@ -585,6 +595,20 @@ class PhaseOnePipeline:
             for entity_id in endpoints:
                 plan.entities[entity_id] = available[entity_id]
         return plan
+
+    def _extracted_by_current_extractor(self, rows: list[dict]) -> bool:
+        """Would the current extractor have produced these assertions? Same input is not
+        enough: a new extraction prompt or model exists to extract differently, and reusing
+        across it meant a prompt change never reached text that had not changed. Judged per
+        assertion, from the provenance each carries, so assertions already carried across a
+        change by the opt-in are recognised for what produced them."""
+        if self.settings.extraction_reuse_across_prompts:
+            return True
+        return all(
+            str(row.get("extraction_prompt_version") or "") == self.settings.extraction_prompt_version
+            and str(row.get("extractor_model") or "") == self.settings.ingestion_model
+            for row in rows
+        )
 
     def _rebuild_reused_assertions(
         self,
@@ -623,7 +647,7 @@ class PhaseOnePipeline:
                         doc_id=doc_id,
                         document_version_id=document_version_id,
                         chunk_id=chunk_id,
-                        extractor_model=str(row.get("extractor_model") or self.settings.gemini_model),
+                        extractor_model=str(row.get("extractor_model") or self.settings.ingestion_model),
                         extraction_prompt_version=str(
                             row.get("extraction_prompt_version")
                             or self.settings.extraction_prompt_version
@@ -999,7 +1023,7 @@ class PhaseOnePipeline:
             duration_ms=(time.perf_counter() - resolution_started) * 1000.0,
             status="completed",
             provider="google" if merge_call_count else None,
-            model_id=self.settings.gemini_model if merge_call_count else None,
+            model_id=self.settings.ingestion_model if merge_call_count else None,
             input_tokens=merge_delta("input_tokens"),
             output_tokens=merge_delta("output_tokens"),
             total_tokens=merge_delta("total_tokens"),
@@ -1012,6 +1036,7 @@ class PhaseOnePipeline:
                 "llm_adjudication_calls": merge_call_count,
                 "reused_chunks": len(reuse.assertions_by_chunk),
                 "reused_assertions": reuse.assertion_count,
+                "reuse_declined_extractor_changed": reuse.declined_extractor_changed,
                 "rejected_assertions": len(getattr(self.assertion_builder, "rejected", [])),
             },
         )
@@ -1170,7 +1195,7 @@ class PhaseOnePipeline:
             duration_ms=(time.perf_counter() - started) * 1000.0,
             status=status,
             provider="google",
-            model_id=self.settings.gemini_model,
+            model_id=self.settings.ingestion_model,
             input_tokens=delta("input_tokens"),
             output_tokens=delta("output_tokens"),
             total_tokens=delta("total_tokens"),

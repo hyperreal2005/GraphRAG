@@ -798,13 +798,13 @@ class CrossDocumentMerger:
             if self._types is not None:
                 config = build_generate_config(
                     self._types,
-                    self.settings.gemini_model,
+                    self.settings.ingestion_model,
                     temperature=0.0,
                     response_mime_type="application/json",
                     response_schema=self._llm_schema,
                 )
             response = self._llm_client.models.generate_content(
-                model=self.settings.gemini_model,
+                model=self.settings.ingestion_model,
                 contents=prompt,
                 config=config,
             )
@@ -896,7 +896,7 @@ class CrossDocumentMerger:
                 type_compatible=decision.type_compatible,
                 decision=audit_decision,
                 rationale=decision.rationale or "No rationale supplied.",
-                model_id=self.settings.gemini_model if decision.decision == "LLM_MERGE" else None,
+                model_id=self.settings.ingestion_model if decision.decision == "LLM_MERGE" else None,
                 prompt_version="merge-r1-v1" if decision.decision == "LLM_MERGE" else None,
                 adjudication_confidence=decision.adjudication_confidence,
             )
