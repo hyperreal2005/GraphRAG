@@ -52,6 +52,14 @@ def _is_rate_limited(exc: Exception) -> bool:
     text = f"{type(exc).__name__} {exc}"
     return "429" in text or "TooManyRequests" in text or "rate limit" in text.lower()
 
+
+def _is_stall(exc: Exception) -> bool:
+    """A request that hung or dropped, not one that was refused. A stall is usually gone on
+    a second try: 5 of 50 questions in one run lost their reranking to single stalls that a
+    retry inside the same deadline would have absorbed (REFACTOR3 WP23)."""
+    name = type(exc).__name__
+    return "Timeout" in name or name in {"ReadError", "RemoteProtocolError", "ConnectError"}
+
 # Loading a cross-encoder costs seconds, and a FusionEngine is constructed per query in
 # some paths. Keyed by model name so a settings change is still honoured.
 _LOCAL_MODELS: dict[str, Any] = {}
@@ -263,9 +271,12 @@ class QueryReranker:
                 )
                 break
             except Exception as exc:
-                delay = 1.0 * (2**attempt)
+                stall = _is_stall(exc)
+                # A throttle backs off exponentially; a stall retries almost at once.
+                delay = 0.5 if stall else 1.0 * (2**attempt)
                 too_late = time.monotonic() + delay + request_timeout > deadline
-                if not _is_rate_limited(exc) or spent + delay > budget or too_late:
+                retryable = _is_rate_limited(exc) or stall
+                if not retryable or spent + delay > budget or too_late:
                     logger.warning(
                         "cohere_rerank_degraded error_type=%s rate_limited=%s",
                         type(exc).__name__,
@@ -365,17 +376,23 @@ class QueryReranker:
         return ranking
 
     def _document_text(self, item: RetrieverResult) -> str:
+        # The document card, when fusion attached one: a question naming "the TechCrunch
+        # report of October 31" can only be ranked against passages that say whose report
+        # they are (WP23).
+        document = str(item.provenance.get("document") or "")
+        document_line = f"Document: {document}\n" if document else ""
         if item.source_type == "vector":
             doc_id = item.provenance.get("doc_id")
             chunk_id = item.provenance.get("chunk_id")
             section = item.provenance.get("section_heading")
             return (
                 "[VECTOR]\n"
+                f"{document_line}"
                 f"doc_id={doc_id} chunk_id={chunk_id} section={section}\n"
                 f"{item.text_or_path}"
             )
         if item.source_type == "graph":
-            return f"[GRAPH]\n{item.text_or_path}"
+            return f"[GRAPH]\n{document_line}{item.text_or_path}"
         if item.source_type == "community":
             return f"[COMMUNITY]\n{item.text_or_path}"
         return item.text_or_path

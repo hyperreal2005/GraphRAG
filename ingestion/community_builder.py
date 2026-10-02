@@ -18,6 +18,13 @@ versioned: each build gets an id, writes its own nodes and points, and the previ
 is removed once the new one is in place. That deliberately avoids the immutable-version
 machinery the ingestion plane needs, because nothing cites a community and a stale summary
 is discarded rather than retracted.
+
+**A build is scoped to one corpus, and stamped with its embedding** (REFACTOR3 WP26). Neo4j
+holds several corpora side by side, so detection is fenced to the store's own document
+versions, as graph retrieval is, and a build replaces only the builds of its own collection.
+Each point records the embedding that indexed it. The first build was embedded with
+`gemini-embedding-2` and was never re-embedded when the corpus moved to `-001`, so community
+retrieval ranked noise for four weeks and nothing said so.
 """
 
 from __future__ import annotations
@@ -43,6 +50,17 @@ SUMMARY_INSTRUCTION = (
     "Use only the entities and relations supplied. Do not add outside knowledge. "
     "Return only the requested JSON."
 )
+
+
+def embedding_stamp(settings: Settings) -> dict[str, Any]:
+    """The embedding contract a community point is indexed under: the same four fields a
+    chunk point carries, and that the retriever compares with the query's embedding."""
+    return {
+        "embedding_model_id": settings.embedding_model_id,
+        "embedding_dimension": int(settings.embedding_dim),
+        "embedding_prompt_version": settings.embedding_prompt_version,
+        "embedding_schema_version": settings.embedding_version,
+    }
 
 
 @dataclass
@@ -115,19 +133,27 @@ class CommunityBuilder:
         import networkx as nx
 
         floor = int(self.settings.community_min_size if min_size is None else min_size)
+        # Fenced to the store's own versions: `active: true` alone spans every corpus in
+        # this Neo4j, and an unfenced build mixed them.
         query = """
         MATCH (x:Entity)-[:SUBJECT_OF]->(a:Assertion {active: true})-[:OBJECT]->(y:Entity)
         WHERE x.id <> y.id
+          AND (NOT $enforce_version_fence OR a.document_version_id IN $active_version_ids)
         RETURN x.id AS a_id, x.name AS a_name, y.id AS b_id, y.name AS b_name,
                a.predicate_normalized AS predicate, a.doc_id AS doc_id
         """
+        active_version_ids = self._queryable_version_ids()
+        params = {
+            "enforce_version_fence": active_version_ids is not None,
+            "active_version_ids": active_version_ids or [],
+        }
         graph = nx.Graph()
         names: dict[str, str] = {}
         edge_facts: dict[tuple[str, str], list[str]] = {}
         edge_docs: dict[tuple[str, str], set[str]] = {}
 
         with self._driver.session() as session:
-            for record in session.run(query):
+            for record in session.run(query, params):
                 left, right = str(record["a_id"]), str(record["b_id"])
                 names.setdefault(left, str(record["a_name"] or left))
                 names.setdefault(right, str(record["b_name"] or right))
@@ -283,8 +309,11 @@ class CommunityBuilder:
         )
 
     def _write_graph(self, build_id: str, communities: list[Community]) -> None:
-        """Replace the previous build. Communities are derived, so this is a swap."""
+        """Replace the previous build of this collection. Communities are derived, so this
+        is a swap. A node from before builds recorded their collection belongs to whichever
+        collection replaces it first."""
         created_at = datetime.now(timezone.utc).isoformat()
+        collection = self.settings.qdrant_communities_collection
         with self._driver.session() as session:
             session.run(
                 """
@@ -292,7 +321,7 @@ class CommunityBuilder:
                 CREATE (c:Community {
                     id: row.id, build_id: $build_id, title: row.title,
                     summary: row.summary, size: row.size, doc_ids: row.doc_ids,
-                    created_at: $created_at, algorithm: 'louvain'
+                    created_at: $created_at, algorithm: 'louvain', collection: $collection
                 })
                 WITH c, row
                 UNWIND row.member_ids AS member_id
@@ -302,6 +331,7 @@ class CommunityBuilder:
                 {
                     "build_id": build_id,
                     "created_at": created_at,
+                    "collection": collection,
                     "rows": [
                         {
                             "id": c.community_id,
@@ -317,10 +347,12 @@ class CommunityBuilder:
             )
             session.run(
                 """
-                MATCH (c:Community) WHERE c.build_id <> $build_id
+                MATCH (c:Community)
+                WHERE c.build_id <> $build_id
+                  AND coalesce(c.collection, $collection) = $collection
                 DETACH DELETE c
                 """,
-                {"build_id": build_id},
+                {"build_id": build_id, "collection": collection},
             )
 
     def _write_vectors(self, build_id: str, communities: list[Community]) -> int:
@@ -360,6 +392,7 @@ class CommunityBuilder:
                     "size": c.size,
                     "doc_ids": c.doc_ids,
                     "member_names": c.member_names[:50],
+                    **embedding_stamp(self.settings),
                 },
             )
             for c, vector in zip(communities, vectors)
@@ -370,6 +403,12 @@ class CommunityBuilder:
         return len(points)
 
     # ----------------------------------------------------------------- plumbing
+    def _queryable_version_ids(self) -> list[str] | None:
+        """The store's active document versions; None for a store that predates versions."""
+        from ingestion.state_store import MetadataStore
+
+        return MetadataStore(self.settings.metadata_db_path).get_queryable_document_version_ids()
+
     def _ensure_client(self) -> Any | None:
         if self._client is not None:
             return self._client

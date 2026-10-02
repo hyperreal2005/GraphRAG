@@ -30,6 +30,7 @@ class AssertionBuilder:
         raw_to_final_entity_id: dict[str, str],
         raw_to_local_entity_id: dict[str, str] | None = None,
         raw_entity_chunk_ids: dict[str, str],
+        prompt_versions: dict[str, str] | None = None,
     ) -> list[AssertionRecord]:
         """Build all assertions and keep the strongest duplicate per source claim.
 
@@ -40,6 +41,8 @@ class AssertionBuilder:
         """
         assertions: dict[str, AssertionRecord] = {}
         local_map = raw_to_local_entity_id or {}
+        # Rows extracted in a batch record the batched prompt version (WP24).
+        versions = prompt_versions or {}
         self.rejected: list[str] = []
 
         for relation in mapped_relations:
@@ -61,7 +64,7 @@ class AssertionBuilder:
                 document_version_id=document_version_id,
                 chunk_id=str(relation["source_chunk"]),
                 extractor_model=self.settings.ingestion_model,
-                extraction_prompt_version=self.settings.extraction_prompt_version,
+                extraction_prompt_version=versions.get(str(relation["source_chunk"]), self.settings.extraction_prompt_version),
                 valid_from=self._optional_text(relation.get("valid_from")),
                 valid_until=self._optional_text(relation.get("valid_until")),
                 active=False,
@@ -96,7 +99,7 @@ class AssertionBuilder:
                     document_version_id=document_version_id,
                     chunk_id=chunk_id,
                     extractor_model=self.settings.ingestion_model,
-                    extraction_prompt_version=self.settings.extraction_prompt_version,
+                    extraction_prompt_version=versions.get(chunk_id, self.settings.extraction_prompt_version),
                     active=False,
                     review_status=self._review_status(float(entity.confidence)),
                 )

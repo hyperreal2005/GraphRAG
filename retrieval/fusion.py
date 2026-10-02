@@ -112,6 +112,9 @@ class FusionEngine:
 
         deduped = self._dedupe_and_score(merged, user_query=user_query)
         ranked = sorted(deduped.values(), key=self._ranking_score, reverse=True)
+        # Before reranking, so the reranker sees which publication and date each passage
+        # comes from: questions name the report they mean (WP23).
+        self._attach_document_cards(ranked)
         reranked, rerank_mode = self._apply_rerank(user_query=user_query, ranked=ranked)
         selected = self._select_context_items(reranked)
 
@@ -378,6 +381,21 @@ class FusionEngine:
             return normalized
         return normalized[: limit - 3].rstrip() + "..."
 
+    def _attach_document_cards(self, items: list[RetrieverResult]) -> None:
+        """Each passage carries what its document is: title, and for news its publisher and
+        date. Questions name all three, and without them the generator could not attribute
+        a fact it had read, and the judges ruled the passage unrelated (WP23)."""
+        doc_ids = {str(item.provenance.get("doc_id") or "") for item in items}
+        try:
+            cards = self.store.get_document_cards(doc_ids)
+        except Exception as exc:  # a card is context, never a reason to fail the query
+            logger.warning("document_cards_unavailable error=%s", type(exc).__name__)
+            return
+        for item in items:
+            card = cards.get(str(item.provenance.get("doc_id") or ""))
+            if card:
+                item.provenance["document"] = card.render()
+
     def _pack_context(self, results: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
         if not results:
             return [], ""
@@ -423,9 +441,14 @@ class FusionEngine:
         include_graph_source: bool = True,
     ) -> str:
         evidence_id = str(item.provenance.get("evidence_id") or item.source_id)
+        document = str(item.provenance.get("document") or "")
+        document_line = f"\nDocument: {document}" if document else ""
         if item.source_type == "graph":
             graph_path = str(item.provenance.get("graph_path") or item.text_or_path)
-            block = f"[EVIDENCE id={evidence_id} type=graph_assertion]\nAssertion: {graph_path}"
+            block = (
+                f"[EVIDENCE id={evidence_id} type=graph_assertion]{document_line}\n"
+                f"Assertion: {graph_path}"
+            )
             evidence_text = str(item.provenance.get("evidence_text") or "").strip()
             if include_graph_source and evidence_text:
                 chunk_id = item.provenance.get("chunk_id")
@@ -444,4 +467,7 @@ class FusionEngine:
         section = item.provenance.get("section_heading")
         page = item.provenance.get("page")
         source_line = f"Source: doc_id={doc_id}, chunk_id={chunk_id}, section={section}, page={page}"
-        return f"[EVIDENCE id={evidence_id} type=document_chunk]\n{source_line}\nText: {item.text_or_path}"
+        return (
+            f"[EVIDENCE id={evidence_id} type=document_chunk]{document_line}\n{source_line}\n"
+            f"Text: {item.text_or_path}"
+        )

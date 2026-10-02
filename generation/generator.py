@@ -23,9 +23,25 @@ SYSTEM_INSTRUCTION = (
     # substance and repeating the attribution produced 8 of 11 unsupported claims in the
     # wp7-rank-fusion run: the judge correctly found no evidence that TechCrunch reported
     # anything. Answer the substance; do not restate provenance the evidence cannot show.
+    # WP23: evidence now carries a Document line - title, and for news the publisher and
+    # date - so attribution the evidence can show is allowed, and the rest still is not.
+    "Each evidence item may carry a Document line giving its document's title and, for news, its "
+    "publisher and publication date; that line is part of the evidence. "
     "A question may name a source, author, publication or date that the evidence does not mention. "
     "Answer the substance of the question from the evidence, but never state that a particular source "
-    "reported, published or said something unless the evidence text itself names that source."
+    "reported, published or said something unless the evidence itself - its text or its Document "
+    "line - names that source. "
+    # WP23: the citation judge, shown the same Document lines, ruled passages from another
+    # outlet "unrelated" to a question about a named report - and it was right to.
+    "When the question names a publication, report or date, prefer and cite the evidence whose "
+    "Document line matches it over evidence from other sources covering the same story."
+)
+# The re-synthesis call has its own instruction. It used SYSTEM_INSTRUCTION, which demands
+# JSON, and in 13 of 15 re-syntheses across the judged runs the reply was the answer schema
+# in a code fence, shown to the reader verbatim (REFACTOR3 WP26).
+RESYNTHESIS_INSTRUCTION = (
+    "You rewrite verified statements as a direct prose answer. Use only the statements given. "
+    "Return plain text: no JSON, no code fences, no list markers, no preamble."
 )
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -45,6 +61,7 @@ class AnswerGenerator:
         self._types = None
         self._response_schema = None
         self.last_usage: dict[str, int] = {}
+        self._publishers: frozenset[str] | None = None
 
         if self._client is None and self.settings.gemini_api_key:
             try:
@@ -250,9 +267,11 @@ class AnswerGenerator:
             attempt_prompt = prompt
             if attempt:
                 attempt_prompt += (
-                    "\nYour previous response referenced unknown evidence or an assertion whose exact "
-                    "value did not support the claim. Regenerate using only exact supplied IDs whose "
-                    "asserted facts directly support each claim."
+                    "\nYour previous response referenced unknown evidence, an assertion whose exact "
+                    "value did not support the claim, or a publication that is not named on the "
+                    "Document line of any evidence the claim cites. Regenerate using only exact "
+                    "supplied IDs whose asserted facts directly support each claim, and name a "
+                    "publication only when the cited evidence comes from it."
                 )
             try:
                 payload = self._request_payload(attempt_prompt, temperature)
@@ -284,6 +303,9 @@ class AnswerGenerator:
                     invalid_reference_found = True
                     continue
                 if not self._claim_matches_literal_assertions(text, evidence_ids, evidence):
+                    invalid_reference_found = True
+                    continue
+                if self._misattributed_publisher(text, evidence_ids, evidence):
                     invalid_reference_found = True
                     continue
                 support = min(self._item_score(evidence[item]) for item in evidence_ids)
@@ -365,7 +387,7 @@ class AnswerGenerator:
                 self._types,
                 self.settings.gemini_model,
                 temperature=0.0,
-                system_instruction=SYSTEM_INSTRUCTION,
+                system_instruction=RESYNTHESIS_INSTRUCTION,
             )
         try:
             response = self._client.models.generate_content(
@@ -376,7 +398,28 @@ class AnswerGenerator:
         except Exception:
             return ""
         self.last_usage = add_usage(self.last_usage, extract_usage_metadata(response))
-        return str(getattr(response, "text", "") or "").strip()
+        return self._prose_only(str(getattr(response, "text", "") or ""))
+
+    @staticmethod
+    def _prose_only(text: str) -> str:
+        """The prose of a re-synthesis reply, or "" when the reply is not prose.
+
+        A reply in the answer schema, fenced or bare, yields its `answer` field. JSON without
+        one, or JSON that does not parse, yields "", so the caller falls back to the claim
+        text rather than show a reader raw JSON.
+        """
+        stripped = (text or "").strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```[A-Za-z]*\s*", "", stripped)
+            stripped = re.sub(r"\s*```$", "", stripped).strip()
+        if not stripped.startswith(("{", "[")):
+            return stripped
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            return ""
+        answer = payload.get("answer") if isinstance(payload, dict) else None
+        return answer.strip() if isinstance(answer, str) else ""
 
     @staticmethod
     def _alias_shown_source_chunks(
@@ -414,10 +457,62 @@ class AnswerGenerator:
                     "section_heading": item.provenance.get("section_heading"),
                     "page": item.provenance.get("page"),
                     "document_version_id": item.provenance.get("document_version_id"),
+                    "document": item.provenance.get("document"),
                     "evidence_id": alias,
                     "shown_via_graph_evidence": str(item.provenance.get("evidence_id") or ""),
                 },
             )
+
+    @staticmethod
+    def _names_outlet(name: str, text: str) -> bool:
+        """Whether the claim names this outlet. A one-word outlet shaped like an ordinary
+        word - "Rivals", "Polygon", "Fortune" - is not counted where it opens a sentence,
+        since any word is capitalised there: "Rivals such as Microsoft..." names no outlet.
+        A name no word looks like - "TechCrunch", "CBSSports.com" - counts anywhere; until
+        WP26 it was exempt too, and "TechCrunch reported..." went unchecked."""
+        word_shaped = re.fullmatch(r"[A-Z][a-z]+", name) is not None
+        for match in re.finditer(rf"(?<![\w]){re.escape(name)}(?![\w])", text):
+            if word_shaped and re.fullmatch(r"\s*(?:.*[.!?:]\s+)?", text[: match.start()], re.DOTALL):
+                continue
+            return True
+        return False
+
+    def _publisher_names(self) -> frozenset[str]:
+        if self._publishers is None:
+            try:
+                from ingestion.document_cards import CorpusCatalog
+
+                catalog = CorpusCatalog.load(
+                    self.settings.corpus_manifest_path, self.settings.corpus_news_index_path
+                )
+                self._publishers = frozenset(catalog.publishers())
+            except Exception:  # no catalog, no attribution check - never a failed answer
+                self._publishers = frozenset()
+        return self._publishers
+
+    def _misattributed_publisher(
+        self, text: str, evidence_ids: list[str], evidence: dict[str, RetrieverResult]
+    ) -> str | None:
+        """A publication the claim names that none of its cited evidence comes from.
+
+        The rule "never state that a source reported something unless the evidence names that
+        source" has been in the instruction since WP7, and was never enforced. It was the
+        commonest unsupported claim in every judged run - "the prosecution's allegations are
+        cited from Fortune, not TechCrunch" - and the commonest reason a cited passage was
+        ruled unrelated (WP24). Each evidence item now carries its document's publisher on
+        its Document line, so the check is exact: a named outlet must appear there.
+        Case-sensitive, so "a fortune" is not Fortune.
+        """
+        named = [name for name in self._publisher_names() if self._names_outlet(name, text)]
+        if not named:
+            return None
+        documents = " | ".join(
+            str(evidence[item].provenance.get("document") or "") for item in evidence_ids if item in evidence
+        )
+        for name in named:
+            if name not in documents:
+                return name
+        return None
 
     def _claim_matches_literal_assertions(
         self,

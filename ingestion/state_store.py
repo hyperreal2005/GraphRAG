@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ingestion.document_cards import DocumentCard
 from models.ingestion import Chunk
 from models.refactor import DocumentVersion, MergeDecision, OutboxEvent, OutboxEventType
 
@@ -266,6 +267,10 @@ class MetadataStore:
             "active_pipeline_fingerprint": "TEXT",
             "desired_pipeline_fingerprint": "TEXT",
             "current_run_id": "TEXT",
+            # WP23 document cards: shown with every passage from the document.
+            "title": "TEXT",
+            "publisher": "TEXT",
+            "published": "TEXT",
         }
         for name, sql_type in additions.items():
             if name not in columns:
@@ -333,7 +338,7 @@ class MetadataStore:
             "doc_id", "source_path", "format", "word_count", "ingested_at", "status",
             "pipeline_stage", "last_error", "active_checksum", "desired_checksum",
             "last_completed_stage", "target_stage", "active_pipeline_fingerprint",
-            "desired_pipeline_fingerprint", "current_run_id",
+            "desired_pipeline_fingerprint", "current_run_id", "title", "publisher", "published",
         ]
         column_list = ", ".join(keep)
         # The caller has already disabled foreign keys, which SQLite only permits outside
@@ -358,7 +363,10 @@ class MetadataStore:
                     target_stage TEXT,
                     active_pipeline_fingerprint TEXT,
                     desired_pipeline_fingerprint TEXT,
-                    current_run_id TEXT
+                    current_run_id TEXT,
+                    title TEXT,
+                    publisher TEXT,
+                    published TEXT
                 )
                 """
             )
@@ -1214,6 +1222,36 @@ class MetadataStore:
                 (doc_id,),
             ).fetchone()
         return row
+
+    def set_document_card(self, doc_id: str, card: DocumentCard) -> None:
+        """Record what the document is - title, publisher, date. Metadata only: it changes
+        no chunk and no extraction, so it is not part of the pipeline fingerprint."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE documents SET title = ?, publisher = ?, published = ? WHERE doc_id = ?",
+                (card.title or None, card.publisher or None, card.published or None, doc_id),
+            )
+
+    def get_document_cards(self, doc_ids: Iterable[str]) -> dict[str, DocumentCard]:
+        ids = sorted({str(doc_id) for doc_id in doc_ids if doc_id})
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT doc_id, title, publisher, published FROM documents "
+                f"WHERE doc_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        cards = {
+            str(row["doc_id"]): DocumentCard(
+                title=str(row["title"] or ""),
+                publisher=str(row["publisher"] or ""),
+                published=str(row["published"] or ""),
+            )
+            for row in rows
+        }
+        return {doc_id: card for doc_id, card in cards.items() if card}
 
     def list_documents(self, status: str | None = None, pipeline_stage: str | None = None) -> list[sqlite3.Row]:
         """List documents filtered by optional status/stage."""

@@ -26,6 +26,49 @@ class ExtractorStats:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    # Batched table rows (gate 18): what was sent together, and what was refused because
+    # it was not found in the row it was filed under.
+    row_batches: int = 0
+    rows_batched: int = 0
+    row_entities_ungrounded: int = 0
+    row_properties_ungrounded: int = 0
+    row_relations_cross_row: int = 0
+    row_results_invalid: int = 0
+
+
+# Recorded on assertions extracted in a batch of table rows, after the base prompt version,
+# so reuse can tell them from single-row extractions (REFACTOR3 WP24).
+ROW_BATCH_VERSION = "rows-v1"
+
+_ROW_RULES = (
+    "- The TEXT is several rows of ONE table, each prefixed with its row label\n"
+    "  ([R1], [R2], ...). Extract each row on its own, exactly as if that row were\n"
+    "  the whole text.\n"
+    "- Every entity and every relation must carry \"row\": the label of the row it\n"
+    "  is stated in. Both entities of a relation must belong to that same row.\n"
+    "- An entity that appears in several rows is listed once for each row, with a new\n"
+    "  id each time. Entity ids must be unique across the whole output.\n"
+)
+
+
+def _normalized(text: str) -> str:
+    """Lowercase alphanumeric tokens, so "0 . 85" and "0.85", "GPT-4o" and "gpt 4o" agree.
+
+    Thousands separators go first: a row reads "Train: 52,440" and the model, correctly for an
+    integer, writes 52440. The smoke rebuild refused 50 such values in one table.
+    """
+    text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text.lower())
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", text).split())
+
+
+def _found_in(value: str, row: str) -> bool:
+    needle = _normalized(value)
+    return bool(needle) and f" {needle} " in f" {row} "
+
+
+def _row_label(value: Any) -> str:
+    text = str(value or "").strip().upper().lstrip("[").rstrip("]")
+    return text if text.startswith("R") else f"R{text}"
 
 
 class GeminiExtractor:
@@ -59,6 +102,7 @@ class GeminiExtractor:
             ),
         )
         self._response_schema = self._build_response_schema()
+        self._row_response_schema = self._build_response_schema(with_rows=True)
 
     def extract(self, chunk_text: str, doc_format: str) -> ExtractionResult:
         """Extract entities and relations from chunk text."""
@@ -99,6 +143,110 @@ class GeminiExtractor:
 
         return result
 
+    def extract_rows(self, rows: list[str], doc_format: str) -> list[ExtractionResult | None]:
+        """Extract several rows of one table in one call: one result per row (gate 18).
+
+        Each row is extracted as if it were the whole text. The model labels every entity
+        and relation with its row, and the response is split back into per-row results, so
+        assertions, mentions and citations stay row-level. Two guards protect that:
+
+        - **Grounding.** An entity whose name, or a property whose value, is not found in
+          the row it is filed under is dropped and counted. A fact filed under the wrong row
+          would cite the wrong chunk, which is the exactness gate 6 protects.
+        - **Fallback.** A row whose part of the response does not validate comes back as
+          None, and the caller extracts it alone the old way. Batching can therefore cost a
+          row its cheaper price, never its extraction.
+        """
+        _ = doc_format
+        labels = [f"R{index}" for index in range(1, len(rows) + 1)]
+        prompt = self._prompt_rows(rows)
+        attempts = max(1, int(self.settings.extraction_max_attempts))
+        payload: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                payload = self._generate(prompt, schema=self._row_response_schema)
+                break
+            except Exception as exc:
+                last_error = exc
+                payload = None
+                if attempt + 1 >= attempts:
+                    break
+                base = max(0.0, float(self.settings.extraction_retry_base_seconds))
+                delay = base * (2**attempt) + random.uniform(0.0, min(0.25, base))
+                if delay > 0:
+                    time.sleep(delay)
+        if payload is None:
+            raise RuntimeError(f"Row extraction failed after {attempts} attempts: {last_error}") from last_error
+
+        results = [self._row_result(payload, label, row) for label, row in zip(labels, rows)]
+        with self._stats_lock:
+            self._stats.row_batches += 1
+            self._stats.rows_batched += len(rows)
+            for result in results:
+                if result is not None:
+                    self._stats.entities_count += len(result.entities)
+                    self._stats.relations_count += len(result.relations)
+        return results
+
+    def _row_result(self, payload: dict[str, Any], label: str, row: str) -> ExtractionResult | None:
+        """The part of a batched response filed under one row, grounded in that row."""
+        row_text = _normalized(row)
+        entities: list[dict[str, Any]] = []
+        kept_ids: set[str] = set()
+        ungrounded_entities = ungrounded_properties = cross_row = 0
+
+        def grounded_properties(item: dict[str, Any]) -> list[dict[str, Any]]:
+            nonlocal ungrounded_properties
+            properties = [p for p in item.get("properties") or [] if isinstance(p, dict)]
+            kept = [p for p in properties if _found_in(str(p.get("value_text") or ""), row_text)]
+            ungrounded_properties += len(properties) - len(kept)
+            return kept
+
+        for raw in payload.get("entities") or []:
+            if not isinstance(raw, dict) or _row_label(raw.get("row")) != label:
+                continue
+            name = str(raw.get("name") or "")
+            # "This Study" names the paper itself and is never written in a row.
+            if name != "This Study" and not _found_in(name, row_text):
+                ungrounded_entities += 1
+                continue
+            entity = {key: value for key, value in raw.items() if key != "row"}
+            entity["properties"] = grounded_properties(raw)
+            entities.append(entity)
+            kept_ids.add(str(raw.get("id") or ""))
+
+        relations: list[dict[str, Any]] = []
+        for raw in payload.get("relations") or []:
+            if not isinstance(raw, dict) or _row_label(raw.get("row")) != label:
+                continue
+            if str(raw.get("head") or "") not in kept_ids or str(raw.get("tail") or "") not in kept_ids:
+                cross_row += 1
+                continue
+            relation = {key: value for key, value in raw.items() if key != "row"}
+            relation["properties"] = grounded_properties(raw)
+            relations.append(relation)
+
+        with self._stats_lock:
+            self._stats.row_entities_ungrounded += ungrounded_entities
+            self._stats.row_properties_ungrounded += ungrounded_properties
+            self._stats.row_relations_cross_row += cross_row
+        try:
+            result = ExtractionResult.from_dict({"entities": entities, "relations": relations})
+            self._validate_result_integrity(result)
+        except Exception:
+            with self._stats_lock:
+                self._stats.row_results_invalid += 1
+            return None
+        return result
+
+    def _prompt_rows(self, rows: list[str]) -> str:
+        """The single-chunk prompt, unchanged, with the row rules added and the rows labelled."""
+        head, _, _ = self._prompt_full("").rpartition("TEXT: ")
+        head = head.replace("Output format:\n", _ROW_RULES + "Output format:\n", 1)
+        labelled = "\n".join(f"[R{index}] {row}" for index, row in enumerate(rows, start=1))
+        return f"{head}TEXT (rows of one table):\n{labelled}\n"
+
     def snapshot_stats(self) -> ExtractorStats:
         """Return a thread-safe copy for per-run usage deltas."""
         with self._stats_lock:
@@ -131,7 +279,7 @@ class GeminiExtractor:
                 f"invalid endpoints: {', '.join(invalid[:5])}."
             )
 
-    def _build_response_schema(self) -> Any:
+    def _build_response_schema(self, with_rows: bool = False) -> Any:
         property_item_schema = self._genai_types.Schema(
             type="OBJECT",
             required=["name", "value_text", "value_type"],
@@ -196,6 +344,11 @@ class GeminiExtractor:
                 "valid_until": self._genai_types.Schema(type="STRING"),
             },
         )
+        if with_rows:
+            # A batch of table rows: every entity and relation names the row it is from.
+            for schema in (entity_schema, relation_schema):
+                schema.properties["row"] = self._genai_types.Schema(type="STRING", min_length=2)
+                schema.required = [*schema.required, "row"]
         return self._genai_types.Schema(
             type="OBJECT",
             required=["entities", "relations"],
@@ -205,7 +358,7 @@ class GeminiExtractor:
             },
         )
 
-    def _generate(self, prompt: str) -> dict[str, Any]:
+    def _generate(self, prompt: str, schema: Any | None = None) -> dict[str, Any]:
         response = self._client.models.generate_content(
             model=self.settings.ingestion_model,
             contents=prompt,
@@ -213,7 +366,7 @@ class GeminiExtractor:
                 self._genai_types,
                 self.settings.ingestion_model,
                 response_mime_type="application/json",
-                response_schema=self._response_schema,
+                response_schema=schema if schema is not None else self._response_schema,
             ),
         )
         self._record_response_usage(response)

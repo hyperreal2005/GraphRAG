@@ -290,6 +290,7 @@ class SemanticChunker:
                     content_hash=content_digest,
                     provenance=list(section.provenance),
                     pages=_pages_of(section),
+                    table_row=True,
                 )
             )
         return chunks

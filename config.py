@@ -12,12 +12,16 @@ class Settings:
     """Configuration defaults aligned to architecture reference."""
 
     metadata_db_path: Path = Path("data/metadata.db")
+    # Where document cards come from: the corpus builder's manifest (titles) and the news
+    # index (publisher, date). Files neither knows fall back to their first heading.
+    corpus_manifest_path: Path = Path("data/corpus/MANIFEST.json")
+    corpus_news_index_path: Path = Path("data/corpus/structured/news_index.csv")
     artifact_dir: Path = Path("artifacts/phase1")
     supported_formats: tuple[str, ...] = ("pdf", "txt", "md", "csv", "json")
     chunk_target_tokens: int = 700
     chunk_max_tokens: int = 800
     chunk_overlap_tokens: int = 100
-    # 0 = one chunk per table row (the wp2f corpus of record). A positive value groups
+    # 0 = one chunk per table row (the corpus of record, wp24; wp2f too). A positive value groups
     # consecutive rows into blocks of up to that many tokens (wp2g was built with 700).
     # Measured on the PDF/table judged arm with Cohere reranking, 2026-09-26: rows answered
     # 47/47, blocks 44/47 - a row is a precise match for a single cell, a block dilutes it.
@@ -25,6 +29,13 @@ class Settings:
     # Part of the pipeline fingerprint: ingesting into a corpus built with another value
     # rebuilds it (env CHUNK_TABLE_BLOCK_TARGET_TOKENS).
     chunk_table_block_target_tokens: int = 0
+    # Gate 18 (REFACTOR3 WP24): extract consecutive table-row chunks in one call, up to this
+    # many tokens of rows, while the chunks stay one per row. Every entity and relation is
+    # filed under its row and grounded in it, so assertions and citations stay row-level.
+    # 0 = one call per row. Part of the fingerprint when on (env EXTRACTION_TABLE_BATCH_TOKENS).
+    # 600 = the corpus of record's build: 19.4 provider calls per PDF against 57.5 unbatched.
+    extraction_table_batch_tokens: int = 600
+    extraction_table_batch_max_rows: int = 30
     # WP2-A: merge parser items into logical sections before coref/chunking (B1).
     section_group_enabled: bool = True
     section_group_target_tokens: int = 700
@@ -51,8 +62,11 @@ class Settings:
     # INGESTION_MODEL). Separate since 2026-09-27 so trying another answer model does not
     # change the graph's identity: it is part of the pipeline fingerprint, and extraction is
     # reused only across chunks the same model extracted, so changing it re-extracts the
-    # corpus (~2,300 calls for wp2f). Default = the model every current corpus was built with.
-    ingestion_model: str = "gemini-3.5-flash-lite"
+    # corpus. Default = the model the corpus of record (wp24) was built with. Measured against
+    # 3.5-flash-lite on Re-DocRED (gold entities z +3.6, connected pairs z +5.1, relation
+    # precision 18.8% -> 21.1%) and on the papers' gold passages (answer captured 38% -> 76%
+    # for table rows, 37% -> 60% for prose) - REFACTOR3 WP25.
+    ingestion_model: str = "gemini-3.8-flash"
     gemini_max_workers: int = 2
     ingestion_provider_timeout_seconds: float = 120.0
     ingestion_progress_interval_chunks: int = 5
@@ -186,7 +200,11 @@ class Settings:
     # prompt was not, so two runs with different answer instructions produced reports that
     # claimed to be comparable. "attribution" marks the rule added after the judge found
     # the generator asserting which publication reported a fact the evidence only stated.
-    generation_prompt_version: str = "answer-r3-attribution-v1"
+    # "document-cards" (WP23): evidence carries its document's title, publisher and date.
+    # "attribution-check" (WP24): a claim naming an outlet must cite evidence from it; the
+    # retry message says so. "prose-resynthesis" (WP26): re-synthesis has its own plain-text
+    # instruction, and "TechCrunch reported..." is checked at a sentence start.
+    generation_prompt_version: str = "answer-r6-prose-resynthesis-v1"
     assertion_review_confidence_threshold: float = 0.50
     # Refactor 3: an assertion whose predicate the corpus uses fewer than this many
     # times is flagged for review, unless a second document corroborates the claim.
@@ -309,8 +327,9 @@ class Settings:
     query_rerank_enabled: bool = True
     # rerank-v4.0-pro on measurement (REFACTOR3 WP17, WP19). Swept offline on the judged
     # news questions, recall@10 / MRR: rank fusion 0.959 / 0.629, rerank-v3.5 0.918 / 0.755,
-    # rerank-v4.0-pro 0.980 / 0.809. Live on the corpus of record it reads MRR 0.820 on the
-    # tuned set and 0.813 on 60 held-out questions, against a 0.75 gate.
+    # rerank-v4.0-pro 0.980 / 0.809. Live it read MRR 0.820 on the tuned set and 0.813 on 60
+    # held-out questions on wp2f; on wp24, the corpus of record from 2026-10-01, 0.845 and
+    # 0.903 (REFACTOR3 WP26). The gate is 0.75.
     query_rerank_model: str = "rerank-v4.0-pro"
     query_rerank_top_n: int = 15
     # Cohere rate limiting. Pacing is off by default; set it for a trial key (limited per
@@ -323,7 +342,9 @@ class Settings:
     # retries together. Both sit inside query_rerank_timeout_seconds, which bounds the
     # whole fusion stage: a stalled call used to outlive it and discard the fused context
     # (seven questions in one judged run). Now reranking degrades to fused order instead.
-    query_rerank_request_timeout_seconds: float = 5.0
+    # 4 s (was 5) so a stall can be retried once inside the 10 s budget: 4 + 0.5 + 4 < 10.
+    # A normal rerank-v4.0-pro call takes under a second (WP23).
+    query_rerank_request_timeout_seconds: float = 4.0
     query_rerank_total_budget_seconds: float = 10.0
     # The architecture's stated alternative to Cohere (5.5): a local cross-encoder, no key,
     # no per-query cost, ~0.65 s for 60 candidates on CPU. Phase 6's "fallback" returned the
@@ -398,6 +419,14 @@ class Settings:
             )
         except ValueError:
             pass
+        for attribute, environment_name in (
+            ("extraction_table_batch_tokens", "EXTRACTION_TABLE_BATCH_TOKENS"),
+            ("extraction_table_batch_max_rows", "EXTRACTION_TABLE_BATCH_MAX_ROWS"),
+        ):
+            try:
+                setattr(self, attribute, max(0, int(os.getenv(environment_name, getattr(self, attribute)))))
+            except ValueError:
+                pass
         coref_raw = os.getenv("COREF_ENABLED")
         if coref_raw is not None:
             self.coref_enabled = coref_raw.strip().lower() not in {"0", "false", "no", "off", ""}

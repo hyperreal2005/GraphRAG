@@ -164,6 +164,8 @@ class Chunk:
     # What extraction reads when it differs from `text`: the same words with coreference
     # annotations inserted. None when there is nothing to annotate.
     extraction_text: str | None = None
+    # One rendered table row. Ingestion-time only: row chunks may be extracted in batches.
+    table_row: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = {

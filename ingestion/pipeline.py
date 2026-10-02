@@ -16,6 +16,8 @@ from config import Settings
 from ingestion.chunker import CHUNK_FINGERPRINT_VERSION, SemanticChunker
 from ingestion.coref import ANNOTATION_VERSION as COREF_ANNOTATION_VERSION
 from ingestion.coref import CoreferenceResolver
+from ingestion.document_cards import CorpusCatalog, fallback_card
+from ingestion.extractor import ROW_BATCH_VERSION
 from ingestion.content_classifier import classify_content_sequence, is_graph_extractable
 from ingestion.entity_types import display_type, dominant_coarse_class
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
@@ -61,6 +63,12 @@ def pipeline_fingerprint_payload(settings: Settings, target_stage: str) -> dict[
     # no-op keeps its identity, and a corpus built with it gets a different one.
     if settings.coref_enabled:
         payload["coref_annotation"] = COREF_ANNOTATION_VERSION
+    # Likewise present only when on: batched row extraction writes different assertions.
+    if settings.extraction_table_batch_tokens > 0:
+        payload["extraction_table_batch"] = (
+            f"{ROW_BATCH_VERSION}:{settings.extraction_table_batch_tokens}"
+            f"/{settings.extraction_table_batch_max_rows}"
+        )
     return payload
 
 
@@ -151,6 +159,9 @@ class PhaseOnePipeline:
         self.settings.ensure_directories()
         self.store = MetadataStore(self.settings.metadata_db_path)
         self.parser = DocumentParser()
+        self.catalog = CorpusCatalog.load(
+            self.settings.corpus_manifest_path, self.settings.corpus_news_index_path
+        )
         self.coref = CoreferenceResolver(
             profile=self.settings.coref_profile,
             strict=self.settings.strict_coref,
@@ -262,6 +273,12 @@ class PhaseOnePipeline:
             pipeline_fingerprint=pipeline_fingerprint,
         ):
             doc_id = str(existing_row["doc_id"])
+            # A store built before document cards existed gains them on its next ingest,
+            # with no reprocessing: the card is metadata, not part of the fingerprint.
+            if not self.store.get_document_cards([doc_id]):
+                card = self.catalog.card_for(absolute_path)
+                if card:
+                    self.store.set_document_card(doc_id, card)
             active_version = self.store.get_active_document_version(doc_id)
             self.store.log_ingestion_run(
                 run_id=run_id,
@@ -318,6 +335,11 @@ class PhaseOnePipeline:
                 source_path=absolute_path,
                 doc_id=doc_id,
                 checksum=checksum,
+            )
+            self.store.set_document_card(
+                doc_id,
+                self.catalog.card_for(absolute_path)
+                or fallback_card(absolute_path, (section.heading for section in parsed.sections)),
             )
             # WP2-A: group parser items into logical sections before coreference, so
             # coref sees a whole section (reference 3.2) and the chunker has enough text
@@ -501,6 +523,7 @@ class PhaseOnePipeline:
         doc_id: str,
         chunks: list,
         active_version_id: str | None,
+        doc_format: str = "",
     ) -> ExtractionReusePlan:
         """Decide which chunks can carry their assertions forward instead of re-extracting.
 
@@ -534,6 +557,7 @@ class PhaseOnePipeline:
             for chunk in chunks
             if (chunk.extraction_text or chunk.text) in prior_by_input
         }
+        chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
         if not candidates:
             return empty
 
@@ -570,7 +594,8 @@ class PhaseOnePipeline:
             prior_rows = by_prior_chunk.get(prior_chunk_id)
             if not prior_rows:
                 continue
-            if not self._extracted_by_current_extractor(prior_rows):
+            expected = self._expected_prompt_version(chunk_by_id.get(new_chunk_id), doc_format)
+            if not self._extracted_by_current_extractor(prior_rows, expected):
                 plan.declined_extractor_changed += 1
                 continue
             endpoints = {
@@ -596,7 +621,7 @@ class PhaseOnePipeline:
                 plan.entities[entity_id] = available[entity_id]
         return plan
 
-    def _extracted_by_current_extractor(self, rows: list[dict]) -> bool:
+    def _extracted_by_current_extractor(self, rows: list[dict], expected_prompt_version: str) -> bool:
         """Would the current extractor have produced these assertions? Same input is not
         enough: a new extraction prompt or model exists to extract differently, and reusing
         across it meant a prompt change never reached text that had not changed. Judged per
@@ -605,10 +630,56 @@ class PhaseOnePipeline:
         if self.settings.extraction_reuse_across_prompts:
             return True
         return all(
-            str(row.get("extraction_prompt_version") or "") == self.settings.extraction_prompt_version
+            str(row.get("extraction_prompt_version") or "") == expected_prompt_version
             and str(row.get("extractor_model") or "") == self.settings.ingestion_model
             for row in rows
         )
+
+    def _row_batching(self, doc_format: str) -> bool:
+        # CSV and JSON rows take the GLiNER-seeded relation prompt, which does not batch.
+        return self.settings.extraction_table_batch_tokens > 0 and doc_format not in {"csv", "json"}
+
+    def _batched_prompt_version(self) -> str:
+        return f"{self.settings.extraction_prompt_version}+{ROW_BATCH_VERSION}"
+
+    def _expected_prompt_version(self, chunk, doc_format: str) -> str:  # noqa: ANN001
+        """The prompt version this chunk's assertions would carry if extracted now."""
+        if self._row_batching(doc_format) and getattr(chunk, "table_row", False):
+            return self._batched_prompt_version()
+        return self.settings.extraction_prompt_version
+
+    def _extraction_units(self, chunks: list, doc_format: str) -> list[list]:
+        """One chunk per unit, except runs of consecutive rows of one table - same heading,
+        consecutive positions - which are grouped up to the token and row limits."""
+        ordered = sorted(chunks, key=lambda chunk: (chunk.position, chunk.chunk_id))
+        if not self._row_batching(doc_format):
+            return [[chunk] for chunk in ordered]
+        budget = int(self.settings.extraction_table_batch_tokens)
+        max_rows = max(1, int(self.settings.extraction_table_batch_max_rows or 1))
+        units: list[list] = []
+        current: list = []
+        tokens = 0
+        for chunk in ordered:
+            if not chunk.table_row:
+                if current:
+                    units.append(current)
+                    current, tokens = [], 0
+                units.append([chunk])
+                continue
+            same_table = bool(current) and (
+                chunk.section_heading == current[-1].section_heading
+                and chunk.position == current[-1].position + 1
+            )
+            if current and (
+                not same_table or tokens + chunk.token_count > budget or len(current) >= max_rows
+            ):
+                units.append(current)
+                current, tokens = [], 0
+            current.append(chunk)
+            tokens += chunk.token_count
+        if current:
+            units.append(current)
+        return units
 
     def _rebuild_reused_assertions(
         self,
@@ -716,6 +787,33 @@ class PhaseOnePipeline:
                 )
                 return chunk, None
 
+        # Gate 18 (WP24): consecutive table rows are extracted in one call and split back
+        # into per-row results. Rows extracted that way record the batched prompt version;
+        # any row the batch could not serve is extracted alone, as before.
+        batched_chunk_ids: list[str] = []
+
+        def run_extract_unit(unit):  # noqa: ANN001, ANN202
+            if not (self._row_batching(doc_format) and unit[0].table_row):
+                return [run_extract(chunk) for chunk in unit]
+            try:
+                results = self.extractor.extract_rows(
+                    [chunk.extraction_text or chunk.text for chunk in unit], doc_format
+                )
+            except Exception as exc:
+                logger.warning("row_batch_failed rows=%d error=%s", len(unit), type(exc).__name__)
+                results = [None] * len(unit)
+            outcomes = []
+            for chunk, result in zip(unit, results):
+                if result is not None:
+                    try:
+                        outcomes.append((chunk, self._scope_extraction_result(chunk.chunk_id, result)))
+                        batched_chunk_ids.append(chunk.chunk_id)
+                        continue
+                    except Exception:
+                        pass
+                outcomes.append(run_extract(chunk))
+            return outcomes
+
         graph_chunks = [chunk for chunk in chunks if is_graph_extractable(chunk.content_kind)]
         skipped_reference_chunks = len(chunks) - len(graph_chunks)
 
@@ -736,10 +834,12 @@ class PhaseOnePipeline:
             doc_id=doc_id,
             chunks=graph_chunks,
             active_version_id=active_version_id,
+            doc_format=doc_format,
         )
         extractable_chunks = [
             chunk for chunk in graph_chunks if chunk.chunk_id not in reuse.assertions_by_chunk
         ]
+        units = self._extraction_units(extractable_chunks, doc_format)
         stats_before = self._extractor_stats()
         extraction_started = time.perf_counter()
         max_workers = max(1, int(self.settings.gemini_max_workers))
@@ -747,12 +847,12 @@ class PhaseOnePipeline:
         completed_chunks = 0
         progress_interval = max(1, int(self.settings.ingestion_progress_interval_chunks))
         try:
-            if max_workers == 1 or len(extractable_chunks) <= 1:
-                for chunk in extractable_chunks:
-                    outcome = run_extract(chunk)
-                    if outcome[1] is not None:
-                        extraction_results.append(outcome)
-                    completed_chunks += 1
+            if max_workers == 1 or len(units) <= 1:
+                for unit in units:
+                    for outcome in run_extract_unit(unit):
+                        if outcome[1] is not None:
+                            extraction_results.append(outcome)
+                    completed_chunks += len(unit)
                     self._log_extraction_progress(
                         completed_chunks,
                         len(extractable_chunks),
@@ -760,15 +860,16 @@ class PhaseOnePipeline:
                     )
             else:
                 with ThreadPoolExecutor(
-                    max_workers=min(max_workers, len(extractable_chunks))
+                    max_workers=min(max_workers, len(units))
                 ) as executor:
-                    futures = [executor.submit(run_extract, chunk) for chunk in extractable_chunks]
+                    futures = [executor.submit(run_extract_unit, unit) for unit in units]
                     try:
                         for future in as_completed(futures):
-                            outcome = future.result()
-                            if outcome[1] is not None:
-                                extraction_results.append(outcome)
-                            completed_chunks += 1
+                            outcomes = future.result()
+                            for outcome in outcomes:
+                                if outcome[1] is not None:
+                                    extraction_results.append(outcome)
+                            completed_chunks += len(outcomes)
                             self._log_extraction_progress(
                                 completed_chunks,
                                 len(extractable_chunks),
@@ -1000,6 +1101,9 @@ class PhaseOnePipeline:
             raw_to_final_entity_id=raw_to_final,
             raw_to_local_entity_id=disamb.entity_id_map,
             raw_entity_chunk_ids=raw_entity_chunk_ids,
+            prompt_versions={
+                chunk_id: self._batched_prompt_version() for chunk_id in batched_chunk_ids
+            },
         )
         assertions.extend(
             self._rebuild_reused_assertions(
@@ -1147,6 +1251,12 @@ class PhaseOnePipeline:
                 "input_tokens",
                 "output_tokens",
                 "total_tokens",
+                "row_batches",
+                "rows_batched",
+                "row_entities_ungrounded",
+                "row_properties_ungrounded",
+                "row_relations_cross_row",
+                "row_results_invalid",
             )
         }
 
@@ -1208,6 +1318,13 @@ class PhaseOnePipeline:
                 "reused_chunks": reused_chunks,
                 "entities": delta("entities_count"),
                 "relations": delta("relations_count"),
+                # Gate 18 batching: calls saved, and what grounding refused.
+                "row_batches": delta("row_batches"),
+                "rows_batched": delta("rows_batched"),
+                "row_entities_ungrounded": delta("row_entities_ungrounded"),
+                "row_properties_ungrounded": delta("row_properties_ungrounded"),
+                "row_relations_cross_row": delta("row_relations_cross_row"),
+                "row_results_invalid": delta("row_results_invalid"),
                 "error": error,
             },
         )

@@ -4,10 +4,14 @@ This was a stub returning `[]` from Phase 4 until 2026-09-01, so the third retri
 never contributed anything and `community_fallback_used` was true on every global query.
 See `ingestion/community_builder.py` for how the summaries are produced.
 
-No read fence is applied here. Communities are derived data rebuilt wholesale, and the
+No version fence is applied here. Communities are derived data rebuilt wholesale, and the
 builder recreates the collection per build, so whatever the collection holds is the current
 build by construction - unlike chunks and entities, which are versioned and must be fenced
 on `document_version_id`.
+
+The embedding *is* checked, as it is for chunks. The first build was embedded with
+`gemini-embedding-2`, the corpus moved to `-001`, and for four weeks every GLOBAL query
+ranked summaries by the cosine between two models' vectors (REFACTOR3 WP26).
 """
 
 from __future__ import annotations
@@ -16,10 +20,20 @@ import logging
 from typing import Any
 
 from config import Settings
+from ingestion.community_builder import embedding_stamp
 from ingestion.embedder import GeminiEmbedder
 from models.query import RetrieverResult
 
 logger = logging.getLogger(__name__)
+
+
+class CommunityEmbeddingMismatch(RuntimeError):
+    """The summaries were indexed by another embedding than the one embedding the query.
+
+    Raised rather than returning nothing, so the orchestrator reports
+    `community_retrieval_failed:CommunityEmbeddingMismatch`. A stale collection is a
+    retriever that did nothing, and must not read as one that found nothing.
+    """
 
 
 class CommunityRetriever:
@@ -64,6 +78,7 @@ class CommunityRetriever:
             )
             return []
 
+        self._check_embedding(collection, hits)
         results: list[RetrieverResult] = []
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
@@ -89,6 +104,21 @@ class CommunityRetriever:
                 )
             )
         return results
+
+    def _check_embedding(self, collection: str, hits: list[Any]) -> None:
+        if not self.settings.enforce_embedding_metadata:
+            return
+        expected = embedding_stamp(self.settings)
+        for hit in hits:
+            payload = getattr(hit, "payload", None) or {}
+            found = {key: payload.get(key) for key in expected}
+            if found != expected:
+                raise CommunityEmbeddingMismatch(
+                    f"Collection {collection!r} was indexed with "
+                    f"{found.get('embedding_model_id') or 'an unrecorded embedding'}; queries use "
+                    f"{expected['embedding_model_id']} ({expected['embedding_schema_version']}). "
+                    "Rebuild it: python main_admin.py communities --db <store>."
+                )
 
     def _ensure_embedder(self) -> GeminiEmbedder:
         if self._embedder is None:
