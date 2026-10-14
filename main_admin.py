@@ -26,7 +26,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from config import Settings
+from config import Settings, default_metadata_db
 from ingestion.state_store import MetadataStore
 
 
@@ -355,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def common(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--db", default="data/metadata.db", help="Metadata database path")
+        sub.add_argument("--db", default=default_metadata_db(), help="Metadata database path")
 
     reconcile = subparsers.add_parser("reconcile", help="Drive incomplete outbox events to completion")
     common(reconcile)

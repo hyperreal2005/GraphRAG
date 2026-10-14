@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from config import Settings
+from config import Settings, default_metadata_db
 from ingestion.pipeline import PhaseOnePipeline
 
 
@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True, help="Input file or directory path")
     parser.add_argument(
         "--metadata-db",
-        default="data/metadata.db",
+        default=default_metadata_db(),
         help="SQLite metadata database path",
     )
     parser.add_argument(

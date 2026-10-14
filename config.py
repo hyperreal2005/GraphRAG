@@ -7,6 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def default_metadata_db() -> str:
+    """The store a CLI uses when none is passed: METADATA_DB_PATH, else data/metadata.db.
+
+    Read by the CLIs after they load .env, never inside Settings, so an explicit
+    `metadata_db_path` - a test's temporary store, a `--db` flag - is never overridden.
+    """
+    return os.getenv("METADATA_DB_PATH") or "data/metadata.db"
+
+
 @dataclass
 class Settings:
     """Configuration defaults aligned to architecture reference."""

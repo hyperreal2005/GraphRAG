@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from config import Settings
+from config import Settings, default_metadata_db
 from retrieval.query_orchestrator import QueryOrchestrator
 
 
@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--metadata-db",
-        default="data/metadata.db",
+        default=default_metadata_db(),
         help="SQLite metadata database path",
     )
     return parser
