@@ -524,6 +524,17 @@ class MetadataStore:
             ).fetchall()
         return [str(row["version_id"]) for row in rows]
 
+    def get_all_document_version_ids(self) -> list[str] | None:
+        """Every version this store has recorded, in any status; ``None`` for a legacy store.
+
+        Entities carry the versions that produced them (`source_versions`), including
+        superseded ones, so deciding which graph nodes belong to this store needs all of them,
+        not only the active set that fences reads.
+        """
+        with self._connection() as conn:
+            rows = conn.execute("SELECT version_id FROM document_versions ORDER BY version_id").fetchall()
+        return [str(row["version_id"]) for row in rows] or None
+
     def list_document_versions(self, doc_id: str) -> list[DocumentVersion]:
         """List document versions newest first."""
         with self._connection() as conn:

@@ -22,6 +22,13 @@ reports honestly that it flags nothing at the documented threshold.
 
 Near-duplicate merging is proposed, never applied. Gate 8 still shows 10 false merges
 against gold, so an unattended job that merges on cosine alone would make identity worse.
+
+**Every pass is fenced to one store** (ROADMAP D0). Neo4j holds several corpora side by side.
+Unfenced, the healer counted orphans and conflicts across all of them, read two corpora's
+extractions of one table as a contradiction, and `--apply` would have pruned and flagged in
+every corpus at once. An entity belongs to the store when one of its `source_versions` is a
+version the store recorded; assertions are fenced on the store's active versions. A store
+that predates document versions is not fenced, as graph retrieval does.
 """
 
 from __future__ import annotations
@@ -60,8 +67,10 @@ class HealReport:
 class GraphHealer:
     """Maintenance passes over the knowledge graph. Read-only unless told otherwise."""
 
-    def __init__(self, settings: Settings, driver: Any | None = None) -> None:
+    def __init__(self, settings: Settings, driver: Any | None = None, store: Any | None = None) -> None:
         self.settings = settings
+        self._store = store
+        self._scope_params: dict[str, Any] | None = None
         if driver is not None:
             self._driver = driver
         else:
@@ -72,9 +81,27 @@ class GraphHealer:
                 auth=(settings.neo4j_user, settings.neo4j_password),
             )
 
+    # -------------------------------------------------------------------- scope
+    def _scope(self) -> dict[str, Any]:
+        """Query parameters fencing every pass to this store's versions."""
+        if self._scope_params is None:
+            store = self._store
+            if store is None:
+                from ingestion.state_store import MetadataStore
+
+                store = MetadataStore(self.settings.metadata_db_path)
+            active = store.get_queryable_document_version_ids()
+            recorded = store.get_all_document_version_ids()
+            self._scope_params = {
+                "enforce_version_fence": active is not None,
+                "store_version_ids": recorded or [],
+                "active_version_ids": active or [],
+            }
+        return self._scope_params
+
     # -------------------------------------------------------------------- orphans
     def find_orphans(self) -> list[tuple[str, str]]:
-        """Entities no active assertion references.
+        """This store's entities that none of its assertions references.
 
         These accumulate from extraction errors and one-off mentions, and from merges that
         left a node behind. They are still reachable by entity-vector search, so they can
@@ -82,12 +109,17 @@ class GraphHealer:
         """
         query = """
         MATCH (e:Entity)
-        WHERE NOT (e)--(:Assertion)
+        WHERE (NOT $enforce_version_fence
+               OR any(v IN coalesce(e.source_versions, []) WHERE v IN $store_version_ids))
+          AND NOT EXISTS {
+            MATCH (e)--(a:Assertion)
+            WHERE NOT $enforce_version_fence OR a.document_version_id IN $store_version_ids
+          }
         RETURN e.id AS id, e.name AS name
         ORDER BY e.name
         """
         with self._driver.session() as session:
-            return [(str(r["id"]), str(r["name"] or "")) for r in session.run(query)]
+            return [(str(r["id"]), str(r["name"] or "")) for r in session.run(query, self._scope())]
 
     def prune_orphans(self, dry_run: bool = True) -> tuple[int, int]:
         orphans = self.find_orphans()
@@ -103,10 +135,12 @@ class GraphHealer:
 
     # -------------------------------------------------------------- contradictions
     def find_type_conflicts(self) -> list[Contradiction]:
-        """One entity given different types by different documents."""
+        """One of this store's entities given different types by different documents."""
         query = """
         MATCH (e:Entity)
         WHERE size(e.types) > 1
+          AND (NOT $enforce_version_fence
+               OR any(v IN coalesce(e.source_versions, []) WHERE v IN $store_version_ids))
         RETURN e.id AS id, e.name AS name, e.types AS types
         """
         with self._driver.session() as session:
@@ -117,7 +151,7 @@ class GraphHealer:
                     subject_name=str(r["name"] or ""),
                     detail=" | ".join(sorted(str(t) for t in (r["types"] or []))),
                 )
-                for r in session.run(query)
+                for r in session.run(query, self._scope())
             ]
 
     def find_functional_conflicts(self) -> list[Contradiction]:
@@ -131,9 +165,11 @@ class GraphHealer:
         from ingestion.graph_writer import GraphWriter
 
         writer = GraphWriter(self.settings, driver=self._driver)
+        scope = self._scope()
         rows = writer.find_value_conflicts(
             min_single_ratio=float(self.settings.heal_functional_threshold),
             min_subjects=int(self.settings.heal_functional_min_support),
+            version_ids=scope["active_version_ids"] if scope["enforce_version_fence"] else None,
         )
         return [
             Contradiction(
@@ -187,30 +223,31 @@ class GraphHealer:
         Corroboration is by `claim_key`, which is shared across documents making the same
         claim - the same test `review_status` uses for rare predicates.
         """
-        query = """
-        MATCH (a:Assertion {active: true})
-        WHERE a.confidence < $threshold
+        fence = "AND (NOT $enforce_version_fence OR a.document_version_id IN $active_version_ids)"
+        query = f"""
+        MATCH (a:Assertion {{active: true}})
+        WHERE a.confidence < $threshold {fence}
         WITH a.claim_key AS claim_key, collect(a) AS group
         WITH claim_key, group, size(apoc.coll.toSet([x IN group | x.doc_id])) AS doc_count
         WHERE doc_count < 2
         UNWIND group AS a
         RETURN a.id AS id, a.confidence AS confidence, a.predicate_normalized AS predicate
         """
-        fallback = """
-        MATCH (a:Assertion {active: true})
-        WHERE a.confidence < $threshold
+        fallback = f"""
+        MATCH (a:Assertion {{active: true}})
+        WHERE a.confidence < $threshold {fence}
         WITH a.claim_key AS claim_key, collect(DISTINCT a.doc_id) AS docs, collect(a) AS group
         WHERE size(docs) < 2
         UNWIND group AS a
         RETURN a.id AS id, a.confidence AS confidence, a.predicate_normalized AS predicate
         """
-        threshold = float(self.settings.assertion_review_confidence_threshold)
+        params = {"threshold": float(self.settings.assertion_review_confidence_threshold), **self._scope()}
         with self._driver.session() as session:
             try:
-                rows = list(session.run(query, {"threshold": threshold}))
+                rows = list(session.run(query, params))
             except Exception:
                 # APOC is not installed on Neo4j Community by default.
-                rows = list(session.run(fallback, {"threshold": threshold}))
+                rows = list(session.run(fallback, params))
         return [
             (str(r["id"]), float(r["confidence"] or 0.0), str(r["predicate"] or ""))
             for r in rows

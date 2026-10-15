@@ -15,7 +15,7 @@ not be met:
     python main_admin.py corpus-health  --db data/corpus.db
     python main_admin.py contradictions --db data/corpus.db --limit 40
     python main_admin.py communities    --db data/corpus.db --min-size 10 --dry-run
-    python main_admin.py heal           --db data/corpus.db --dry-run
+    python main_admin.py heal           --db data/corpus.db            # dry run; --apply writes
 """
 
 from __future__ import annotations
@@ -238,14 +238,17 @@ def command_contradictions(args: argparse.Namespace) -> int:
 
     settings = _settings(args)
     writer = GraphWriter(settings)
+    # Fenced to this store's versions: Neo4j holds several corpora (ROADMAP D0).
+    version_ids = MetadataStore(settings.metadata_db_path).get_queryable_document_version_ids()
     try:
         rows = (
-            writer.find_contradictions(doc_id=args.doc_id)
+            writer.find_contradictions(doc_id=args.doc_id, version_ids=version_ids)
             if args.raw
             else writer.find_value_conflicts(
                 doc_id=args.doc_id,
                 min_single_ratio=args.min_single_ratio,
                 min_subjects=args.min_subjects,
+                version_ids=version_ids,
             )
         )
     finally:

@@ -11,6 +11,7 @@ from config import Settings
 from generation.model_adapter import build_generate_config
 from generation.usage import add_usage, extract_usage_metadata
 from generation.prompt_builder import PromptBuilder
+from generation.question_form import is_polar_question
 from models.query import AnswerClaim, Citation, FusionOutput, GraphRAGResponse, QueryAnalysis, RetrieverResult
 
 
@@ -44,6 +45,44 @@ RESYNTHESIS_INSTRUCTION = (
     "Return plain text: no JSON, no code fences, no list markers, no preamble."
 )
 JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+# ROADMAP C1. Round 5 answered 18 news yes/no questions and said yes or no in 3: the rest
+# described each source and left the verdict to the reader, and false-premise comparisons
+# were refused. Conditions are checked per named source because the questions are built that
+# way ("Does the Verge article suggest X, while the TechCrunch article alleges Y?").
+POLAR_VERDICT_INSTRUCTION = (
+    "\n\nThis question asks for a yes-or-no verdict. Set `verdict` before writing `answer`.\n"
+    "- Read the question as a set of conditions, each about the source it names, and check every "
+    "condition against the evidence from that source; its Document line shows the publication "
+    "and date.\n"
+    "- \"yes\" when every condition holds. \"no\" when any condition fails, including when the "
+    "question attributes to a source something its evidence does not say or contradicts. A false "
+    "premise is answered \"no\", followed by what the sources do report; it is not a reason to "
+    "set `answerable` to false.\n"
+    "- Reports on the same story are consistent unless they contradict each other on a fact. "
+    "Different emphasis, angle or detail is not an inconsistency, and an article that reports "
+    "both sides of a dispute - prosecution and defence, plaintiff and defendant - is reporting "
+    "the dispute, not contradicting another report.\n"
+    "- Answer the question as worded, negations included: \"Was there no change...?\" is \"yes\" "
+    "only if the portrayal stayed the same.\n"
+    "- \"insufficient\" only when the evidence does not bear on a condition at all."
+)
+# Without variant 2 a condition about an absent source is still judged, from the story.
+POLAR_ABSENT_SOURCE_JUDGED = (
+    "\n- When no evidence comes from a source the question names, judge its condition from the "
+    "evidence on the same story, and say which publication that evidence comes from."
+)
+POLAR_ANSWER_OPENING = "\n`answer` then begins with \"Yes,\" or \"No,\" matching `verdict`, and says why."
+# ROADMAP C1, variant 2. B1's one abstention miss asked what a publication absent from the
+# corpus had reported; the system answered from another outlet's coverage of the story.
+ABSENT_NAMED_SOURCE_INSTRUCTION = (
+    " When the question asks what a named publication reported and no evidence item's "
+    "Document line names that publication, set `answerable` to false: the evidence cannot show "
+    "what that publication said, and other publications' coverage of the story does not answer "
+    "for it."
+)
+VERDICTS = ("yes", "no", "insufficient")
+# A verdict the answer states itself: "Yes," / "No." - not "No single report...".
+_STATED_VERDICT = re.compile(r"^\W*(yes|no)\s*[,.;:!—-]", re.IGNORECASE)
 
 
 class AnswerGenerator:
@@ -60,6 +99,7 @@ class AnswerGenerator:
         self._client = client
         self._types = None
         self._response_schema = None
+        self._polar_response_schema = None
         self.last_usage: dict[str, int] = {}
         self._publishers: frozenset[str] | None = None
 
@@ -89,6 +129,35 @@ class AnswerGenerator:
                 self._types = types
 
         if self._types is not None:
+            claims_schema = self._types.Schema(
+                type="ARRAY",
+                items=self._types.Schema(
+                    type="OBJECT",
+                    required=["text", "evidence_ids"],
+                    properties={
+                        "claim_id": self._types.Schema(type="STRING"),
+                        "text": self._types.Schema(type="STRING"),
+                        "evidence_ids": self._types.Schema(
+                            type="ARRAY",
+                            items=self._types.Schema(type="STRING"),
+                        ),
+                    },
+                ),
+            )
+            # ROADMAP C1: polar questions only, so every other answer keeps the schema it
+            # was measured with. The verdict is ordered before the answer, which is
+            # written to it.
+            self._polar_response_schema = self._types.Schema(
+                type="OBJECT",
+                required=["answerable", "verdict", "answer", "claims"],
+                property_ordering=["answerable", "verdict", "answer", "claims"],
+                properties={
+                    "answerable": self._types.Schema(type="BOOLEAN"),
+                    "verdict": self._types.Schema(type="STRING", enum=list(VERDICTS)),
+                    "answer": self._types.Schema(type="STRING"),
+                    "claims": claims_schema,
+                },
+            )
             self._response_schema = self._types.Schema(
                 type="OBJECT",
                 # WP5-B: the model writes the prose answer itself. Concatenating claim
@@ -105,21 +174,7 @@ class AnswerGenerator:
                 properties={
                     "answerable": self._types.Schema(type="BOOLEAN"),
                     "answer": self._types.Schema(type="STRING"),
-                    "claims": self._types.Schema(
-                        type="ARRAY",
-                        items=self._types.Schema(
-                            type="OBJECT",
-                            required=["text", "evidence_ids"],
-                            properties={
-                                "claim_id": self._types.Schema(type="STRING"),
-                                "text": self._types.Schema(type="STRING"),
-                                "evidence_ids": self._types.Schema(
-                                    type="ARRAY",
-                                    items=self._types.Schema(type="STRING"),
-                                ),
-                            },
-                        ),
-                    )
+                    "claims": claims_schema,
                 },
             )
 
@@ -128,6 +183,7 @@ class AnswerGenerator:
         self.last_usage = {}
         self.last_flagged_claims: list[str] = []
         self.last_answerable = True
+        self.last_verdict: str | None = None
         if not fusion.context_items:
             return GraphRAGResponse(
                 answer="I do not have enough retrieved evidence to answer this question.",
@@ -190,6 +246,10 @@ class AnswerGenerator:
         else:
             answer = model_answer.strip() or self._join_claims(claims)
 
+        verdict = getattr(self, "last_verdict", None) if claims else None
+        if verdict in ("yes", "no"):
+            answer, verdict = self._open_with_verdict(answer, verdict)
+
         used_evidence = {
             evidence_id
             for claim in claims
@@ -227,7 +287,22 @@ class AnswerGenerator:
             degraded=bool(warnings and "insufficient_evidence" not in warnings),
             warnings=list(dict.fromkeys(warnings)),
             confidence_kind="validated_evidence_support_score",
+            verdict=verdict,
         )
+
+    @staticmethod
+    def _open_with_verdict(answer: str, verdict: str) -> tuple[str, str]:
+        """The answer opening with its verdict, and the verdict it then states.
+
+        A re-synthesised answer, or one built from claim text, does not open with the verdict
+        the model set, so it is added. An answer that opens with the other word keeps it, and
+        the response reports what the reader is shown: the prose is written after the field,
+        and it is the prose the claims must account for.
+        """
+        stated = _STATED_VERDICT.match(answer)
+        if stated:
+            return answer, stated.group(1).lower()
+        return f"{verdict.capitalize()}. {answer}", verdict
 
     def _generate_validated_claims(
         self,
@@ -243,12 +318,16 @@ class AnswerGenerator:
             analysis=analysis,
             fusion=fusion,
         )
+        refuse_absent_source = self.settings.generation_refuse_absent_named_source
+        polar = self.settings.generation_polar_verdicts and is_polar_question(question)
         prompt += (
             "\n\nFirst decide `answerable`. Set it to false **only** when the evidence does "
             "not bear on the question at all - it is about other people, other events, other "
             "subjects. Partial evidence is still answerable: if it supports even part of an "
             "answer, set true and answer that part. A multi-hop or comparative question whose "
-            "evidence covers some of what it asks is answerable.\n"
+            "evidence covers some of what it asks is answerable."
+            + (ABSENT_NAMED_SOURCE_INSTRUCTION if refuse_absent_source else "")
+            + "\n"
             "When it is false, return an empty claims array and do not write an answer whose "
             "content is that the evidence is missing - `answerable: false` already says "
             "that.\n\n"
@@ -258,6 +337,13 @@ class AnswerGenerator:
             "together the claims must account for every factual statement in `answer`. "
             "Use only evidence IDs shown in the retrieved evidence."
         )
+        if polar:
+            prompt += (
+                POLAR_VERDICT_INSTRUCTION
+                + ("" if refuse_absent_source else POLAR_ABSENT_SOURCE_JUDGED)
+                + POLAR_ANSWER_OPENING
+            )
+        schema = self._polar_response_schema if polar else self._response_schema
         last_valid: list[AnswerClaim] = []
         last_flagged: list[str] = []
         last_answer = ""
@@ -274,7 +360,7 @@ class AnswerGenerator:
                     "publication only when the cited evidence comes from it."
                 )
             try:
-                payload = self._request_payload(attempt_prompt, temperature)
+                payload = self._request_payload(attempt_prompt, temperature, schema)
             except Exception:
                 continue
             raw_claims = payload.get("claims")
@@ -284,6 +370,9 @@ class AnswerGenerator:
             # Absent means answerable, so a model that ignores the field keeps the
             # previous behaviour rather than silently refusing everything.
             self.last_answerable = bool(payload.get("answerable", True))
+            if polar:
+                verdict = str(payload.get("verdict") or "").strip().lower()
+                self.last_verdict = verdict if verdict in VERDICTS else None
             offered_claims = 0
             flagged_claims: list[str] = []
             validated: list[AnswerClaim] = []
@@ -596,7 +685,9 @@ class AnswerGenerator:
         normalized_value = " ".join(str(value).casefold().split())
         return bool(normalized_value and normalized_value in normalized_text)
 
-    def _request_payload(self, prompt: str, temperature: float) -> dict[str, Any]:
+    def _request_payload(
+        self, prompt: str, temperature: float, schema: Any | None = None
+    ) -> dict[str, Any]:
         config = None
         if self._types is not None:
             config = build_generate_config(
@@ -605,7 +696,7 @@ class AnswerGenerator:
                 temperature=temperature,
                 system_instruction=SYSTEM_INSTRUCTION,
                 response_mime_type="application/json",
-                response_schema=self._response_schema,
+                response_schema=schema or self._response_schema,
             )
         response = self._client.models.generate_content(
             model=self.settings.gemini_model,

@@ -213,7 +213,8 @@ class Settings:
     # "attribution-check" (WP24): a claim naming an outlet must cite evidence from it; the
     # retry message says so. "prose-resynthesis" (WP26): re-synthesis has its own plain-text
     # instruction, and "TechCrunch reported..." is checked at a sentence start.
-    generation_prompt_version: str = "answer-r6-prose-resynthesis-v1"
+    # "polar-verdict" (ROADMAP C1): yes/no questions carry a verdict the answer opens with.
+    generation_prompt_version: str = "answer-r7-polar-verdict-v1"
     assertion_review_confidence_threshold: float = 0.50
     # Refactor 3: an assertion whose predicate the corpus uses fewer than this many
     # times is flagged for review, unless a second document corroborates the claim.
@@ -327,6 +328,18 @@ class Settings:
     # it is a setting rather than a fixed behaviour. False restores the previous
     # behaviour of always answering.
     generation_refuse_when_unanswerable: bool = True
+    # ROADMAP C1. A polar question ("Was there consistency between the TechCrunch and
+    # Fortune reports?") gets an explicit verdict: a `verdict` field, an answer that opens
+    # with it, and a false premise answered "no" instead of refused. Adopted under the C1
+    # decision rule: correct verdicts 15/41 -> 32/41 (news 2 -> 15 of 18, held out 13 -> 17
+    # of 23), faithfulness 0.938 / 0.927, abstention controls 9 -> 10 of 10.
+    generation_polar_verdicts: bool = True
+    # ROADMAP C1, variant 2. A question asking what a named publication reported, when no
+    # evidence comes from that publication, is refused rather than answered from other
+    # outlets' coverage of the story (the B1 abstention miss). Measured and not adopted: it
+    # refused that question (20/20) but also 11 news questions V1 answers, 6 of them with a
+    # gold article at rank 1 - news verdicts 15 -> 9 of 18, entity answers 31 -> 27.
+    generation_refuse_absent_named_source: bool = False
     query_temperature_local: float = 0.1
     query_temperature_multihop: float = 0.1
     query_temperature_comparative: float = 0.2
@@ -750,6 +763,14 @@ class Settings:
         if refuse_env is not None:
             self.generation_refuse_when_unanswerable = (
                 refuse_env.strip().lower() not in {"0", "false", "no"}
+            )
+        polar_env = os.getenv("GENERATION_POLAR_VERDICTS")
+        if polar_env is not None:
+            self.generation_polar_verdicts = polar_env.strip().lower() not in {"0", "false", "no"}
+        absent_source_env = os.getenv("GENERATION_REFUSE_ABSENT_NAMED_SOURCE")
+        if absent_source_env is not None:
+            self.generation_refuse_absent_named_source = (
+                absent_source_env.strip().lower() not in {"0", "false", "no"}
             )
         sparse_env = os.getenv("QUERY_SPARSE_ENABLED")
         if sparse_env is not None:

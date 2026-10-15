@@ -133,6 +133,9 @@ class GraphRAGResponse(QueryModel):
     degraded: bool = False
     warnings: list[str] = Field(default_factory=list)
     confidence_kind: str = "retrieval_grounding_score"
+    # ROADMAP C1: "yes", "no" or "insufficient" for a yes/no question answered with
+    # `generation_polar_verdicts` on; None otherwise, and for a refusal.
+    verdict: str | None = None
     stage_timings_ms: dict[str, float] = Field(default_factory=dict)
     provider_usage: dict[str, dict[str, int]] = Field(default_factory=dict)
 

@@ -577,6 +577,7 @@ class GraphWriter:
         doc_id: str | None = None,
         min_single_ratio: float = 0.9,
         min_subjects: int = 5,
+        version_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Contradictions, as opposed to predicates that are simply multi-valued.
 
@@ -589,10 +590,15 @@ class GraphWriter:
         predicate whose subjects almost always carry exactly one value is single-valued by
         observation, and a subject with two values for it is a genuine conflict.
         `min_subjects` stops a predicate used twice from qualifying on one example.
+
+        `version_ids` fences the query to one store's versions. Neo4j holds several corpora
+        side by side, so unfenced, two corpora's extractions of one table read as a conflict,
+        and a predicate's cardinality is inferred from both (ROADMAP D0).
         """
         query = """
         MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {active: true})
-        WHERE $doc_id IS NULL OR a.doc_id = $doc_id
+        WHERE ($doc_id IS NULL OR a.doc_id = $doc_id)
+          AND ($version_ids IS NULL OR a.document_version_id IN $version_ids)
         OPTIONAL MATCH (a)-[:OBJECT]->(object:Entity)
         WITH subject.id AS subject_id,
              subject.name AS subject_name,
@@ -627,19 +633,24 @@ class GraphWriter:
                         "doc_id": doc_id,
                         "min_single_ratio": float(min_single_ratio),
                         "min_subjects": int(min_subjects),
+                        "version_ids": version_ids,
                     },
                 )
             ]
 
-    def find_contradictions(self, doc_id: str | None = None) -> list[dict[str, Any]]:
+    def find_contradictions(
+        self, doc_id: str | None = None, version_ids: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         """Every subject/predicate carrying more than one object value.
 
         The raw primitive. Most results are ordinary one-to-many relations rather than
         contradictions; prefer `find_value_conflicts`, which infers cardinality first.
+        `version_ids` fences it to one store, as there.
         """
         query = """
         MATCH (subject:Entity)-[:SUBJECT_OF]->(a:Assertion {active: true})
-        WHERE $doc_id IS NULL OR a.doc_id = $doc_id
+        WHERE ($doc_id IS NULL OR a.doc_id = $doc_id)
+          AND ($version_ids IS NULL OR a.document_version_id IN $version_ids)
         OPTIONAL MATCH (a)-[:OBJECT]->(object:Entity)
         WITH subject.id AS subject_id,
              a.predicate_normalized AS predicate,
@@ -650,7 +661,10 @@ class GraphWriter:
         ORDER BY subject_id, predicate
         """
         with self._driver.session() as session:
-            return [dict(record) for record in session.run(query, {"doc_id": doc_id})]
+            return [
+                dict(record)
+                for record in session.run(query, {"doc_id": doc_id, "version_ids": version_ids})
+            ]
 
     def preview_rollback(
         self,
