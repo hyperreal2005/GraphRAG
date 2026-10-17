@@ -17,6 +17,7 @@ ranked summaries by the cosine between two models' vectors (REFACTOR3 WP26).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from config import Settings
@@ -49,7 +50,8 @@ class CommunityRetriever:
         self._embedder = embedder
         self._client = client
 
-    def retrieve(self, query: str, top_k: int = 5) -> list[RetrieverResult]:
+    def retrieve(self, query: str, top_k: int = 5, size_prior: float = 0.0) -> list[RetrieverResult]:
+        """Community summaries nearest the query; `size_prior` > 0 favours wide communities."""
         clean_query = (query or "").strip()
         if not clean_query:
             return []
@@ -58,6 +60,8 @@ class CommunityRetriever:
             return []
 
         collection = self.settings.qdrant_communities_collection
+        prior = max(0.0, float(size_prior or 0.0))
+        limit = max(1, int(top_k))
         try:
             vector = self._ensure_embedder().embed_texts(
                 [clean_query], task_type=self.settings.query_embedding_task_type
@@ -65,7 +69,7 @@ class CommunityRetriever:
             hits = client.query_points(
                 collection_name=collection,
                 query=vector,
-                limit=max(1, int(top_k)),
+                limit=limit * 3 if prior else limit,
                 with_payload=True,
             ).points
         except Exception as exc:
@@ -79,6 +83,8 @@ class CommunityRetriever:
             return []
 
         self._check_embedding(collection, hits)
+        if prior:
+            hits = self._with_size_prior(hits, prior)[:limit]
         results: list[RetrieverResult] = []
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
@@ -99,11 +105,34 @@ class CommunityRetriever:
                         "title": title,
                         "size": payload.get("size"),
                         "doc_ids": payload.get("doc_ids") or [],
+                        "member_names": payload.get("member_names") or [],
                         "evidence_id": f"community:{community_id}",
                     },
                 )
             )
         return results
+
+    @staticmethod
+    def _with_size_prior(hits: list[Any], prior: float) -> list[Any]:
+        """Candidates reordered by cosine plus a bonus for the number of documents spanned.
+
+        ROADMAP C2 (WP11's open lever): asked for an overview of the corpus, the answer named
+        small encyclopedia clusters and not the large sport and technology ones, because
+        nothing in the ranking knows how much of the corpus a community covers. The bonus is
+        log-scaled and at most `prior`, reached by the widest candidate.
+        """
+        def span(hit: Any) -> int:
+            return len((getattr(hit, "payload", None) or {}).get("doc_ids") or [])
+
+        widest = max((span(hit) for hit in hits), default=0)
+        if widest <= 0:
+            return list(hits)
+        scale = math.log1p(widest)
+        return sorted(
+            hits,
+            key=lambda hit: float(getattr(hit, "score", 0.0) or 0.0) + prior * math.log1p(span(hit)) / scale,
+            reverse=True,
+        )
 
     def _check_embedding(self, collection: str, hits: list[Any]) -> None:
         if not self.settings.enforce_embedding_metadata:

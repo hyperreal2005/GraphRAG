@@ -1574,6 +1574,29 @@ class MetadataStore:
             ).fetchall()
         return rows
 
+    def get_queryable_chunks_for_docs(self, doc_ids: Iterable[str]) -> list[sqlite3.Row]:
+        """Active chunks of these documents, fenced to active versions, in reading order.
+
+        For passages fetched by document rather than by search (ROADMAP C2), which must obey
+        the same fence the vector retriever applies to its hits.
+        """
+        ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids if doc_id))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection() as conn:
+            return conn.execute(
+                f"""
+                SELECT c.chunk_id, c.doc_id, c.text, c.section, c.page, c.document_version_id
+                FROM chunks c
+                JOIN document_versions v
+                  ON v.version_id = c.document_version_id AND v.status = 'active'
+                WHERE c.active = 1 AND c.doc_id IN ({placeholders})
+                ORDER BY c.doc_id, c.position ASC
+                """,
+                ids,
+            ).fetchall()
+
     def get_chunk_by_id(
         self,
         chunk_id: str,

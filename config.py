@@ -340,6 +340,16 @@ class Settings:
     # refused that question (20/20) but also 11 news questions V1 answers, 6 of them with a
     # gold article at rank 1 - news verdicts 15 -> 9 of 18, entity answers 31 -> 27.
     generation_refuse_absent_named_source: bool = False
+    # ROADMAP C2. For a GLOBAL or HYBRID question, each retrieved community adds this many of
+    # its most central member passages, one per document, so the answer can cite real text and
+    # draw on more of the theme's documents. 0 is off. Measured at 3 and not adopted: uncited
+    # claims 0.101 -> 0.068, but theme recall 0.567 -> 0.614, inside run-to-run noise.
+    query_community_grounding_passages: int = 0
+    # ROADMAP C2. A bonus of at most this much cosine for the community spanning the most
+    # documents among the candidates, log-scaled. 0 is off. Measured at 0.05 and not adopted:
+    # theme recall 0.567 -> 0.654, but uncited claims rose to 0.112, and the overview question
+    # it was meant for did not move.
+    query_community_size_prior: float = 0.0
     query_temperature_local: float = 0.1
     query_temperature_multihop: float = 0.1
     query_temperature_comparative: float = 0.2
@@ -764,6 +774,19 @@ class Settings:
             self.generation_refuse_when_unanswerable = (
                 refuse_env.strip().lower() not in {"0", "false", "no"}
             )
+        try:
+            self.query_community_grounding_passages = max(
+                0,
+                int(os.getenv("QUERY_COMMUNITY_GROUNDING_PASSAGES", self.query_community_grounding_passages)),
+            )
+        except ValueError:
+            pass
+        try:
+            self.query_community_size_prior = max(
+                0.0, float(os.getenv("QUERY_COMMUNITY_SIZE_PRIOR", self.query_community_size_prior))
+            )
+        except ValueError:
+            pass
         polar_env = os.getenv("GENERATION_POLAR_VERDICTS")
         if polar_env is not None:
             self.generation_polar_verdicts = polar_env.strip().lower() not in {"0", "false", "no"}

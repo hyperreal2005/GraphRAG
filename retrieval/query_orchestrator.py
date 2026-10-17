@@ -12,9 +12,10 @@ from typing import Any
 from config import Settings
 from generation.generator import AnswerGenerator
 from ingestion.state_store import MetadataStore
-from models.query import FusionOutput, GraphRAGResponse, RetrieverResult
+from models.query import FusionOutput, GraphRAGResponse, QueryType, RetrieverResult
 from retrieval.analyzer import QueryAnalyzer
 from retrieval.cache import NoOpCache
+from retrieval.community_grounding import ground_communities
 from retrieval.community_retriever import CommunityRetriever
 from retrieval.entity_linker import EntityLinker
 from retrieval.fusion import FusionEngine
@@ -186,6 +187,13 @@ class QueryOrchestrator:
             fn=self._traced("community_retrieval", self.community_retriever.retrieve),
             query=user_query,
             timeout_seconds=self.settings.query_vector_timeout_seconds,
+            # ROADMAP C2: like grounding, for the question types it was measured on.
+            **(
+                {"size_prior": float(self.settings.query_community_size_prior)}
+                if self.settings.query_community_size_prior
+                and analysis.query_type in (QueryType.GLOBAL, QueryType.HYBRID)
+                else {}
+            ),
         )
 
         graph_outcome, vector_outcome, community_outcome = await asyncio.gather(
@@ -209,6 +217,9 @@ class QueryOrchestrator:
             if warning is not None
         )
         community_fallback_used = bool(analysis.retrieval_flags.get("community")) and not community_results
+        vector_results = list(vector_results) + await self._ground_communities(
+            analysis, community_results, warnings, stage_timings_ms
+        )
 
         stage_started = time.perf_counter()
         try:
@@ -267,6 +278,40 @@ class QueryOrchestrator:
             },
         )
         return response
+
+    async def _ground_communities(
+        self,
+        analysis: Any,
+        community_results: list[RetrieverResult],
+        warnings: list[str],
+        stage_timings_ms: dict[str, float],
+    ) -> list[RetrieverResult]:
+        """Central member passages for the retrieved communities (ROADMAP C2).
+
+        GLOBAL and HYBRID only, so questions of every other type keep the evidence they
+        were measured with even when the analyzer switches community retrieval on.
+        """
+        per_community = int(self.settings.query_community_grounding_passages)
+        if (
+            per_community <= 0
+            or not community_results
+            or self.store is None
+            or analysis.query_type not in (QueryType.GLOBAL, QueryType.HYBRID)
+        ):
+            return []
+        results, warning, duration = await self._to_thread_or_empty(
+            component="community_grounding",
+            enabled=True,
+            fn=self._traced("community_grounding", ground_communities),
+            communities=community_results,
+            store=self.store,
+            per_community=per_community,
+            timeout_seconds=self.settings.query_vector_timeout_seconds,
+        )
+        stage_timings_ms["community_grounding"] = duration
+        if warning is not None:
+            warnings.append(warning)
+        return results
 
     async def _to_thread_or_empty(
         self,
