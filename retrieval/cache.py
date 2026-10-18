@@ -4,7 +4,7 @@ Three implementations of one interface:
 
 * `NoOpCache` - always misses, keeps nothing. The default, and what every evaluation uses.
 * `RedisCache` - the architecture's store: `query_cache:{key}` holds a response as JSON with a
-  TTL, and `session:{id}:chain` the session's last turns.
+  TTL, and `session:{id}:chain` the session's last turns, both under a `graphrag:` prefix.
 * `MemoryCache` - the same behaviour inside one process, used when Redis cannot be reached, so
   a chat still remembers its turns and a query never fails over its cache.
 """
@@ -90,14 +90,17 @@ class RedisCache:
     """The architecture's Redis store. Any Redis failure reads as a miss and logs a warning:
     a cache that is down must cost recomputation, never an answer."""
 
-    def __init__(self, client: Any, max_turns: int = 10, session_ttl_seconds: int = 86400) -> None:
+    def __init__(
+        self, client: Any, max_turns: int = 10, session_ttl_seconds: int = 86400, prefix: str = "graphrag:"
+    ) -> None:
         self._client = client
         self.max_turns = max(1, int(max_turns))
         self.session_ttl_seconds = max(1, int(session_ttl_seconds))
+        self.prefix = prefix
 
     def get_query(self, query_hash: str) -> dict[str, Any] | None:
         try:
-            raw = self._client.get(f"query_cache:{query_hash}")
+            raw = self._client.get(f"{self.prefix}query_cache:{query_hash}")
         except Exception as exc:
             logger.warning("redis_cache_get_failed error_type=%s", type(exc).__name__)
             return None
@@ -112,7 +115,7 @@ class RedisCache:
     def set_query(self, query_hash: str, response_payload: dict[str, Any], ttl_seconds: int) -> None:
         try:
             self._client.setex(
-                f"query_cache:{query_hash}",
+                f"{self.prefix}query_cache:{query_hash}",
                 max(1, int(ttl_seconds)),
                 json.dumps(response_payload, default=str),
             )
@@ -120,7 +123,7 @@ class RedisCache:
             logger.warning("redis_cache_set_failed error_type=%s", type(exc).__name__)
 
     def append_session_entry(self, session_id: str, entry: dict[str, Any]) -> None:
-        key = f"session:{session_id}:chain"
+        key = f"{self.prefix}session:{session_id}:chain"
         record = json.dumps({**entry, "timestamp": entry.get("timestamp") or time.time()}, default=str)
         try:
             self._client.rpush(key, record)
@@ -131,7 +134,7 @@ class RedisCache:
 
     def get_session_entries(self, session_id: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
-            raw = self._client.lrange(f"session:{session_id}:chain", -max(1, int(limit)), -1)
+            raw = self._client.lrange(f"{self.prefix}session:{session_id}:chain", -max(1, int(limit)), -1)
         except Exception as exc:
             logger.warning("redis_session_read_failed error_type=%s", type(exc).__name__)
             return []
@@ -160,7 +163,9 @@ def build_cache(settings: Any) -> NoOpCache | MemoryCache | RedisCache:
 
             client = redis.Redis.from_url(url, socket_timeout=1.0, socket_connect_timeout=1.0, decode_responses=True)
             client.ping()
-            return RedisCache(client, max_turns=max_turns, session_ttl_seconds=session_ttl)
+            return RedisCache(
+                client, max_turns=max_turns, session_ttl_seconds=session_ttl, prefix=str(settings.redis_key_prefix)
+            )
         except Exception as exc:
             logger.warning("redis_unavailable error_type=%s; using the in-process cache", type(exc).__name__)
     return MemoryCache(max_turns=max_turns, session_ttl_seconds=session_ttl)

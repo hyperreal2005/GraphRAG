@@ -32,11 +32,13 @@ services:
     restart: unless-stopped
   # ROADMAP D2: the query cache and session chains (architecture 4.3). Both are derived and
   # short-lived - a lost cache costs one recomputation - so nothing is persisted to disk.
+  # Host port 6380, not 6379: another stack on this machine runs its own Redis there, and
+  # GraphRAG must never write into another application's store.
   redis:
     image: redis:7.4-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

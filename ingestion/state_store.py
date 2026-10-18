@@ -1318,6 +1318,47 @@ class MetadataStore:
         }
         return {doc_id: card for doc_id, card in cards.items() if card}
 
+    def document_overview(
+        self,
+        *,
+        status: str | None = None,
+        search: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[int, list[sqlite3.Row]]:
+        """Documents with their active version and active chunk count, for the API (ROADMAP D3).
+
+        Returns the total matching and one page. `search` matches the title or the source path.
+        """
+        where = ["(:status IS NULL OR d.status = :status)"]
+        if search:
+            where.append("(d.title LIKE :pattern OR d.source_path LIKE :pattern)")
+        params = {
+            "status": status,
+            "pattern": f"%{search}%" if search else None,
+            "limit": max(1, min(500, int(limit))),
+            "offset": max(0, int(offset)),
+        }
+        clause = " AND ".join(where)
+        with self._connection() as conn:
+            total = conn.execute(f"SELECT count(*) FROM documents d WHERE {clause}", params).fetchone()[0]
+            rows = conn.execute(
+                f"""
+                SELECT d.doc_id, d.title, d.publisher, d.published, d.format, d.status,
+                       d.source_path, d.ingested_at, d.word_count, d.last_error,
+                       v.version_id AS active_version_id,
+                       (SELECT count(*) FROM chunks c
+                        WHERE c.document_version_id = v.version_id AND c.active = 1) AS active_chunks
+                FROM documents d
+                LEFT JOIN document_versions v ON v.doc_id = d.doc_id AND v.status = 'active'
+                WHERE {clause}
+                ORDER BY coalesce(d.title, d.source_path)
+                LIMIT :limit OFFSET :offset
+                """,
+                params,
+            ).fetchall()
+        return int(total), rows
+
     def list_documents(self, status: str | None = None, pipeline_stage: str | None = None) -> list[sqlite3.Row]:
         """List documents filtered by optional status/stage."""
         clauses = []

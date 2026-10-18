@@ -414,7 +414,10 @@ class Settings:
     query_cache_global_ttl_seconds: int = 21600
     # ROADMAP D2. The query cache and session chains live in Redis (architecture 4.3); when it
     # cannot be reached, an in-process cache stands in and no query fails over it.
-    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_url: str = "redis://127.0.0.1:6380/0"
+    # Every key GraphRAG writes starts with this, so even a Redis shared with another application
+    # could never mix their keys.
+    redis_key_prefix: str = "graphrag:"
     # ROADMAP D2 (architecture 9.5). A follow-up question is read in the light of the session's
     # earlier turns: rewritten to stand alone, with their entities as extra graph seeds.
     # Measured and adopted: on 30 follow-ups ambiguous by construction, 5 answered alone, 21
@@ -427,6 +430,13 @@ class Settings:
     session_max_turns: int = 10
     session_context_turns: int = 3
     session_ttl_seconds: int = 86400
+    # ROADMAP D3. The API binds to localhost; `main_api.py` refuses any other address unless
+    # API_TOKEN is set, and with a token every request must carry it. Ingest requests may only
+    # name paths under these roots, relative to the working directory.
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+    api_token: str | None = None
+    api_ingest_roots: tuple[str, ...] = ("data",)
     # WP1 evaluation harness (docs/REFACTOR2.md section 3)
     eval_judge_model: str = "gemini-3.5-flash-lite"
     # Phase 10.1. Off by default so nothing needs a collector; enable to send every query
@@ -712,6 +722,16 @@ class Settings:
         except ValueError:
             pass
         self.redis_url = os.getenv("REDIS_URL", self.redis_url)
+        self.redis_key_prefix = os.getenv("REDIS_KEY_PREFIX", self.redis_key_prefix)
+        self.api_host = os.getenv("API_HOST", self.api_host)
+        try:
+            self.api_port = int(os.getenv("API_PORT", self.api_port))
+        except ValueError:
+            pass
+        self.api_token = os.getenv("API_TOKEN") or self.api_token
+        roots_env = os.getenv("API_INGEST_ROOTS")
+        if roots_env:
+            self.api_ingest_roots = tuple(r.strip() for r in roots_env.split(",") if r.strip())
         for name in ("session_max_turns", "session_context_turns", "session_ttl_seconds"):
             try:
                 setattr(self, name, max(1, int(os.getenv(name.upper(), getattr(self, name)))))
