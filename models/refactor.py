@@ -277,6 +277,8 @@ OutboxEventType = Literal[
     "ACTIVATE_VERSION",
     "RETRACT_VERSION",
     "REFRESH_ENTITY_VECTOR",
+    # ROADMAP D1: retract a removed document's last version, with nothing replacing it.
+    "REMOVE_VERSION",
 ]
 
 

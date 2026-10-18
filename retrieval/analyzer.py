@@ -67,8 +67,12 @@ class QueryAnalyzer:
         )
         self._schema = self._build_schema(types)
 
-    def analyze(self, user_query: str) -> QueryAnalysis:
-        """Return structured query analysis for retrieval orchestration."""
+    def analyze(self, user_query: str, history: list[dict[str, Any]] | None = None) -> QueryAnalysis:
+        """Return structured query analysis for retrieval orchestration.
+
+        With `history` - the session's earlier turns, oldest first (ROADMAP D2) - the same call
+        also rewrites the query to stand alone. Without it the request is unchanged.
+        """
         clean_query = user_query.strip()
         if not clean_query:
             return self._heuristic_analysis(clean_query)
@@ -77,10 +81,28 @@ class QueryAnalyzer:
             return self._heuristic_analysis(clean_query)
 
         try:
-            payload = self._analyze_with_model(clean_query)
-            return self._analysis_from_payload(payload, fallback_query=clean_query)
+            payload = self._analyze_with_model(clean_query, history or [])
+            analysis = self._analysis_from_payload(payload, fallback_query=clean_query)
         except Exception:
             return self._heuristic_analysis(clean_query)
+        if history:
+            standalone = str(payload.get("standalone_query") or "").strip()
+            analysis.standalone_query = standalone or None
+        return analysis
+
+    @staticmethod
+    def _conversation_block(history: list[dict[str, Any]]) -> str:
+        """The earlier turns as the model sees them: each question, and its answer cut short."""
+        lines = []
+        for number, turn in enumerate(history, start=1):
+            asked = str(turn.get("standalone_query") or turn.get("query") or "").strip()
+            answer = " ".join(str(turn.get("answer") or "").split())
+            if len(answer) > 400:
+                answer = answer[:397].rstrip() + "..."
+            lines.append(f"TURN {number} QUESTION: {asked}")
+            if answer:
+                lines.append(f"TURN {number} ANSWER: {answer}")
+        return "\n".join(lines)
 
     def _build_schema(self, types: Any) -> Any:
         return types.Schema(
@@ -116,7 +138,7 @@ class QueryAnalyzer:
             },
         )
 
-    def _analyze_with_model(self, user_query: str) -> dict[str, Any]:
+    def _analyze_with_model(self, user_query: str, history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         prompt = (
             "Classify this query for a GraphRAG retrieval system.\n"
             "Return strict JSON with keys:\n"
@@ -133,6 +155,26 @@ class QueryAnalyzer:
             "- hybrid: needs global synthesis and specific entities together\n"
             f"QUERY: {user_query}"
         )
+        schema = self._schema
+        if history:
+            # ROADMAP D2: a follow-up is analysed as the question it stands for.
+            prompt = (
+                "This query continues a conversation. The earlier turns, oldest first:\n"
+                f"{self._conversation_block(history)}\n\n"
+                f"{prompt}\n\n"
+                "Also return `standalone_query`: the query rewritten so it can be understood "
+                "without the conversation. Replace pronouns and references - he, she, it, they, "
+                "that report, the company, the second one - with what they refer to in the earlier "
+                "turns, and keep everything else exactly as asked. If the query already stands "
+                "alone, return it unchanged. Classify the standalone query, and list the entities "
+                "it mentions."
+            )
+            if self._types is not None and schema is not None:
+                schema = self._types.Schema(
+                    type="OBJECT",
+                    required=[*schema.required, "standalone_query"],
+                    properties={**schema.properties, "standalone_query": self._types.Schema(type="STRING")},
+                )
         config = None
         if self._types is not None:
             config = build_generate_config(
@@ -140,7 +182,7 @@ class QueryAnalyzer:
                 self.settings.gemini_model,
                 temperature=0.0,
                 response_mime_type="application/json",
-                response_schema=self._schema,
+                response_schema=schema,
             )
         response = self._client.models.generate_content(
             model=self.settings.gemini_model,

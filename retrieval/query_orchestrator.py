@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import inspect
 import logging
 import time
@@ -12,9 +13,9 @@ from typing import Any
 from config import Settings
 from generation.generator import AnswerGenerator
 from ingestion.state_store import MetadataStore
-from models.query import FusionOutput, GraphRAGResponse, QueryType, RetrieverResult
+from models.query import FusionOutput, GraphRAGResponse, LinkedEntity, QueryType, RetrieverResult
 from retrieval.analyzer import QueryAnalyzer
-from retrieval.cache import NoOpCache
+from retrieval.cache import build_cache
 from retrieval.community_grounding import ground_communities
 from retrieval.community_retriever import CommunityRetriever
 from retrieval.entity_linker import EntityLinker
@@ -44,7 +45,7 @@ class QueryOrchestrator:
         store: MetadataStore | None = None,
     ) -> None:
         self.settings = settings
-        self.cache = cache or NoOpCache()
+        self.cache = cache or build_cache(settings)
         self.store = store
         if self.store is None and (graph_retriever is None or fusion_engine is None):
             self.store = MetadataStore(settings.metadata_db_path)
@@ -107,11 +108,19 @@ class QueryOrchestrator:
 
     async def _query(self, user_query: str, session_id: str = "default") -> GraphRAGResponse:
         """Execute analyze -> retrieve -> fuse -> generate."""
-        cache_key = self._build_cache_key(user_query=user_query, session_id=session_id)
-        if self.settings.query_cache_enabled:
-            cached_payload = self.cache.get_query(cache_key)
-            if isinstance(cached_payload, dict):
-                return GraphRAGResponse.from_dict(cached_payload)
+        asked = user_query
+        history = (
+            self.cache.get_session_entries(session_id, limit=int(self.settings.session_context_turns))
+            if self._remembers(session_id)
+            else []
+        )
+        # A first turn means what it says, so the cache can answer before any model call. A
+        # follow-up is looked up only once analysis has said what it stands for.
+        if not history:
+            cached = self._cached_response(user_query)
+            if cached is not None:
+                self._remember(session_id, asked, user_query, [], cached)
+                return cached
 
         warnings: list[str] = []
         stage_timings_ms: dict[str, float] = {}
@@ -120,7 +129,11 @@ class QueryOrchestrator:
         stage_started = time.perf_counter()
         try:
             analysis = await asyncio.wait_for(
-                asyncio.to_thread(self._traced("analysis", self.analyzer.analyze), user_query),
+                asyncio.to_thread(
+                    self._traced("analysis", self.analyzer.analyze),
+                    user_query,
+                    *([history] if history else []),
+                ),
                 timeout=max(0.1, float(self.settings.query_analysis_timeout_seconds)),
             )
         except Exception as exc:
@@ -135,6 +148,15 @@ class QueryOrchestrator:
                 provider_usage=self._provider_usage(),
             )
         stage_timings_ms["analysis"] = (time.perf_counter() - stage_started) * 1000.0
+        if history and analysis.standalone_query:
+            # ROADMAP D2: every later stage - linking, retrieval, reranking, generation and the
+            # cache - works on the question the follow-up stands for.
+            user_query = analysis.standalone_query
+            cached = self._cached_response(user_query)
+            if cached is not None:
+                cached.interpreted_query = user_query if user_query != asked else None
+                self._remember(session_id, asked, user_query, [], cached)
+                return cached
         stage_started = time.perf_counter()
         try:
             async_link = getattr(self.entity_linker, "alink_entities", None)
@@ -158,6 +180,8 @@ class QueryOrchestrator:
             warnings.append(f"entity_linking_failed:{type(exc).__name__}")
             linked_entities = []
         stage_timings_ms["entity_linking"] = (time.perf_counter() - stage_started) * 1000.0
+        if history and self.settings.session_entity_seeds:
+            linked_entities = self._with_session_seeds(linked_entities, history)
 
         graph_task = self._to_thread_or_empty(
             component="graph_retrieval",
@@ -264,20 +288,81 @@ class QueryOrchestrator:
         response.stage_timings_ms = stage_timings_ms
         response.provider_usage = self._provider_usage()
 
-        if self.settings.query_cache_enabled:
-            self.cache.set_query(
-                query_hash=cache_key,
-                response_payload=response.to_dict(),
-                ttl_seconds=int(self.settings.query_cache_ttl_seconds),
+        response.interpreted_query = user_query if user_query != asked else None
+        # A degraded answer - a stage failed or timed out - is never cached: the next asking
+        # may well get the real one.
+        if self.settings.query_cache_enabled and not response.degraded:
+            ttl = (
+                self.settings.query_cache_global_ttl_seconds
+                if analysis.query_type in (QueryType.GLOBAL, QueryType.HYBRID)
+                else self.settings.query_cache_ttl_seconds
             )
+            self.cache.set_query(
+                query_hash=self._build_cache_key(user_query),
+                response_payload=response.to_dict(),
+                ttl_seconds=int(ttl),
+            )
+        self._remember(session_id, asked, user_query, linked_entities, response)
+        return response
+
+    def _remembers(self, session_id: str | None) -> bool:
+        """Only a real session has a memory. A caller that names none gets "default", and
+        sharing one conversation between every such caller would mix unrelated questions."""
+        return bool(self.settings.session_memory_enabled) and str(session_id or "default") != "default"
+
+    def _cached_response(self, question: str) -> GraphRAGResponse | None:
+        if not self.settings.query_cache_enabled:
+            return None
+        started = time.perf_counter()
+        payload = self.cache.get_query(self._build_cache_key(question))
+        if not isinstance(payload, dict):
+            return None
+        response = GraphRAGResponse.from_dict(payload)
+        response.cached = True
+        # What this response cost, not what the original did: one lookup, no provider calls.
+        response.stage_timings_ms = {"cache_lookup": (time.perf_counter() - started) * 1000.0}
+        response.provider_usage = {}
+        return response
+
+    def _remember(
+        self,
+        session_id: str,
+        asked: str,
+        question: str,
+        linked_entities: list[Any],
+        response: GraphRAGResponse,
+    ) -> None:
+        """Append the turn to the session chain (architecture 9.5)."""
+        if not self._remembers(session_id):
+            return
         self.cache.append_session_entry(
             session_id=session_id,
             entry={
-                "query": user_query,
+                "query": asked,
+                "standalone_query": question,
+                "answer": response.answer[:600],
                 "linked_entities": [entity.to_dict() for entity in linked_entities],
             },
         )
-        return response
+
+    @staticmethod
+    def _with_session_seeds(linked_entities: list[Any], history: list[dict[str, Any]]) -> list[Any]:
+        """Add the previous turn's linked entities as extra graph seeds (architecture 9.5).
+
+        "Tell me about Elon Musk", then "What companies did he found?": his node becomes a
+        starting point for traversal even though the second question never names him.
+        """
+        present = {getattr(entity, "entity_id", None) for entity in linked_entities}
+        seeds = []
+        for raw in (history[-1].get("linked_entities") or []) if history else []:
+            try:
+                entity = LinkedEntity.model_validate(raw)
+            except Exception:
+                continue
+            if entity.entity_id and entity.entity_id not in present:
+                present.add(entity.entity_id)
+                seeds.append(entity.model_copy(update={"mention": f"session:{entity.mention}"}))
+        return [*linked_entities, *seeds]
 
     async def _ground_communities(
         self,
@@ -397,9 +482,34 @@ class QueryOrchestrator:
                     deduped[key] = item
         return list(deduped.values())
 
-    def _build_cache_key(self, user_query: str, session_id: str) -> str:
-        payload = f"{session_id}|{user_query.strip().lower()}"
+    def _build_cache_key(self, question: str) -> str:
+        """The question, and everything that decides its answer (ROADMAP D2).
+
+        Not the session: a cached answer depends on what was asked, and a follow-up is keyed by
+        the standalone question it was rewritten to. The corpus token makes any ingest, removal
+        or configuration change invalidate every entry, rather than serve an answer from a
+        corpus that no longer exists.
+        """
+        payload = f"{self._corpus_state_token()}|{' '.join(question.strip().lower().split())}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _corpus_state_token(self) -> str:
+        s = self.settings
+        versions = self.store.get_queryable_document_version_ids() if self.store is not None else None
+        state = {
+            "versions": sorted(versions) if versions is not None else None,
+            "store": str(s.metadata_db_path),
+            "collections": [s.qdrant_chunks_collection, s.qdrant_entities_collection, s.qdrant_communities_collection],
+            "models": [s.gemini_model, s.embedding_model_id, s.embedding_version, s.query_rerank_model],
+            "prompts": [s.generation_prompt_version, s.extraction_prompt_version, s.embedding_prompt_version],
+            "query": [
+                s.query_rerank_enabled, s.query_vector_top_k, s.query_context_max_items,
+                s.generation_polar_verdicts, s.generation_refuse_absent_named_source,
+                s.generation_refuse_when_unanswerable, s.query_community_grounding_passages,
+                s.query_community_size_prior, s.enable_graph,
+            ],
+        }
+        return hashlib.sha256(json.dumps(state, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     def close(self) -> None:
         resources = [

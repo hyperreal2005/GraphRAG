@@ -702,30 +702,84 @@ class MetadataStore:
     def enqueue_outbox_event(self, event: OutboxEvent) -> None:
         """Insert an event once; replaying the same enqueue is a no-op."""
         with self._connection() as conn:
+            self._insert_outbox_event(conn, event)
+
+    @staticmethod
+    def _insert_outbox_event(conn: sqlite3.Connection, event: OutboxEvent) -> None:
+        conn.execute(
+            """
+            INSERT INTO outbox_events (
+                event_id, event_type, run_id, doc_id, document_version_id,
+                payload_json, status, attempts, available_at, last_error,
+                created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (
+                event.event_id,
+                event.event_type,
+                event.run_id,
+                event.doc_id,
+                event.document_version_id,
+                event.payload_json,
+                event.status,
+                event.attempts,
+                event.available_at.isoformat(),
+                event.last_error,
+                event.created_at.isoformat(),
+                event.completed_at.isoformat() if event.completed_at else None,
+            ),
+        )
+
+    def deactivate_document(self, doc_id: str, version_id: str, removal_event: OutboxEvent) -> None:
+        """Take a document out of the corpus, and queue its retraction, in one transaction.
+
+        ROADMAP D1. Every read path fences on SQLite's active versions, so the document stops
+        being served the moment this commits; the queued event then deletes what Neo4j and
+        Qdrant still hold for the version, and is retried like any other if it fails. The
+        version becomes `superseded`, the state a replaced version is left in, so every
+        existing fence and check already treats it correctly. The document row keeps its
+        source path: re-adding the file ingests it again under the same doc id.
+        """
+        now = utc_now_iso()
+        with self._connection() as conn:
+            updated = conn.execute(
+                """
+                UPDATE document_versions
+                SET status = 'superseded', superseded_at = ?, last_completed_stage = 'REMOVED'
+                WHERE version_id = ? AND doc_id = ? AND status = 'active'
+                """,
+                (now, version_id, doc_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(f"Version {version_id} is not the active version of {doc_id}.")
+            conn.execute("UPDATE chunks SET active = 0 WHERE doc_id = ?", (doc_id,))
+            conn.execute("UPDATE entity_mentions SET active = 0 WHERE doc_id = ?", (doc_id,))
+            conn.execute("UPDATE version_doc_entities SET active = 0 WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM doc_entities WHERE doc_id = ?", (doc_id,))
             conn.execute(
                 """
-                INSERT INTO outbox_events (
-                    event_id, event_type, run_id, doc_id, document_version_id,
-                    payload_json, status, attempts, available_at, last_error,
-                    created_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(event_id) DO NOTHING
+                UPDATE documents
+                SET status = 'removed', pipeline_stage = 'REMOVED', last_completed_stage = 'REMOVED',
+                    active_checksum = NULL, active_pipeline_fingerprint = NULL, last_error = NULL
+                WHERE doc_id = ?
                 """,
-                (
-                    event.event_id,
-                    event.event_type,
-                    event.run_id,
-                    event.doc_id,
-                    event.document_version_id,
-                    event.payload_json,
-                    event.status,
-                    event.attempts,
-                    event.available_at.isoformat(),
-                    event.last_error,
-                    event.created_at.isoformat(),
-                    event.completed_at.isoformat() if event.completed_at else None,
-                ),
+                (doc_id,),
             )
+            self._insert_outbox_event(conn, removal_event)
+
+    def list_documents_missing_source(self, root: Path) -> list[sqlite3.Row]:
+        """Documents still in the corpus whose source file under `root` no longer exists."""
+        prefix = str(Path(root).resolve())
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT doc_id, source_path, title, status FROM documents WHERE status <> 'removed'"
+            ).fetchall()
+        return [
+            row
+            for row in rows
+            if str(row["source_path"]).startswith(prefix) and not Path(row["source_path"]).exists()
+        ]
 
     def claim_next_outbox_event(
         self,

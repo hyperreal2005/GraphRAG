@@ -16,6 +16,7 @@ not be met:
     python main_admin.py contradictions --db data/corpus.db --limit 40
     python main_admin.py communities    --db data/corpus.db --min-size 10 --dry-run
     python main_admin.py heal           --db data/corpus.db            # dry run; --apply writes
+    python main_admin.py remove-document --db data/corpus.db --path <file>   # dry run; --apply removes
 """
 
 from __future__ import annotations
@@ -313,6 +314,56 @@ def command_communities(args: argparse.Namespace) -> int:
     return 0 if report.summarised else 1
 
 
+def command_remove_document(args: argparse.Namespace) -> int:
+    """Take one document out of the corpus (ROADMAP D1). A dry run unless --apply."""
+    import uuid
+
+    settings = _settings(args)
+    store = MetadataStore(settings.metadata_db_path)
+    if args.doc_id:
+        row = store.get_document_by_id(args.doc_id)
+    else:
+        row = store.get_document_by_source(str(Path(args.path).resolve()))
+    if row is None:
+        print("No such document in this store.")
+        return 1
+    doc_id = str(row["doc_id"])
+    active = store.get_active_document_version(doc_id)
+    source = Path(str(row["source_path"]))
+    print(f"document   {doc_id}  {row['title'] or ''}")
+    print(f"source     {source}  ({'present' if source.exists() else 'missing'})")
+    print(f"status     {row['status']}")
+    if active is None:
+        print("It has no active version: nothing is served, and nothing to remove.")
+        return 0 if row["status"] == "removed" else 1
+    chunks = store.get_chunks_for_doc(doc_id, active.version_id, active_only=True)
+    print(f"version    {active.version_id}, {len(chunks)} active chunks")
+    if not args.apply:
+        print("\nDry run. --apply removes it: it stops being served at once, then its assertions"
+              " and vectors are retracted. Entities other documents support are kept.")
+        return 0
+
+    _, graph_writer, vector_indexer, processor = _components(settings)
+    try:
+        version_id = processor.remove_document(doc_id, run_id=str(uuid.uuid4()))
+        event = next(
+            (e for e in store.list_outbox_events(document_version_id=version_id) if e.event_type == "REMOVE_VERSION"),
+            None,
+        )
+        graph_left = graph_writer.verify_document_version(version_id)
+        vectors_left = vector_indexer.count_document_version(version_id)
+    finally:
+        graph_writer.close()
+    print(f"\nRemoved. Retraction event: {event.status if event else 'missing'}"
+          + (f" ({event.last_error})" if event and event.last_error else ""))
+    print(f"left in Neo4j for the version:  {graph_left}")
+    print(f"left in Qdrant for the version: {vectors_left}")
+    print("Community summaries are derived and still reflect this document until"
+          " `main_admin.py communities` rebuilds them.")
+    done = event is not None and event.status == "completed"
+    return 0 if done and not any(graph_left.values()) and not any(vectors_left.values()) else 1
+
+
 def command_heal(args: argparse.Namespace) -> int:
     """Phase 9 graph self-healing: orphans, contradictions, confidence decay.
 
@@ -439,6 +490,14 @@ def build_parser() -> argparse.ArgumentParser:
     communities.add_argument("--limit", type=int, default=None, help="Cap communities summarised")
     communities.add_argument("--dry-run", action="store_true", help="Detect only; no provider calls")
     communities.set_defaults(func=command_communities)
+
+    remove = subparsers.add_parser("remove-document", help="Take one document out of the corpus")
+    common(remove)
+    target = remove.add_mutually_exclusive_group(required=True)
+    target.add_argument("--path", help="The document's source file (it may no longer exist)")
+    target.add_argument("--doc-id", help="The document's id")
+    remove.add_argument("--apply", action="store_true", help="Remove it (default is a dry run)")
+    remove.set_defaults(func=command_remove_document)
 
     heal = subparsers.add_parser("heal", help="Graph self-healing (Phase 9)")
     common(heal)

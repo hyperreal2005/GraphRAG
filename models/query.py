@@ -43,6 +43,9 @@ class QueryAnalysis(QueryModel):
     retrieval_flags: dict[str, bool] = Field(default_factory=dict)
     sub_queries: list[str] = Field(default_factory=list)
     temporal_filter: str | None = None
+    # ROADMAP D2: a follow-up rewritten to stand alone from its session's earlier turns
+    # ("What companies did he found?" -> "... did Elon Musk found?"). None for a first turn.
+    standalone_query: str | None = None
 
 
 class LinkedEntity(QueryModel):
@@ -136,6 +139,10 @@ class GraphRAGResponse(QueryModel):
     # ROADMAP C1: "yes", "no" or "insufficient" for a yes/no question answered with
     # `generation_polar_verdicts` on; None otherwise, and for a refusal.
     verdict: str | None = None
+    # ROADMAP D2: how a follow-up was read, when that differs from what was asked, and
+    # whether the response came from the query cache.
+    interpreted_query: str | None = None
+    cached: bool = False
     stage_timings_ms: dict[str, float] = Field(default_factory=dict)
     provider_usage: dict[str, dict[str, int]] = Field(default_factory=dict)
 

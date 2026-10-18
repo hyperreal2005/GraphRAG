@@ -410,6 +410,23 @@ class Settings:
     query_rerank_llm_snippet_chars: int = 400
     query_cache_enabled: bool = False
     query_cache_ttl_seconds: int = 3600
+    # Architecture 5.1: global and summary answers change least, so they live longer.
+    query_cache_global_ttl_seconds: int = 21600
+    # ROADMAP D2. The query cache and session chains live in Redis (architecture 4.3); when it
+    # cannot be reached, an in-process cache stands in and no query fails over it.
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    # ROADMAP D2 (architecture 9.5). A follow-up question is read in the light of the session's
+    # earlier turns: rewritten to stand alone, with their entities as extra graph seeds.
+    # Measured and adopted: on 30 follow-ups ambiguous by construction, 5 answered alone, 21
+    # with memory, 21 asked in full; topic switches unchanged. Off as a library default so
+    # tests and evaluations never touch Redis; main_query.py (and the API) turn it on.
+    session_memory_enabled: bool = False
+    # The architecture's mechanism: the previous turn's linked entities seed graph traversal.
+    # A setting so the rewrite can be measured with and without it.
+    session_entity_seeds: bool = True
+    session_max_turns: int = 10
+    session_context_turns: int = 3
+    session_ttl_seconds: int = 86400
     # WP1 evaluation harness (docs/REFACTOR2.md section 3)
     eval_judge_model: str = "gemini-3.5-flash-lite"
     # Phase 10.1. Off by default so nothing needs a collector; enable to send every query
@@ -689,6 +706,18 @@ class Settings:
         except ValueError:
             self.query_cache_ttl_seconds = self.query_cache_ttl_seconds
         try:
+            self.query_cache_global_ttl_seconds = int(
+                os.getenv("QUERY_CACHE_GLOBAL_TTL_SECONDS", self.query_cache_global_ttl_seconds)
+            )
+        except ValueError:
+            pass
+        self.redis_url = os.getenv("REDIS_URL", self.redis_url)
+        for name in ("session_max_turns", "session_context_turns", "session_ttl_seconds"):
+            try:
+                setattr(self, name, max(1, int(os.getenv(name.upper(), getattr(self, name)))))
+            except ValueError:
+                pass
+        try:
             self.query_rerank_top_n = int(os.getenv("QUERY_RERANK_TOP_N", self.query_rerank_top_n))
         except ValueError:
             self.query_rerank_top_n = self.query_rerank_top_n
@@ -938,6 +967,12 @@ class Settings:
         cache_enabled_env = os.getenv("QUERY_CACHE_ENABLED")
         if cache_enabled_env is not None:
             self.query_cache_enabled = cache_enabled_env.strip().lower() not in {"0", "false", "no"}
+        session_env = os.getenv("SESSION_MEMORY_ENABLED")
+        if session_env is not None:
+            self.session_memory_enabled = session_env.strip().lower() not in {"0", "false", "no"}
+        seeds_env = os.getenv("SESSION_ENTITY_SEEDS")
+        if seeds_env is not None:
+            self.session_entity_seeds = seeds_env.strip().lower() not in {"0", "false", "no"}
         mmr_enabled_env = os.getenv("QUERY_MMR_ENABLED")
         if mmr_enabled_env is not None:
             self.query_mmr_enabled = mmr_enabled_env.strip().lower() not in {"0", "false", "no"}

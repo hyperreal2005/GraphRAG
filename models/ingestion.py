@@ -241,6 +241,9 @@ class IngestionRunSummary:
     skipped: int = 0
     failed: int = 0
     results: list[FileIngestionResult] = field(default_factory=list)
+    # ROADMAP D1: documents in the store whose source file under the ingested directory is
+    # gone. Reported, never removed: `main_admin.py remove-document` does that, deliberately.
+    missing_sources: list[dict[str, str]] = field(default_factory=list)
 
     def add(self, result: FileIngestionResult) -> None:
         self.results.append(result)
@@ -261,4 +264,5 @@ class IngestionRunSummary:
             "skipped": self.skipped,
             "failed": self.failed,
             "results": [result.to_dict() for result in self.results],
+            "missing_sources": self.missing_sources,
         }

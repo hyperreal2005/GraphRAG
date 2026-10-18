@@ -215,6 +215,17 @@ class PhaseOnePipeline:
         summary = IngestionRunSummary()
         for file_path in files:
             summary.add(self.ingest_file(file_path))
+        if input_path.is_dir():
+            summary.missing_sources = [
+                {"doc_id": str(row["doc_id"]), "source_path": str(row["source_path"]), "title": str(row["title"] or "")}
+                for row in self.store.list_documents_missing_source(input_path)
+            ]
+            for item in summary.missing_sources:
+                logger.warning(
+                    "source_missing doc_id=%s path=%s (still served; remove with main_admin.py remove-document)",
+                    item["doc_id"],
+                    item["source_path"],
+                )
         return summary
 
     def close(self) -> None:

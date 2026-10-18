@@ -127,11 +127,16 @@ class IngestionOutboxProcessor:
                 )
                 if status == "dead_letter":
                     version = self.store.get_document_version(event.document_version_id)
-                    if version is not None and version.status == "active":
+                    if event.event_type == "REMOVE_VERSION":
+                        # The document stays removed - it is already out of every read path;
+                        # only its leftovers in Neo4j and Qdrant wait for `reconcile`.
+                        self.store.record_document_version_error(event.document_version_id, error)
+                    elif version is not None and version.status == "active":
                         self.store.record_document_version_error(event.document_version_id, error)
                     else:
                         self.store.fail_document_version(event.document_version_id, error)
-                    self.store.fail_document(event.doc_id, error)
+                    if event.event_type != "REMOVE_VERSION":
+                        self.store.fail_document(event.doc_id, error)
                     break
                 if wait_for_retries:
                     delay = max(0.0, float(self.settings.outbox_retry_base_seconds)) * (
@@ -205,6 +210,7 @@ class IngestionOutboxProcessor:
             "ACTIVATE_VERSION": self._activate,
             "RETRACT_VERSION": self._retract,
             "REFRESH_ENTITY_VECTOR": self._refresh_entities,
+            "REMOVE_VERSION": self._remove,
         }
         handlers[event.event_type](event, payload)
 
@@ -330,6 +336,55 @@ class IngestionOutboxProcessor:
         self.graph_writer.retract_document_version(retract_version_id)
         self.vector_indexer.delete_document_version(retract_version_id)
         self._finish_active_version(event.doc_id, activated_version_id)
+
+    def remove_document(self, doc_id: str, run_id: str) -> str:
+        """Take a document out of the corpus and retract its active version (ROADMAP D1).
+
+        Until D1 a deleted source file kept being served: retraction existed only inside
+        replacement, which retracts the old version once a new one is active. Removal has no
+        new version. SQLite deactivates the document and queues the retraction in one
+        transaction, so it stops being served at once; the retraction then runs here, and a
+        failure leaves the event for `reconcile` like any other. Returns the removed version.
+
+        Refused while the document has unfinished ingest events: a version still being built
+        would activate after the removal and bring the document back.
+        """
+        active = self.store.get_active_document_version(doc_id)
+        if active is None:
+            raise ValueError(f"Document {doc_id} has no active version to remove.")
+        unfinished = [
+            event
+            for event in self.store.list_outbox_events()
+            if event.doc_id == doc_id
+            and event.status in {"pending", "processing", "failed", "dead_letter"}
+            and event.event_type != "REMOVE_VERSION"
+        ]
+        if unfinished:
+            raise RuntimeError(
+                f"Document {doc_id} has {len(unfinished)} unfinished ingest event(s); "
+                "run `main_admin.py reconcile` first."
+            )
+        event = self.make_event(
+            event_type="REMOVE_VERSION",
+            run_id=run_id,
+            doc_id=doc_id,
+            document_version_id=active.version_id,
+            payload={"retract_version_id": active.version_id},
+        )
+        self.store.deactivate_document(doc_id, active.version_id, event)
+        self.reconcile(document_version_id=active.version_id, wait_for_retries=True)
+        return active.version_id
+
+    def _remove(self, event: OutboxEvent, payload: dict[str, Any]) -> None:
+        retract_version_id = self._optional_text(payload.get("retract_version_id")) or event.document_version_id
+        version = self.store.get_document_version(retract_version_id)
+        if version is None:
+            raise ValueError(f"Removal names an unknown document version {retract_version_id}.")
+        if version.status == "active":
+            # Only reachable if the version was reactivated after removal was queued.
+            raise RuntimeError("Refusing to retract the active document version.")
+        self.graph_writer.retract_document_version(retract_version_id)
+        self.vector_indexer.delete_document_version(retract_version_id)
 
     def _finish_active_version(self, doc_id: str, document_version_id: str) -> None:
         self.store.complete_document_version(document_version_id)
