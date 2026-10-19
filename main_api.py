@@ -54,7 +54,11 @@ def main() -> int:
 
     from api.main import create_app
 
-    uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level="info")
+    # On Windows uvicorn defaults to the Proactor loop, whose accept loop dies on WinError 64
+    # when a client drops a connection mid-request: the process lives on but stops listening.
+    # Seen live (a browser killed during a page load). The selector loop has no such failure.
+    loop = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+    uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level="info", loop=loop)
     return 0
 
 

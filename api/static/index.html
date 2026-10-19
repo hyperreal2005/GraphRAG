@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GraphRAG Console</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='9' cy='10' r='4' fill='%234f6bed'/%3E%3Ccircle cx='23' cy='9' r='3' fill='%234f6bed'/%3E%3Ccircle cx='16' cy='23' r='5' fill='%234f6bed'/%3E%3Cpath d='M9 10L23 9M9 10L16 23M23 9L16 23' stroke='%234f6bed' stroke-width='2'/%3E%3C/svg%3E">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M9 10L23 9M9 10L16 23M23 9L16 23"/><circle cx="9" cy="10" r="4"/><circle cx="23" cy="9" r="3"/><circle cx="16" cy="23" r="5"/></svg>
+      <span>GraphRAG</span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="ask" aria-selected="true">Ask</button>
+      <button role="tab" data-tab="corpus" aria-selected="false">Corpus</button>
+      <button role="tab" data-tab="graph" aria-selected="false">Graph</button>
+    </nav>
+    <div id="status" class="status-pill" title="Service health">…</div>
+  </header>
+
+  <main>
+    <!-- Ask -->
+    <section id="tab-ask" class="tab" role="tabpanel">
+      <div id="thread" class="thread" aria-live="polite"></div>
+      <div id="empty" class="empty">
+        <h1>Ask the corpus</h1>
+        <p class="muted">Answers cite the passages they rest on. Ask a follow-up and it is read in the light of the conversation.</p>
+        <div id="suggestions" class="suggestions"></div>
+      </div>
+      <form id="composer" class="composer">
+        <textarea id="question" rows="1" maxlength="2000" placeholder="Ask a question…" aria-label="Question"></textarea>
+        <div class="composer-actions">
+          <button type="button" id="new-session" class="ghost" title="Start a new conversation">New conversation</button>
+          <button type="submit" id="ask" class="primary">Ask</button>
+        </div>
+        <div id="session-line" class="muted small"></div>
+      </form>
+    </section>
+
+    <!-- Corpus -->
+    <section id="tab-corpus" class="tab" role="tabpanel" hidden>
+      <div id="health" class="health"></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Documents</h2>
+          <div class="filters">
+            <input id="doc-search" type="search" placeholder="Search titles and paths" aria-label="Search documents">
+            <select id="doc-status" aria-label="Status">
+              <option value="">Any status</option>
+              <option value="complete">Complete</option>
+              <option value="removed">Removed</option>
+              <option value="failed">Failed</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="docs">
+            <thead><tr><th>Title</th><th>Publisher</th><th>Published</th><th>Format</th><th>Status</th><th class="num">Chunks</th></tr></thead>
+            <tbody id="doc-rows"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span id="doc-range" class="muted small"></span>
+          <div>
+            <button id="doc-prev" class="ghost small-btn">Previous</button>
+            <button id="doc-next" class="ghost small-btn">Next</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h2>Ingest</h2>
+          <form id="ingest-form" class="ingest">
+            <input id="ingest-path" placeholder="data/inbox" aria-label="Path to ingest" required>
+            <label class="check"><input id="ingest-recursive" type="checkbox" checked> Include subfolders</label>
+            <button type="submit" class="primary">Ingest</button>
+          </form>
+          <p class="muted small">Paths must be under the API's ingest roots (by default <code>data/</code>). A changed file is re-ingested; an unchanged one is skipped.</p>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Jobs</h2>
+            <div class="row-gap">
+              <button id="run-communities" class="ghost small-btn">Rebuild communities</button>
+              <button id="run-heal" class="ghost small-btn">Run healer report</button>
+            </div>
+          </div>
+          <ul id="jobs" class="jobs"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Graph -->
+    <section id="tab-graph" class="tab" role="tabpanel" hidden>
+      <div id="graph-tiles" class="tiles"></div>
+      <div class="grid-2">
+        <div class="panel"><h2>Entity types</h2><div id="entity-types" class="bars"></div></div>
+        <div class="panel"><h2>Relation and attribute types</h2><div id="relation-types" class="bars scroll"></div></div>
+      </div>
+      <div class="panel"><h2>Growth</h2><p class="muted small">Documents and assertions per document, by the day each document's active version was made live.</p><div id="density"></div></div>
+      <div class="grid-2">
+        <div class="panel"><h2>Communities</h2><div id="community-build" class="muted small"></div><div id="communities" class="bars scroll"></div></div>
+        <div class="panel"><h2>Latest healer report</h2><div id="healer"></div></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="doc-dialog" class="drawer">
+    <form method="dialog" class="dialog-close"><button aria-label="Close">×</button></form>
+    <div id="doc-detail"></div>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="confirm">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <form method="dialog" class="confirm-actions">
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="ok" class="danger">Remove</button>
+    </form>
+  </dialog>
+
+  <dialog id="token-dialog" class="confirm">
+    <h2>API token</h2>
+    <p>This API needs a bearer token. It is kept for this browser session only.</p>
+    <form method="dialog" class="token-form">
+      <input id="token-input" type="password" autocomplete="off" aria-label="Token">
+      <div class="confirm-actions"><button value="cancel" class="ghost">Cancel</button><button value="ok" class="primary">Use token</button></div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

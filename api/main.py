@@ -13,6 +13,8 @@ Endpoints:
 * `GET /jobs`, `GET /jobs/{job_id}` - job state.
 * `POST /jobs/communities`, `POST /jobs/heal-report` - run a scheduled job now (D4).
 * `GET /schedule` - what is due: community staleness and the healer report.
+* `GET /graph/overview` - the schema emergence dashboard (architecture 9.4) for the console.
+* `GET /` - the web console (D5), a static page that calls the endpoints above.
 * `GET /health` - the stores, the embedding contract, models and the corpus of record. It
   reports state and versions, never a key or a password.
 
@@ -29,10 +31,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from api.jobs import JobRunner
+from api.overview import GraphOverview
 from background.community_job import run_community_build, staleness
 from background.healer_job import run_heal_report
 from background.scheduler import Scheduler, due_jobs
@@ -43,6 +47,7 @@ from models.query import GraphRAGResponse
 logger = logging.getLogger(__name__)
 
 SESSION_PATTERN = r"^[A-Za-z0-9_.:-]{1,100}$"
+STATIC = Path(__file__).resolve().parent / "static"
 
 
 class QueryRequest(BaseModel):
@@ -52,6 +57,9 @@ class QueryRequest(BaseModel):
 
 class QueryReply(GraphRAGResponse):
     session_id: str
+    # What each cited document is - title, publisher, date - so a reader can judge a source
+    # without a second request. Keyed by doc_id.
+    documents: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class IngestRequest(BaseModel):
@@ -175,6 +183,7 @@ def create_app(
     operations: Any | None = None,
     probes: Callable[[Settings], dict[str, Any]] | None = None,
     scheduler: Scheduler | None = None,
+    overview: GraphOverview | None = None,
 ) -> FastAPI:
     settings = settings or Settings(metadata_db_path=Path(default_metadata_db()))
     store = store or MetadataStore(settings.metadata_db_path)
@@ -184,6 +193,7 @@ def create_app(
     state: dict[str, Any] = {"orchestrator": orchestrator}
     scheduled_jobs = {"communities": lambda: operations.communities(), "heal-report": lambda: operations.heal_report()}
     scheduler = scheduler or Scheduler(settings, store, runner, scheduled_jobs)
+    overview = overview or GraphOverview(settings, store)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):  # noqa: ANN202
@@ -218,6 +228,15 @@ def create_app(
 
     guard = [Depends(authorised)]
 
+    @app.middleware("http")
+    async def console_revalidates(request: Request, call_next):  # noqa: ANN001, ANN202
+        # The console's files change with the code; without this a browser keeps serving an
+        # old page after an update (seen: a stale index.html beside a fresh stylesheet).
+        response = await call_next(request)
+        if request.url.path.startswith("/console"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     @app.exception_handler(Exception)
     async def unhandled(_: Request, exc: Exception) -> JSONResponse:
         logger.exception("api_unhandled error_type=%s", type(exc).__name__)
@@ -227,7 +246,12 @@ def create_app(
     async def query(body: QueryRequest) -> QueryReply:
         session_id = body.session_id or f"api-{uuid.uuid4().hex[:12]}"
         response = await state["orchestrator"].query(user_query=body.question, session_id=session_id)
-        return QueryReply(**response.to_dict(), session_id=session_id)
+        cards = store.get_document_cards(c.doc_id for c in response.citations if c.doc_id)
+        documents = {
+            doc_id: {"title": card.title, "publisher": card.publisher, "published": card.published}
+            for doc_id, card in cards.items()
+        }
+        return QueryReply(**response.to_dict(), session_id=session_id, documents=documents)
 
     @app.get("/sessions/{session_id}", dependencies=guard)
     async def session(session_id: str) -> dict[str, Any]:
@@ -323,6 +347,21 @@ def create_app(
 
         due = due_jobs(settings, store, datetime.now())
         return {"scheduler_enabled": settings.scheduler_enabled, "tick_seconds": settings.scheduler_tick_seconds, **due}
+
+    @app.get("/graph/overview", dependencies=guard)
+    async def graph_overview() -> dict[str, Any]:
+        import asyncio
+
+        return await asyncio.to_thread(overview.get)
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse("/console/")
+
+    # The console holds no data - every figure it shows comes through the guarded endpoints -
+    # so its files are served without the token, which it asks for when a call is refused.
+    if STATIC.is_dir():
+        app.mount("/console", StaticFiles(directory=STATIC, html=True), name="console")
 
     @app.get("/health", dependencies=guard)
     async def health() -> dict[str, Any]:
