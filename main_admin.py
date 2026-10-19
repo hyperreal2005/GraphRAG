@@ -17,6 +17,7 @@ not be met:
     python main_admin.py communities    --db data/corpus.db --min-size 10 --dry-run
     python main_admin.py heal           --db data/corpus.db            # dry run; --apply writes
     python main_admin.py remove-document --db data/corpus.db --path <file>   # dry run; --apply removes
+    python main_admin.py due-jobs       --db data/corpus.db            # what is due; --run runs it
 """
 
 from __future__ import annotations
@@ -308,6 +309,10 @@ def command_communities(args: argparse.Namespace) -> int:
         print()
         print(f"Dry run. A real build would make {report.kept} provider calls.")
         return 0
+    if report.summarised:
+        from background.community_job import record_build
+
+        record_build(MetadataStore(settings.metadata_db_path), build_id=report.build_id, communities=report.indexed)
     print(f"- summarised: {report.summarised} (failed {report.failed})")
     print(f"- indexed to Qdrant: {report.indexed}")
     print(f"- provider calls: {report.provider_calls}")
@@ -362,6 +367,37 @@ def command_remove_document(args: argparse.Namespace) -> int:
           " `main_admin.py communities` rebuilds them.")
     done = event is not None and event.status == "completed"
     return 0 if done and not any(graph_left.values()) and not any(vectors_left.values()) else 1
+
+
+def command_due_jobs(args: argparse.Namespace) -> int:
+    """The scheduler's decision, for an OS task when the API is not running (ROADMAP D4)."""
+    from datetime import datetime
+
+    from background.community_job import adopt_current_build, build_record, run_community_build
+    from background.healer_job import run_heal_report
+    from background.scheduler import due_jobs
+
+    settings = _settings(args)
+    store = MetadataStore(settings.metadata_db_path)
+    if build_record(store) is None:
+        if args.run:
+            adopt_current_build(store)
+            print("No community build was recorded: the current corpus is now the baseline.")
+        else:
+            print("No community build is recorded; --run adopts the current corpus as the baseline.")
+    due = due_jobs(settings, store, datetime.now())
+    community, healer = due["communities"], due["healer"]
+    print(f"communities: {community.get('changed_documents')} documents changed since build "
+          f"{community.get('build_id')} (threshold {community['threshold']}) - {'DUE' if community['due'] else 'not due'}")
+    print(f"healer report: last {(healer['last'] or {}).get('at', 'never')}, from {healer['hour']}:00 - "
+          f"{'DUE' if healer['due'] else 'not due'}")
+    if not args.run:
+        return 0
+    if community["due"]:
+        print("community rebuild:", run_community_build(settings, store))
+    if healer["due"]:
+        print("healer report:", run_heal_report(settings, store))
+    return 0
 
 
 def command_heal(args: argparse.Namespace) -> int:
@@ -498,6 +534,11 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--doc-id", help="The document's id")
     remove.add_argument("--apply", action="store_true", help="Remove it (default is a dry run)")
     remove.set_defaults(func=command_remove_document)
+
+    due = subparsers.add_parser("due-jobs", help="Scheduled jobs that are due (ROADMAP D4)")
+    common(due)
+    due.add_argument("--run", action="store_true", help="Run what is due")
+    due.set_defaults(func=command_due_jobs)
 
     heal = subparsers.add_parser("heal", help="Graph self-healing (Phase 9)")
     common(heal)

@@ -437,6 +437,17 @@ class Settings:
     api_port: int = 8000
     api_token: str | None = None
     api_ingest_roots: tuple[str, ...] = ("data",)
+    # ROADMAP D4. Scheduled work, inside the API process (`main_api.py` turns it on; off as a
+    # library default so nothing in tests or evaluations schedules anything).
+    scheduler_enabled: bool = False
+    scheduler_tick_seconds: int = 300
+    # Architecture 6.3: rebuild the communities after this many documents change (added,
+    # removed or re-versioned). 0 turns the automatic rebuild off.
+    community_rebuild_every_n_documents: int = 50
+    # Architecture 6.1, read-only here: a nightly healer report from this local hour.
+    healer_report_enabled: bool = True
+    healer_report_hour: int = 3
+    report_dir: Path = Path("data/reports")
     # WP1 evaluation harness (docs/REFACTOR2.md section 3)
     eval_judge_model: str = "gemini-3.5-flash-lite"
     # Phase 10.1. Off by default so nothing needs a collector; enable to send every query
@@ -729,6 +740,15 @@ class Settings:
         except ValueError:
             pass
         self.api_token = os.getenv("API_TOKEN") or self.api_token
+        for name in ("scheduler_tick_seconds", "community_rebuild_every_n_documents", "healer_report_hour"):
+            try:
+                setattr(self, name, max(0, int(os.getenv(name.upper(), getattr(self, name)))))
+            except ValueError:
+                pass
+        healer_env = os.getenv("HEALER_REPORT_ENABLED")
+        if healer_env is not None:
+            self.healer_report_enabled = healer_env.strip().lower() not in {"0", "false", "no"}
+        self.report_dir = Path(os.getenv("REPORT_DIR", str(self.report_dir)))
         roots_env = os.getenv("API_INGEST_ROOTS")
         if roots_env:
             self.api_ingest_roots = tuple(r.strip() for r in roots_env.split(",") if r.strip())

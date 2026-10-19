@@ -47,6 +47,8 @@ def main() -> int:
     # ROADMAP D2, adopted: the API is where conversations happen.
     settings.session_memory_enabled = True
     settings.query_cache_enabled = True
+    # ROADMAP D4: community rebuilds and the nightly healer report run inside the API process.
+    settings.scheduler_enabled = True
 
     import uvicorn
 

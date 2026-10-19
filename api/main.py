@@ -11,6 +11,8 @@ Endpoints:
 * `DELETE /documents/{doc_id}` - remove a document (D1), as a job.
 * `POST /ingest` - ingest a file or directory under an allowed root, as a job.
 * `GET /jobs`, `GET /jobs/{job_id}` - job state.
+* `POST /jobs/communities`, `POST /jobs/heal-report` - run a scheduled job now (D4).
+* `GET /schedule` - what is due: community staleness and the healer report.
 * `GET /health` - the stores, the embedding contract, models and the corpus of record. It
   reports state and versions, never a key or a password.
 
@@ -31,6 +33,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from api.jobs import JobRunner
+from background.community_job import run_community_build, staleness
+from background.healer_job import run_heal_report
+from background.scheduler import Scheduler, due_jobs
 from config import Settings, default_metadata_db
 from ingestion.state_store import MetadataStore
 from models.query import GraphRAGResponse
@@ -76,6 +81,12 @@ class Operations:
                 for r in summary["results"]
             ]
         }
+
+    def communities(self) -> dict[str, Any]:
+        return run_community_build(self.settings, MetadataStore(self.settings.metadata_db_path))
+
+    def heal_report(self) -> dict[str, Any]:
+        return run_heal_report(self.settings, MetadataStore(self.settings.metadata_db_path))
 
     def remove(self, doc_id: str) -> dict[str, Any]:
         from ingestion.graph_writer import GraphWriter
@@ -163,6 +174,7 @@ def create_app(
     runner: JobRunner | None = None,
     operations: Any | None = None,
     probes: Callable[[Settings], dict[str, Any]] | None = None,
+    scheduler: Scheduler | None = None,
 ) -> FastAPI:
     settings = settings or Settings(metadata_db_path=Path(default_metadata_db()))
     store = store or MetadataStore(settings.metadata_db_path)
@@ -170,6 +182,8 @@ def create_app(
     operations = operations or Operations(settings)
     probes = probes or default_probes
     state: dict[str, Any] = {"orchestrator": orchestrator}
+    scheduled_jobs = {"communities": lambda: operations.communities(), "heal-report": lambda: operations.heal_report()}
+    scheduler = scheduler or Scheduler(settings, store, runner, scheduled_jobs)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):  # noqa: ANN202
@@ -177,9 +191,12 @@ def create_app(
             from retrieval.query_orchestrator import QueryOrchestrator
 
             state["orchestrator"] = QueryOrchestrator(settings=settings, store=store)
+        if settings.scheduler_enabled:
+            scheduler.start()
         try:
             yield
         finally:
+            scheduler.stop()
             closer = getattr(state["orchestrator"], "aclose", None)
             if closer is not None:
                 await closer()
@@ -294,6 +311,19 @@ def create_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "No such job.")
         return found.to_dict()
 
+    @app.post("/jobs/{kind}", status_code=status.HTTP_202_ACCEPTED, dependencies=guard)
+    async def run_job(kind: str) -> dict[str, Any]:
+        if kind not in scheduled_jobs:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown job; one of: {', '.join(scheduled_jobs)}.")
+        return runner.submit(kind, {"trigger": "on_demand"}, scheduled_jobs[kind]).to_dict()
+
+    @app.get("/schedule", dependencies=guard)
+    async def schedule() -> dict[str, Any]:
+        from datetime import datetime
+
+        due = due_jobs(settings, store, datetime.now())
+        return {"scheduler_enabled": settings.scheduler_enabled, "tick_seconds": settings.scheduler_tick_seconds, **due}
+
     @app.get("/health", dependencies=guard)
     async def health() -> dict[str, Any]:
         total, _ = store.document_overview(limit=1)
@@ -310,6 +340,10 @@ def create_app(
                 },
             },
             "stores": stores,
+            "communities": {
+                k: v for k, v in staleness(store, settings.community_rebuild_every_n_documents).items()
+                if k != "versions"
+            },
             "models": {
                 "generation": settings.gemini_model,
                 "ingestion": settings.ingestion_model,
