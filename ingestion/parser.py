@@ -56,6 +56,9 @@ def compute_sha256(source_path: Path) -> str:
     return digest.hexdigest()
 
 
+# ROADMAP E3: below this share of dark pixels a rendered page is blank.
+BLANK_PAGE_INK = 0.0005
+
 def normalize_whitespace(text: str) -> str:
     """Normalize whitespace to simplify downstream chunking/hash stability."""
     return re.sub(r"\s+", " ", text).strip()
@@ -90,6 +93,11 @@ class DocumentParser:
 
     def __init__(self) -> None:
         self._docling_converter = DocumentConverter() if DocumentConverter is not None else None
+        self._ocr_engine = None
+        # ROADMAP E3: how the last PDF's pages that Docling omitted were recovered, by page
+        # number - from the text layer, by OCR, or found blank. Read by the pipeline's
+        # coverage record.
+        self.last_page_recovery: dict[str, list[int]] = {"text_layer": [], "ocr": [], "blank": []}
 
     def parse_document(self, source_path: Path, doc_id: str, checksum: str) -> ParsedDocument:
         """Parse file into architecture-defined document schema."""
@@ -190,6 +198,7 @@ class DocumentParser:
         ]
 
     def _parse_pdf(self, source_path: Path) -> list[Section]:
+        self.last_page_recovery = {"text_layer": [], "ocr": [], "blank": []}
         sections_from_docling = self._parse_pdf_with_docling(source_path)
         if sections_from_docling:
             return self._recover_missing_pdf_pages(source_path, sections_from_docling)
@@ -255,17 +264,30 @@ class DocumentParser:
 
             try:
                 raw_text = reader.pages[page_number - 1].extract_text() or ""
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Docling omitted PDF page {page_number} and text-layer recovery failed."
-                ) from exc
+            except Exception:
+                raw_text = ""  # an unreadable text layer is handled as an absent one
+
+            normalized_page_text = normalize_whitespace(raw_text)
+            if normalized_page_text:
+                self.last_page_recovery["text_layer"].append(page_number)
+            else:
+                # ROADMAP E3 (architecture open question 7): OCR the page, and refuse only if
+                # OCR also fails. Until E3 an empty text layer refused the whole document, and
+                # kept 2608.15382.pdf out since Refactor 2 - its page 18 is blank.
+                kind, ocr_text = self._read_page_without_text_layer(source_path, page_number)
+                if kind == "blank":
+                    self.last_page_recovery["blank"].append(page_number)
+                    continue
+                if kind != "ocr":
+                    raise RuntimeError(
+                        f"PDF page {page_number} has no text layer, is not blank, and OCR found no "
+                        "text; refusing rather than ingest the document with that page missing."
+                    )
+                raw_text = ocr_text
+                normalized_page_text = normalize_whitespace(ocr_text)
+                self.last_page_recovery["ocr"].append(page_number)
 
             lines = raw_text.splitlines()
-            normalized_page_text = normalize_whitespace(raw_text)
-            if not normalized_page_text:
-                raise RuntimeError(
-                    f"Docling omitted PDF page {page_number} and its text layer is empty."
-                )
 
             reference_line_index = next(
                 (
@@ -325,6 +347,42 @@ class DocumentParser:
             last_heading = reference_heading
 
         return ordered
+
+    def _read_page_without_text_layer(self, source_path: Path, page_number: int) -> tuple[str, str]:
+        """("blank", ""), ("ocr", text), or ("unreadable", "") for a page with no text layer.
+
+        Blank means no ink at all once rendered - 2608.15382.pdf's page 18 has none - so there is
+        nothing to lose. Otherwise RapidOCR, which the Docling stack already ships, reads it.
+        """
+        try:
+            import numpy as np
+            import pypdfium2 as pdfium
+
+            document = pdfium.PdfDocument(str(source_path))
+            try:
+                page = document[page_number - 1]
+                gray = np.asarray(page.render(scale=1).to_pil().convert("L"))
+                blank = float((gray < 200).mean()) < BLANK_PAGE_INK
+                image = None if blank else page.render(scale=2).to_pil()
+                page.close()
+            finally:
+                document.close()
+            if blank:
+                return "blank", ""
+        except Exception as exc:
+            logger.warning("pdf_page_render_failed source=%s page=%d error=%s", source_path, page_number, type(exc).__name__)
+            return "unreadable", ""
+        try:
+            if getattr(self, "_ocr_engine", None) is None:
+                from rapidocr import RapidOCR
+
+                self._ocr_engine = RapidOCR()
+            result = self._ocr_engine(image)
+            lines = [str(line) for line in (getattr(result, "txts", None) or []) if str(line).strip()]
+        except Exception as exc:
+            logger.warning("pdf_page_ocr_failed source=%s page=%d error=%s", source_path, page_number, type(exc).__name__)
+            return "unreadable", ""
+        return ("ocr", "\n".join(lines)) if lines else ("unreadable", "")
 
     @staticmethod
     def _recovered_pdf_section(

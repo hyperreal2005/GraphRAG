@@ -18,6 +18,7 @@ not be met:
     python main_admin.py heal           --db data/corpus.db            # dry run; --apply writes
     python main_admin.py remove-document --db data/corpus.db --path <file>   # dry run; --apply removes
     python main_admin.py due-jobs       --db data/corpus.db            # what is due; --run runs it
+    python main_admin.py page-coverage  --db data/corpus.db            # PDF coverage; --write records it
 """
 
 from __future__ import annotations
@@ -400,6 +401,42 @@ def command_due_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_page_coverage(args: argparse.Namespace) -> int:
+    """How much of each PDF reached its chunks, page by page (ROADMAP E3). No provider calls."""
+    from ingestion.coverage import coverage_report
+
+    settings = _settings(args)
+    store = MetadataStore(settings.metadata_db_path)
+    with store._connection() as conn:  # noqa: SLF001
+        rows = conn.execute(
+            "SELECT d.doc_id, d.source_path, v.version_id FROM documents d JOIN document_versions v "
+            "ON v.doc_id = d.doc_id AND v.status = 'active' WHERE d.format = 'pdf' ORDER BY d.source_path"
+        ).fetchall()
+    flagged = 0
+    for row in rows:
+        path = Path(str(row["source_path"]))
+        if not path.exists():
+            print(f"  {path.name}: source file missing, not measured")
+            continue
+        chunks = store.get_chunks_for_doc(str(row["doc_id"]), str(row["version_id"]), active_only=True)
+        previous = store.get_document_coverage(str(row["doc_id"])) or {}
+        # Pages the parser found blank or read by OCR are only known at ingest; keep them.
+        report = coverage_report(path, [str(c["text"] or "") for c in chunks],
+                                 {"blank": previous.get("blank"), "ocr": previous.get("ocr")})
+        if report["missing"] or report["no_text"]:
+            flagged += 1
+            print(f"  {path.name}: coverage {report['coverage']}, missing pages {report['missing']}, "
+                  f"no text layer {report['no_text']}")
+        if args.write:
+            store.set_document_coverage(str(row["doc_id"]), str(row["version_id"]), report)
+    print(f"{len(rows)} PDF documents; {len(rows) - flagged} fully covered, {flagged} with flagged pages."
+          + ("" if args.write else " Dry run: --write records it."))
+    refused = store.coverage_summary()["refused"]
+    for item in refused:
+        print(f"  refused: {item['document']}: {item['reason']}")
+    return 0
+
+
 def command_heal(args: argparse.Namespace) -> int:
     """Phase 9 graph self-healing: orphans, contradictions, confidence decay.
 
@@ -534,6 +571,11 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--doc-id", help="The document's id")
     remove.add_argument("--apply", action="store_true", help="Remove it (default is a dry run)")
     remove.set_defaults(func=command_remove_document)
+
+    coverage = subparsers.add_parser("page-coverage", help="PDF page coverage (ROADMAP E3)")
+    common(coverage)
+    coverage.add_argument("--write", action="store_true", help="Record the measurements")
+    coverage.set_defaults(func=command_page_coverage)
 
     due = subparsers.add_parser("due-jobs", help="Scheduled jobs that are due (ROADMAP D4)")
     common(due)

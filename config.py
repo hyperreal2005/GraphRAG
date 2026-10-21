@@ -107,6 +107,15 @@ class Settings:
     )
     disamb_model: str = "all-MiniLM-L6-v2"
     disamb_threshold: float = 0.92
+    # ROADMAP E1. A one-word name ("Schneider") joins the one longer name in the document that
+    # contains it ("Wilfried Willi Schneider"), for these coarse classes only. Measured on
+    # Re-DocRED gold before it was written: for persons 37 pairs gained against 8 wrong, for
+    # places 3 against 24 ("Albany" is not "Albany County"). Empty turns it off.
+    disamb_partial_name_classes: tuple[str, ...] = ("PER",)
+    # ROADMAP E1. Two non-person names with the same words in another order are different
+    # things ("The Frog Princess", "The Princess and the Frog"); in gold this pattern is never
+    # one entity. People are exempt: "Lyapunov, Zakhary" is Zakhary Lyapunov.
+    disamb_permutation_guard: bool = True
     # WP2-B: identity is name-first, unconditionally - the disambiguator matches on the
     # normalized name and its aliases, and type only blocks on a coarse-class conflict.
     # An `entity_identity_name_first` flag stood here until 2026-09-01 and was never read
@@ -121,6 +130,22 @@ class Settings:
     cross_doc_llm_confidence_threshold: float = 0.90
     cross_doc_same_type_required_for_auto: bool = True
     cross_doc_llm_enabled: bool = True
+    # ROADMAP E1. An LLM-approved merge also needs the names to support it lexically. The
+    # strict check accepts only the same tokens, the same letters or an acronym, and on wp24 it
+    # vetoed 382 approved merges, 59 of a 60-pair sample genuinely one entity ("Chelsea" /
+    # "Chelsea F.C.", "Raphael" / "Raphaël"). Relaxed also folds accents, drops "the" and
+    # company or club forms, and accepts one name as a contiguous run of the other. Measured
+    # on that hand-labelled sample: it admits 40 of the 60, every one genuinely the same.
+    cross_doc_relaxed_lexical_support: bool = True
+    # ROADMAP E2. A new version of a document reuses the vector of any chunk or entity whose
+    # embedded text is unchanged since an earlier version, under the same embedding contract,
+    # instead of embedding it again. Vectors are a function of text and contract, so the
+    # result is the same; only the calls are saved.
+    vector_reuse_enabled: bool = True
+    # ROADMAP F2: where provider calls are counted, and the Cohere key's monthly call limit
+    # (the trial key's is 1,000; 0 means no limit is shown).
+    usage_dir: Path = Path("data/usage")
+    cohere_monthly_call_limit: int = 1000
     # Switched from `gemini-embedding-2` on 2026-09-05. That model sheds load
     # server-side regardless of billing tier: measured interleaved against -001 on one key
     # in one minute, it failed 8 of 30 calls where -001 failed 0 of 30, and it failed even
@@ -519,6 +544,23 @@ class Settings:
         coarse_block_env = os.getenv("ENTITY_COARSE_CLASS_BLOCKING")
         if coarse_block_env is not None:
             self.entity_coarse_class_blocking = coarse_block_env.strip().lower() not in {"0", "false", "no"}
+        self.usage_dir = Path(os.getenv("USAGE_DIR", str(self.usage_dir)))
+        try:
+            self.cohere_monthly_call_limit = max(0, int(os.getenv("COHERE_MONTHLY_CALL_LIMIT", self.cohere_monthly_call_limit)))
+        except ValueError:
+            pass
+        reuse_env = os.getenv("VECTOR_REUSE_ENABLED")
+        if reuse_env is not None:
+            self.vector_reuse_enabled = reuse_env.strip().lower() not in {"0", "false", "no"}
+        relaxed_env = os.getenv("CROSS_DOC_RELAXED_LEXICAL_SUPPORT")
+        if relaxed_env is not None:
+            self.cross_doc_relaxed_lexical_support = relaxed_env.strip().lower() not in {"0", "false", "no"}
+        partial_env = os.getenv("DISAMB_PARTIAL_NAME_CLASSES")
+        if partial_env is not None:
+            self.disamb_partial_name_classes = tuple(c.strip().upper() for c in partial_env.split(",") if c.strip())
+        permutation_env = os.getenv("DISAMB_PERMUTATION_GUARD")
+        if permutation_env is not None:
+            self.disamb_permutation_guard = permutation_env.strip().lower() not in {"0", "false", "no"}
         section_group_env = os.getenv("SECTION_GROUP_ENABLED")
         if section_group_env is not None:
             self.section_group_enabled = section_group_env.strip().lower() not in {"0", "false", "no"}

@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from api.jobs import JobRunner
 from api.overview import GraphOverview
+from observability.usage_ledger import summary as usage_summary
 from background.community_job import run_community_build, staleness
 from background.healer_job import run_heal_report
 from background.scheduler import Scheduler, due_jobs
@@ -292,6 +293,8 @@ def create_app(
             "source_exists": Path(str(row["source_path"])).exists(),
             "active_version_id": active.version_id if active else None,
             "active_chunks": len(store.get_chunks_for_doc(doc_id, active.version_id, active_only=True)) if active else 0,
+            "coverage": store.get_document_coverage(doc_id),
+            "last_error": row["last_error"],
             "versions": [
                 {"version_id": v.version_id, "status": v.status, "created_at": str(v.created_at)} for v in versions
             ],
@@ -383,6 +386,8 @@ def create_app(
                 k: v for k, v in staleness(store, settings.community_rebuild_every_n_documents).items()
                 if k != "versions"
             },
+            "coverage": store.coverage_summary(),
+            "cohere": usage_summary(settings),
             "models": {
                 "generation": settings.gemini_model,
                 "ingestion": settings.ingestion_model,

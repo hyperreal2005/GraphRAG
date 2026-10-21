@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from config import Settings
+from observability.usage_ledger import record_cohere_call
 from models.query import RetrieverResult
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,8 @@ class QueryReranker:
             ):
                 logger.warning("cohere_rerank_degraded reason=pacing_would_exceed_deadline")
                 return self._degrade(clean_query, items)
+            # ROADMAP F2: every attempt that reaches Cohere is counted against the key.
+            record_cohere_call(self.settings)
             try:
                 response = self._client.rerank(
                     model=self.settings.query_rerank_model,

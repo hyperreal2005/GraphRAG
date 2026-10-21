@@ -20,6 +20,7 @@ from ingestion.document_cards import CorpusCatalog, fallback_card
 from ingestion.extractor import ROW_BATCH_VERSION
 from ingestion.content_classifier import classify_content_sequence, is_graph_extractable
 from ingestion.entity_types import display_type, dominant_coarse_class
+from ingestion.coverage import coverage_report
 from ingestion.parser import DocumentParser, compute_sha256, detect_format
 from ingestion.section_grouper import group_sections
 from observability import tracing
@@ -69,6 +70,16 @@ def pipeline_fingerprint_payload(settings: Settings, target_stage: str) -> dict[
             f"{ROW_BATCH_VERSION}:{settings.extraction_table_batch_tokens}"
             f"/{settings.extraction_table_batch_max_rows}"
         )
+    # ROADMAP E1: the partial-name rule and the permutation guard change which mentions become
+    # one entity, so a corpus built with them is a different corpus. Present only when on.
+    if graph and (settings.disamb_partial_name_classes or settings.disamb_permutation_guard):
+        payload["disamb_rules"] = {
+            "partial_name_classes": sorted(settings.disamb_partial_name_classes),
+            "permutation_guard": bool(settings.disamb_permutation_guard),
+        }
+    # Likewise: the relaxed lexical check changes which cross-document merges are made.
+    if graph and settings.cross_doc_relaxed_lexical_support:
+        payload["cross_doc_relaxed_lexical_support"] = True
     return payload
 
 
@@ -488,6 +499,8 @@ class PhaseOnePipeline:
                 self.store.upsert_chunks(chunks)
                 self.store.finish_document(doc_id, resolved.metadata.word_count, target_stage)
 
+            if doc_format == "pdf":
+                self._record_coverage(absolute_path, doc_id, document_version_id, chunks)
             self.store.log_ingestion_run(
                 run_id=run_id,
                 doc_id=doc_id,
@@ -1348,6 +1361,19 @@ class PhaseOnePipeline:
                 completed,
                 total,
             )
+
+    def _record_coverage(self, path: Path, doc_id: str, document_version_id: str | None, chunks: list) -> None:
+        """ROADMAP E3: measure and keep how much of a PDF reached its chunks. Never fails an ingest."""
+        if not document_version_id:
+            return
+        try:
+            report = coverage_report(path, [str(getattr(chunk, "text", "") or "") for chunk in chunks],
+                                     self.parser.last_page_recovery)
+            self.store.set_document_coverage(doc_id, document_version_id, report)
+            if report.get("missing") or report.get("no_text"):
+                logger.warning("pdf_coverage_gaps doc_id=%s missing=%s no_text=%s", doc_id, report.get("missing"), report.get("no_text"))
+        except Exception as exc:
+            logger.warning("pdf_coverage_unmeasured doc_id=%s error=%s", doc_id, type(exc).__name__)
 
     def _pipeline_fingerprint(self, target_stage: str) -> str:
         return pipeline_fingerprint(self.settings, target_stage)

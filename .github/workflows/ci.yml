@@ -1,0 +1,37 @@
+# ROADMAP F3: every push installs the pinned environment and checks it. The unit suite uses fakes
+# only and needs no services; its step runs once tests/unit is in the repository.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # CPU wheels for torch (pulled in by gliner, fastcoref and sentence-transformers): the
+      # default CUDA build is several GB the suite never uses.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest==9.0.2 --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: pip check
+        run: pip check
+
+      - name: Compile
+        run: python -m compileall -q -x '(^|/)\.?venv/' .
+
+      - name: Unit tests
+        if: hashFiles('tests/unit/**/*.py') != ''
+        run: python -m pytest tests/unit -q -p no:cacheprovider

@@ -71,6 +71,46 @@ class CrossDocMergeResult:
         return self.auto_merged + self.llm_merged
 
 
+
+# ROADMAP E1: the relaxed lexical check, a module function so it can be measured on its own.
+_ORG_FORMS = frozenset({"fc", "afc", "cf", "f", "c", "inc", "incorporated", "ltd", "limited", "llc", "plc",
+                        "corp", "corporation", "co", "company"})
+_GLUE = frozenset({"the", "of", "and"})
+_UNDECOMPOSED = str.maketrans({"ø": "o", "Ø": "O", "æ": "ae", "Æ": "AE", "ß": "ss", "ł": "l", "Ł": "L",
+                               "đ": "d", "Đ": "D", "œ": "oe", "Œ": "OE"})
+
+
+def _relaxed_tokens(name: str) -> list[str]:
+    import unicodedata
+
+    # Letters NFKD does not decompose are mapped first, or "Højlund" would lose its "o".
+    text = str(name).translate(_UNDECOMPOSED)
+    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    folded = folded.casefold().replace("+", " plus ").replace("&", " and ")
+    tokens = re.findall(r"[a-z0-9]+", folded)
+    return [t for t in tokens if t not in _GLUE and t not in _ORG_FORMS]
+
+
+def names_support_identity_relaxed(incoming_name: str, candidate_name: str) -> bool:
+    """Lexical support for an LLM-approved merge, beyond the strict check.
+
+    Accepts the same tokens once accents, "the" and company or club forms are set aside, or
+    one name as a contiguous run of the other ("Red Sox" in "Boston Red Sox"). Refused, as in
+    the strict path, when the names differ by a distinguishing token: a generation, an ordinal
+    or a number ("AirPods Pro" / "AirPods Pro (second-gen)").
+    """
+    from ingestion.entity_types import names_differ_discriminatively
+
+    left, right = _relaxed_tokens(incoming_name), _relaxed_tokens(candidate_name)
+    if not left or not right:
+        return False
+    if names_differ_discriminatively(" ".join(left), " ".join(right)):
+        return False
+    if left == right:
+        return True
+    short, long_ = (left, right) if len(left) <= len(right) else (right, left)
+    return any(long_[i : i + len(short)] == short for i in range(len(long_) - len(short) + 1))
+
 class CrossDocumentMerger:
     """Resolve document-local canonical entities to corpus-level canonical IDs."""
 
@@ -379,7 +419,10 @@ class CrossDocumentMerger:
                 candidate_summary=payload.get("summary"),
                 similarity=score,
             )
-            lexical_support = self._names_support_identity(name, str(candidate_name or ""))
+            lexical_support = self._names_support_identity(name, str(candidate_name or "")) or (
+                bool(self.settings.cross_doc_relaxed_lexical_support)
+                and names_support_identity_relaxed(name, str(candidate_name or ""))
+            )
             if (
                 approved
                 and confidence >= float(self.settings.cross_doc_llm_confidence_threshold)
@@ -533,6 +576,7 @@ class CrossDocumentMerger:
     ) -> list[dict[str, Any]]:
         collection = self.settings.qdrant_entities_collection
         active_filter = build_active_version_filter(active_version_ids)
+        query_points_error: Exception | None = None
         if hasattr(self._qdrant_client, "query_points"):
             try:
                 try:
@@ -556,8 +600,11 @@ class CrossDocumentMerger:
                 # (e.g., first entity in an empty collection). Treat that as
                 # "no candidate" instead of falling through to API-shape errors.
                 return self._extract_points(response)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Kept, not swallowed: when no legacy method exists this is the real
+                # failure. Discarding it once reported a four-hour Qdrant outage as "no
+                # compatible search API" on 155 documents (wp25 build, 2026-10-20).
+                query_points_error = exc
 
         if hasattr(self._qdrant_client, "search"):
             response = self._qdrant_client.search(
@@ -579,6 +626,10 @@ class CrossDocumentMerger:
             )
             return self._extract_points(response)
 
+        if query_points_error is not None:
+            raise RuntimeError(
+                f"Qdrant entity search failed: {type(query_points_error).__name__}: {query_points_error}"
+            ) from query_points_error
         raise RuntimeError("Qdrant client does not expose a compatible search API.")
 
     def _extract_points(self, response: Any) -> list[dict[str, Any]]:

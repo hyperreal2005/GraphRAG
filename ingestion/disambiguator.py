@@ -13,10 +13,17 @@ Now:
     small bonus when the raw types agree, so type still informs ranking;
   * observed types accumulate as a multiset — the emergent schema the architecture wants
     to observe — instead of acting as a gate.
+
+ROADMAP E1, measured on Re-DocRED gold before either was written:
+  * a one-word name joins the one longer name in the document that contains it, for the
+    classes in `disamb_partial_name_classes` (persons by default) - "Schneider" is Wilfried
+    Willi Schneider, unless the document has a second Schneider;
+  * names with the same words in a different order are kept apart, except for people.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -27,6 +34,8 @@ from sentence_transformers import SentenceTransformer
 
 from config import Settings
 from ingestion.entity_types import (
+    DISCRIMINATIVE_TOKENS,
+    PERSON,
     coarse_class,
     coarse_classes_compatible,
     display_type,
@@ -35,6 +44,20 @@ from ingestion.entity_types import (
     VALUE_COARSE_CLASSES,
 )
 from models.extraction import ExtractedEntity
+
+_WORD = re.compile(r"[a-z0-9]+")
+# Function words carry no identity: "The Frog Princess" and "Frog Princess" name one thing.
+_FUNCTION_WORDS = frozenset({"the", "of", "and", "a", "an"})
+
+
+def content_words(name: str) -> list[str]:
+    return [w for w in _WORD.findall(name.casefold()) if w not in _FUNCTION_WORDS]
+
+
+def names_permuted(left: str, right: str) -> bool:
+    """Same content words, different order: "The Frog Princess" / "The Princess and the Frog"."""
+    a, b = content_words(left), content_words(right)
+    return len(a) >= 2 and a != b and sorted(a) == sorted(b)
 
 
 @dataclass
@@ -110,6 +133,7 @@ class EntityDisambiguator:
                 self._update_centroid(matched, embedding)
                 entity_id_map[entity.entity_id] = matched.entity_id
 
+        canonical_clusters = self._join_partial_names(canonical_clusters, entity_id_map)
         referenced_cluster_ids = set(entity_id_map.values())
         return DisambiguationResult(
             canonical_entities=[
@@ -202,6 +226,8 @@ class EntityDisambiguator:
                 for alias in (cluster.canonical_name, *cluster.aliases)
             ):
                 continue
+            if self._permuted_apart(name, incoming_class, cluster):
+                continue
             score = float(np.dot(embedding, cluster.embedding))
             if normalized_type and normalized_type in {
                 self._normalize_type(item) for item in cluster.entity_types
@@ -246,6 +272,61 @@ class EntityDisambiguator:
             if any(self._normalize_name(alias) == normalized_name for alias in cluster.aliases):
                 return cluster
         return None
+
+    def _permuted_apart(self, name: str, incoming_class: str, cluster: CanonicalEntity) -> bool:
+        if not (self.settings.disamb_permutation_guard and name):
+            return False
+        if incoming_class == PERSON or cluster.coarse_class == PERSON:
+            return False
+        return any(names_permuted(name, alias) for alias in (cluster.canonical_name, *cluster.aliases))
+
+    def _join_partial_names(
+        self, clusters: list[CanonicalEntity], entity_id_map: dict[str, str]
+    ) -> list[CanonicalEntity]:
+        """Fold each one-word cluster into the one longer cluster that contains its word.
+
+        Runs after every mention is placed, because the full name may appear after the short
+        one. Only for the configured coarse classes, only when the word is at least three
+        letters and not a distinguishing token (Jr, II), and only when exactly one longer
+        cluster of the same class contains it: a document with two Schneiders keeps
+        "Schneider" apart, because either could be meant.
+        """
+        classes = set(self.settings.disamb_partial_name_classes or ())
+        if not classes:
+            return clusters
+        folded: dict[str, CanonicalEntity] = {}
+        for short in clusters:
+            if short.coarse_class not in classes:
+                continue
+            words = {tuple(content_words(alias)) for alias in short.aliases}
+            if len(words) != 1:
+                continue
+            (only,) = words
+            if len(only) != 1 or len(only[0]) < 3 or only[0] in DISCRIMINATIVE_TOKENS:
+                continue
+            word = only[0]
+            hosts = [
+                long_
+                for long_ in clusters
+                if long_ is not short
+                and long_.entity_id not in folded
+                and long_.coarse_class == short.coarse_class
+                and any(len(content_words(a)) >= 2 and word in content_words(a) for a in long_.aliases)
+            ]
+            if len(hosts) != 1:
+                continue
+            host = hosts[0]
+            for alias in short.aliases:
+                if alias not in host.aliases:
+                    host.aliases.append(alias)
+            host.entity_types.update(short.entity_types)
+            folded[short.entity_id] = host
+        if not folded:
+            return clusters
+        for raw_id, cluster_id in list(entity_id_map.items()):
+            if cluster_id in folded:
+                entity_id_map[raw_id] = folded[cluster_id].entity_id
+        return [cluster for cluster in clusters if cluster.entity_id not in folded]
 
     def _update_centroid(self, cluster: CanonicalEntity, embedding: np.ndarray) -> None:
         if cluster.embedding is None:

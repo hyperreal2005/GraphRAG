@@ -131,9 +131,15 @@ def command_run(args: argparse.Namespace) -> int:
     )
     print(f"Running {len(selected)} of {len(records)} questions ...")
 
+    from observability import usage_ledger
+
+    usage_ledger.count_gemini_calls()
+    before = usage_ledger.process_calls()
     result = harness.run(settings, selected, resolution, progress_every=args.progress_every)
+    query_calls = usage_ledger.calls_since(before)
 
     faithfulness = None
+    before = usage_ledger.process_calls()
     if args.judge:
         print("Judging claim faithfulness ...")
         faithfulness = FaithfulnessJudge(settings).judge(result.outcomes, max_claims=args.max_claims)
@@ -141,6 +147,8 @@ def command_run(args: argparse.Namespace) -> int:
             f"  judged {len(faithfulness.verdicts)} claims, "
             f"skipped {faithfulness.skipped}"
         )
+
+    judge_calls = usage_ledger.calls_since(before)
 
     metrics = summarize(
         result.outcomes,
@@ -161,6 +169,12 @@ def command_run(args: argparse.Namespace) -> int:
         outcomes=result.outcomes,
         wall_seconds=time.perf_counter() - started,
     )
+    # ROADMAP F2: what this run spent, counted rather than reconstructed afterwards.
+    payload["provider_calls"] = {
+        "queries": query_calls,
+        "judge": judge_calls,
+        "cohere_key": usage_ledger.summary(settings),
+    }
     directory = _report_dir(args, args.label)
     json_path, markdown_path = report.write(directory, payload, health, None)
 

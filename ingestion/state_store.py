@@ -106,6 +106,15 @@ class MetadataStore:
                     value TEXT
                 );
 
+                -- ROADMAP E3: how much of each PDF version reached the corpus, page by page.
+                CREATE TABLE IF NOT EXISTS document_coverage (
+                    document_version_id TEXT PRIMARY KEY,
+                    doc_id TEXT NOT NULL,
+                    measured_at TEXT NOT NULL,
+                    coverage REAL,
+                    report_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS ingestion_log (
                     run_id TEXT PRIMARY KEY,
                     doc_id TEXT,
@@ -1892,6 +1901,76 @@ class MetadataStore:
                 }
             )
         return results
+
+    def set_document_coverage(self, doc_id: str, document_version_id: str, report: dict) -> None:
+        """Record one version's page coverage (ROADMAP E3); a re-measure replaces it."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO document_coverage (document_version_id, doc_id, measured_at, coverage, report_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(document_version_id) DO UPDATE SET
+                    measured_at = excluded.measured_at, coverage = excluded.coverage,
+                    report_json = excluded.report_json
+                """,
+                (document_version_id, doc_id, utc_now_iso(), report.get("coverage"), json.dumps(report)),
+            )
+
+    def get_document_coverage(self, doc_id: str) -> dict | None:
+        """The active version's coverage report, or None when it was never measured."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT c.report_json, c.measured_at FROM document_coverage c
+                JOIN document_versions v ON v.version_id = c.document_version_id AND v.status = 'active'
+                WHERE c.doc_id = ?
+                """,
+                (doc_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {**json.loads(row["report_json"]), "measured_at": row["measured_at"]}
+
+    def coverage_summary(self) -> dict:
+        """Coverage across the active PDF versions, and the refused documents with their reasons."""
+        with self._connection() as conn:
+            pdfs = conn.execute(
+                "SELECT count(*) FROM documents WHERE format = 'pdf' AND status = 'complete'"
+            ).fetchone()[0]
+            rows = conn.execute(
+                """
+                SELECT d.doc_id, d.title, d.source_path, c.coverage, c.report_json FROM document_coverage c
+                JOIN document_versions v ON v.version_id = c.document_version_id AND v.status = 'active'
+                JOIN documents d ON d.doc_id = c.doc_id
+                """
+            ).fetchall()
+            refused = conn.execute(
+                "SELECT doc_id, source_path, last_error FROM documents WHERE status = 'failed'"
+            ).fetchall()
+        flagged = []
+        for row in rows:
+            report = json.loads(row["report_json"])
+            if report.get("missing") or report.get("no_text"):
+                flagged.append({
+                    "doc_id": row["doc_id"],
+                    "document": row["title"] or Path(str(row["source_path"])).name,
+                    "coverage": row["coverage"],
+                    "missing_pages": report.get("missing"),
+                    "pages_without_text": report.get("no_text"),
+                })
+        return {
+            "pdf_documents": pdfs,
+            "measured": len(rows),
+            "fully_covered": sum(1 for row in rows if row["coverage"] == 1.0),
+            "pages": sum(json.loads(row["report_json"]).get("pages", 0) for row in rows),
+            "pages_recovered_by_ocr": sum(len(json.loads(row["report_json"]).get("ocr") or []) for row in rows),
+            "blank_pages": sum(len(json.loads(row["report_json"]).get("blank") or []) for row in rows),
+            "flagged": flagged,
+            "refused": [
+                {"doc_id": r["doc_id"], "document": Path(str(r["source_path"])).name, "reason": r["last_error"]}
+                for r in refused
+            ],
+        }
 
     def set_system_metadata(self, key: str, value: str) -> None:
         """Upsert system metadata entry."""

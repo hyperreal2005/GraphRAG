@@ -127,8 +127,15 @@ function renderHealth(health) {
   const community = c.recorded
     ? `Communities: ${fmt(c.changed_documents)} of ${fmt(c.threshold)} changed documents before a rebuild`
     : "Communities: no build recorded yet";
+  const cov = health.coverage || {};
+  const coverage = cov.measured
+    ? `PDF coverage: ${fmt(cov.fully_covered)} of ${fmt(cov.measured)} fully covered${cov.flagged?.length ? ` · ${cov.flagged.length} with flagged pages` : ""}${cov.refused?.length ? ` · ${cov.refused.length} refused` : ""}`
+    : null;
   box.replaceChildren(...chips, h("span", { class: "muted small" }, community),
-    h("span", { class: "muted small" }, `Models: ${health.models?.generation} · ${health.models?.embedding} · ${health.models?.rerank || "no rerank"}`));
+    coverage ? h("span", { class: "muted small", title: (cov.refused || []).map((r) => `${r.document}: ${r.reason}`).join(" · ") }, coverage) : null,
+    h("span", { class: "muted small" }, `Models: ${health.models?.generation} · ${health.models?.embedding} · ${health.models?.rerank || "no rerank"}`),
+    health.cohere ? h("span", { class: "muted small", title: `Key ${health.cohere.key}; ${health.cohere.counted_from}` },
+      `Cohere this month: ${fmt(health.cohere.calls_this_month)}${health.cohere.remaining != null ? ` · ${fmt(health.cohere.remaining)} left` : ""}`) : null);
 }
 
 // ---------------------------------------------------------------- ask
@@ -280,6 +287,13 @@ async function openDoc(docId) {
         h("dt", {}, "Format"), h("dd", {}, doc.format || "—"),
         h("dt", {}, "Status"), h("dd", {}, doc.status || "—"),
         h("dt", {}, "Active chunks"), h("dd", {}, fmt(doc.active_chunks)),
+        doc.coverage ? h("dt", {}, "Page coverage") : null,
+        doc.coverage ? h("dd", {}, `${Math.round(100 * (doc.coverage.coverage ?? 0))}% of ${doc.coverage.pages} pages`
+          + (doc.coverage.missing?.length ? ` · flagged pages ${doc.coverage.missing.join(", ")}` : "")
+          + (doc.coverage.ocr?.length ? ` · read by OCR ${doc.coverage.ocr.join(", ")}` : "")
+          + (doc.coverage.blank?.length ? ` · blank ${doc.coverage.blank.join(", ")}` : "")) : null,
+        doc.last_error ? h("dt", {}, "Last error") : null,
+        doc.last_error ? h("dd", {}, doc.last_error) : null,
         h("dt", {}, "Source"), h("dd", { class: "detail-path" }, doc.source_path, doc.source_exists ? "" : " (file missing)"),
         h("dt", {}, "Document id"), h("dd", { class: "detail-path" }, doc.doc_id)),
       h("h2", { style: "margin-top:1rem" }, "Versions"),

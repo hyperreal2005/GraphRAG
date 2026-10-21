@@ -105,6 +105,10 @@ def _coerce_properties(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
 def build_entity_embed_text(item: "EntityVectorInput") -> str:
     """Text embedded for one entity.
 
@@ -149,6 +153,8 @@ class QdrantVectorIndexer:
         self.settings = settings
         self.embedder = embedder or GeminiEmbedder(settings)
         self._models = None
+        # ROADMAP E2: how many vectors the last upsert of each kind reused and embedded.
+        self.last_reuse: dict[str, dict[str, int]] = {}
 
         if client is not None:
             self._client = client
@@ -175,10 +181,19 @@ class QdrantVectorIndexer:
         self._ensure_payload_indexes()
 
     def upsert_chunk_vectors(self, inputs: list[ChunkVectorInput]) -> None:
-        """Embed and upsert chunk vectors with deterministic point IDs."""
+        """Embed and upsert chunk vectors with deterministic point IDs.
+
+        ROADMAP E2: a chunk whose text an earlier version of the same document already
+        embedded, under the same embedding contract, reuses that vector.
+        """
         if not inputs:
             return
-        vectors = self.embedder.embed_texts([item.text for item in inputs])
+        vectors = self._vectors_for(
+            self.settings.qdrant_chunks_collection,
+            "content_sha256",
+            [(item.doc_id, item.text) for item in inputs],
+            kind="chunks",
+        )
         if len(vectors) != len(inputs):
             raise RuntimeError("Embedding output length mismatch for chunk indexing.")
         points = []
@@ -230,6 +245,76 @@ class QdrantVectorIndexer:
                 wait=True,
             )
 
+    def _vectors_for(
+        self, collection: str, hash_field: str, items: list[tuple[str | None, str]], *, kind: str
+    ) -> list[list[float]]:
+        """Each text's dense vector: reused when an earlier version embedded it, else embedded."""
+        hashes = [_sha256(text) for _, text in items]
+        reusable = self._reusable_vectors(collection, hash_field, {d for d, _ in items if d}, set(hashes))
+        missing = [i for i, digest in enumerate(hashes) if digest not in reusable]
+        embedded = self.embedder.embed_texts([items[i][1] for i in missing]) if missing else []
+        if len(embedded) != len(missing):
+            raise RuntimeError(f"Embedding output length mismatch for {kind} indexing.")
+        fresh = dict(zip(missing, embedded))
+        self.last_reuse[kind] = {"reused": len(items) - len(missing), "embedded": len(missing)}
+        if reusable:
+            logger.info("vector_reuse kind=%s reused=%d embedded=%d", kind, len(items) - len(missing), len(missing))
+        return [fresh[i] if i in fresh else reusable[digest] for i, digest in enumerate(hashes)]
+
+    def _reusable_vectors(
+        self, collection: str, hash_field: str, doc_ids: set[str], hashes: set[str]
+    ) -> dict[str, list[float]]:
+        """Dense vectors already stored for these texts of these documents, under this contract.
+
+        Anything the store cannot answer means nothing is reused - never a failed ingest.
+        """
+        if not (self.settings.vector_reuse_enabled and doc_ids and hashes):
+            return {}
+        contract = {
+            "embedding_model_id": self.settings.embedding_model_id,
+            "embedding_dimension": int(self.settings.embedding_dim),
+            "embedding_normalization_policy": self.settings.embedding_normalization_policy,
+            "embedding_prompt_version": self.settings.embedding_prompt_version,
+            "embedding_schema_version": self.settings.embedding_version,
+        }
+        conditions = [
+            ("doc_id", {"any": sorted(doc_ids)}),
+            (hash_field, {"any": sorted(hashes)}),
+            *((key, {"value": value}) for key, value in contract.items()),
+        ]
+        if self._models is not None:
+            m = self._models
+            scroll_filter: Any = m.Filter(must=[
+                m.FieldCondition(key=key, match=m.MatchAny(any=match["any"]) if "any" in match else m.MatchValue(value=match["value"]))
+                for key, match in conditions
+            ])
+        else:
+            scroll_filter = {"must": [{"key": key, "match": match} for key, match in conditions]}
+        found: dict[str, list[float]] = {}
+        offset = None
+        try:
+            while True:
+                points, offset = self._client.scroll(
+                    collection_name=collection,
+                    scroll_filter=scroll_filter,
+                    with_payload=[hash_field],
+                    with_vectors=True,
+                    limit=256,
+                    offset=offset,
+                )
+                for point in points:
+                    payload = (point.get("payload") if isinstance(point, dict) else point.payload) or {}
+                    vector = point.get("vector") if isinstance(point, dict) else point.vector
+                    dense = vector.get("") if isinstance(vector, dict) else vector
+                    if payload.get(hash_field) and dense is not None and len(dense) == int(self.settings.embedding_dim):
+                        found.setdefault(str(payload[hash_field]), list(dense))
+                if offset is None:
+                    break
+        except Exception as exc:
+            logger.warning("vector_reuse_lookup_failed collection=%s error_type=%s", collection, type(exc).__name__)
+            return {}
+        return found
+
     def _chunk_vector_payload(self, dense: list[float], text: str):  # noqa: ANN201
         """Dense alone, or dense plus the local sparse channel when WP6 is enabled."""
         if not self.settings.query_sparse_enabled or self._models is None:
@@ -251,11 +336,16 @@ class QdrantVectorIndexer:
         if not inputs:
             return
         embed_texts = [build_entity_embed_text(item) for item in inputs]
-        vectors = self.embedder.embed_texts(embed_texts)
+        vectors = self._vectors_for(
+            self.settings.qdrant_entities_collection,
+            "embed_text_sha256",
+            [(item.doc_id, text) for item, text in zip(inputs, embed_texts)],
+            kind="entities",
+        )
         if len(vectors) != len(inputs):
             raise RuntimeError("Embedding output length mismatch for entity indexing.")
         points = []
-        for item, vector in zip(inputs, vectors):
+        for item, vector, text in zip(inputs, vectors, embed_texts):
             points.append(
                 {
                     "id": self._entity_point_id(item),
@@ -265,6 +355,8 @@ class QdrantVectorIndexer:
                         "name": item.name,
                         "type": item.entity_type,
                         "summary": item.summary,
+                        # ROADMAP E2: what was embedded, so a later version can reuse it.
+                        "embed_text_sha256": _sha256(text),
                         "doc_id": item.doc_id,
                         "document_version_id": item.document_version_id,
                         "active": bool(item.active),
