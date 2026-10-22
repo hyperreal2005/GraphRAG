@@ -145,6 +145,14 @@ class Settings:
     # ROADMAP F2: where provider calls are counted, and the Cohere key's monthly call limit
     # (the trial key's is 1,000; 0 means no limit is shown).
     usage_dir: Path = Path("data/usage")
+    # ROADMAP F1, both off until measured. Overlap: the raw question's vector search runs
+    # alongside analysis, and vector and community retrieval run alongside entity linking -
+    # none of them reads what it overlaps, so results are unchanged and only waiting goes.
+    # The cache keeps recent embeddings by model, dimension, task type and prepared text, so a
+    # text embedded twice (the vector and community retrievers both embed the question) is
+    # sent once; 0 disables it.
+    query_overlap_retrieval: bool = False
+    embedding_cache_size: int = 0
     cohere_monthly_call_limit: int = 1000
     # Switched from `gemini-embedding-2` on 2026-09-05. That model sheds load
     # server-side regardless of billing tier: measured interleaved against -001 on one key
@@ -545,6 +553,13 @@ class Settings:
         if coarse_block_env is not None:
             self.entity_coarse_class_blocking = coarse_block_env.strip().lower() not in {"0", "false", "no"}
         self.usage_dir = Path(os.getenv("USAGE_DIR", str(self.usage_dir)))
+        overlap_env = os.getenv("QUERY_OVERLAP_RETRIEVAL")
+        if overlap_env is not None:
+            self.query_overlap_retrieval = overlap_env.strip().lower() not in {"0", "false", "no"}
+        try:
+            self.embedding_cache_size = max(0, int(os.getenv("EMBEDDING_CACHE_SIZE", self.embedding_cache_size)))
+        except ValueError:
+            pass
         try:
             self.cohere_monthly_call_limit = max(0, int(os.getenv("COHERE_MONTHLY_CALL_LIMIT", self.cohere_monthly_call_limit)))
         except ValueError:

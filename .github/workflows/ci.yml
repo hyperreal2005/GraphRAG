@@ -32,6 +32,16 @@ jobs:
       - name: Compile
         run: python -m compileall -q -x '(^|/)\.?venv/' .
 
+      # 12 unit tests load the disambiguator's sentence-transformers model (about 90 MB). It is
+      # downloaded once and kept between runs. The rest of the suite needs no network, data or
+      # secrets: it was checked offline on a clean copy with no .env, data/ or API keys.
+      - name: Model cache
+        if: hashFiles('tests/unit/**/*.py') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('requirements.txt') }}
+
       - name: Unit tests
         if: hashFiles('tests/unit/**/*.py') != ''
         run: python -m pytest tests/unit -q -p no:cacheprovider

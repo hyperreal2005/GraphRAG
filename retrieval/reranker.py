@@ -73,6 +73,7 @@ class QueryReranker:
     def __init__(self, settings: Settings, client: Any | None = None) -> None:
         self.settings = settings
         self._client = client
+        self.last_timing: dict[str, float] = {}
         self._cohere_module = None
         self._llm = None
         self._llm_types = None
@@ -230,6 +231,9 @@ class QueryReranker:
 
     def rerank(self, query: str, items: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
         """Return reranked items plus mode marker."""
+        # ROADMAP F1/F2: how much of the stage is the trial key's pacing and how much the call.
+        timing = {"rerank_pacing_wait": 0.0, "rerank_call": 0.0}
+        self.last_timing = timing
         if not self.settings.query_rerank_enabled:
             return list(items), "disabled"
 
@@ -257,14 +261,18 @@ class QueryReranker:
         response = None
         for attempt in range(4):
             remaining = deadline - time.monotonic()
-            if not _pace_cohere(
+            paced_from = time.perf_counter()
+            paced = _pace_cohere(
                 float(self.settings.query_rerank_min_interval_seconds),
                 max_wait=remaining - request_timeout,
-            ):
+            )
+            timing["rerank_pacing_wait"] += (time.perf_counter() - paced_from) * 1000.0
+            if not paced:
                 logger.warning("cohere_rerank_degraded reason=pacing_would_exceed_deadline")
                 return self._degrade(clean_query, items)
             # ROADMAP F2: every attempt that reaches Cohere is counted against the key.
             record_cohere_call(self.settings)
+            called_from = time.perf_counter()
             try:
                 response = self._client.rerank(
                     model=self.settings.query_rerank_model,
@@ -272,8 +280,10 @@ class QueryReranker:
                     documents=documents,
                     top_n=top_n,
                 )
+                timing["rerank_call"] += (time.perf_counter() - called_from) * 1000.0
                 break
             except Exception as exc:
+                timing["rerank_call"] += (time.perf_counter() - called_from) * 1000.0
                 stall = _is_stall(exc)
                 # A throttle backs off exponentially; a stall retries almost at once.
                 delay = 0.5 if stall else 1.0 * (2**attempt)

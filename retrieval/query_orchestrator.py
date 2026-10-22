@@ -126,6 +126,10 @@ class QueryOrchestrator:
         stage_timings_ms: dict[str, float] = {}
         if self.store is not None and self.store.has_pending_corpus_update():
             warnings.append("corpus_update_in_progress")
+        # ROADMAP F1: a first turn's own words are what the vector stage searches, so that
+        # search can start now and run alongside analysis. A follow-up is searched by the
+        # standalone question analysis writes, so it waits.
+        early_vector = None if history else self._start_early_vector(user_query)
         stage_started = time.perf_counter()
         try:
             analysis = await asyncio.wait_for(
@@ -138,6 +142,7 @@ class QueryOrchestrator:
             )
         except Exception as exc:
             logger.warning("query_analysis_failed error_type=%s", type(exc).__name__)
+            self._cancel(early_vector)
             stage_timings_ms["analysis"] = (time.perf_counter() - stage_started) * 1000.0
             return GraphRAGResponse(
                 answer="I could not safely analyze this question within the configured limits.",
@@ -157,6 +162,45 @@ class QueryOrchestrator:
                 cached.interpreted_query = user_query if user_query != asked else None
                 self._remember(session_id, asked, user_query, [], cached)
                 return cached
+        # ROADMAP F1: vector and community retrieval read nothing that linking produces, so
+        # with overlap on they start here and run while linking does; graph retrieval alone
+        # waits for the links. Off, they start together after linking, as before.
+        vector_enabled = bool(analysis.retrieval_flags.get("vector", True))
+        if not vector_enabled:
+            self._cancel(early_vector)
+            early_vector = None
+        vector_task = self._to_thread_or_empty(
+            component="vector_retrieval",
+            enabled=vector_enabled,
+            fn=self._traced(
+                "vector_retrieval",
+                self._aretrieve_vector_queries
+                if callable(getattr(self.vector_retriever, "aretrieve", None))
+                else self._retrieve_vector_queries,
+            ),
+            query=user_query,
+            sub_queries=analysis.sub_queries,
+            timeout_seconds=self.settings.query_vector_timeout_seconds,
+            **({"early": early_vector} if early_vector is not None else {}),
+        )
+        community_task = self._to_thread_or_empty(
+            component="community_retrieval",
+            enabled=bool(analysis.retrieval_flags.get("community")),
+            fn=self._traced("community_retrieval", self.community_retriever.retrieve),
+            query=user_query,
+            timeout_seconds=self.settings.query_vector_timeout_seconds,
+            # ROADMAP C2: like grounding, for the question types it was measured on.
+            **(
+                {"size_prior": float(self.settings.query_community_size_prior)}
+                if self.settings.query_community_size_prior
+                and analysis.query_type in (QueryType.GLOBAL, QueryType.HYBRID)
+                else {}
+            ),
+        )
+
+        if self.settings.query_overlap_retrieval:
+            vector_task = asyncio.ensure_future(vector_task)
+            community_task = asyncio.ensure_future(community_task)
         stage_started = time.perf_counter()
         try:
             async_link = getattr(self.entity_linker, "alink_entities", None)
@@ -192,34 +236,6 @@ class QueryOrchestrator:
             user_query=user_query,
             timeout_seconds=self.settings.query_graph_timeout_seconds,
         )
-        vector_task = self._to_thread_or_empty(
-            component="vector_retrieval",
-            enabled=bool(analysis.retrieval_flags.get("vector", True)),
-            fn=self._traced(
-                "vector_retrieval",
-                self._aretrieve_vector_queries
-                if callable(getattr(self.vector_retriever, "aretrieve", None))
-                else self._retrieve_vector_queries,
-            ),
-            query=user_query,
-            sub_queries=analysis.sub_queries,
-            timeout_seconds=self.settings.query_vector_timeout_seconds,
-        )
-        community_task = self._to_thread_or_empty(
-            component="community_retrieval",
-            enabled=bool(analysis.retrieval_flags.get("community")),
-            fn=self._traced("community_retrieval", self.community_retriever.retrieve),
-            query=user_query,
-            timeout_seconds=self.settings.query_vector_timeout_seconds,
-            # ROADMAP C2: like grounding, for the question types it was measured on.
-            **(
-                {"size_prior": float(self.settings.query_community_size_prior)}
-                if self.settings.query_community_size_prior
-                and analysis.query_type in (QueryType.GLOBAL, QueryType.HYBRID)
-                else {}
-            ),
-        )
-
         graph_outcome, vector_outcome, community_outcome = await asyncio.gather(
             graph_task,
             vector_task,
@@ -262,6 +278,9 @@ class QueryOrchestrator:
             warnings.append(f"fusion_or_rerank_failed:{type(exc).__name__}")
             fusion_output = FusionOutput()
         stage_timings_ms["fusion_rerank"] = (time.perf_counter() - stage_started) * 1000.0
+        rerank_timing = getattr(getattr(self.fusion_engine, "reranker", None), "last_timing", None)
+        if isinstance(rerank_timing, dict):
+            stage_timings_ms.update({key: float(value) for key, value in rerank_timing.items()})
         stage_started = time.perf_counter()
         try:
             response = await asyncio.wait_for(
@@ -427,6 +446,20 @@ class QueryOrchestrator:
                 (time.perf_counter() - started) * 1000.0,
             )
 
+    def _start_early_vector(self, question: str) -> "asyncio.Future[list[RetrieverResult]] | None":
+        aretrieve = getattr(self.vector_retriever, "aretrieve", None)
+        if not self.settings.query_overlap_retrieval or not callable(aretrieve):
+            return None
+        task = asyncio.ensure_future(aretrieve(question, top_k=int(self.settings.query_vector_top_k)))
+        # A search whose result is never used must not log "exception was never retrieved".
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        return task
+
+    @staticmethod
+    def _cancel(task: "asyncio.Future[Any] | None") -> None:
+        if task is not None and not task.done():
+            task.cancel()
+
     def _provider_usage(self) -> dict[str, dict[str, int]]:
         usage: dict[str, dict[str, int]] = {}
         for name, component in (("analysis", self.analyzer), ("generation", self.generator)):
@@ -461,15 +494,20 @@ class QueryOrchestrator:
         self,
         query: str,
         sub_queries: list[str],
+        early: "asyncio.Future[list[RetrieverResult]] | None" = None,
     ) -> list[RetrieverResult]:
         queries = list(dict.fromkeys([query, *sub_queries]))
         groups = await asyncio.gather(
             *(
-                self.vector_retriever.aretrieve(
+                # The question's own search may already be under way (ROADMAP F1); it is the
+                # same call, so it takes the same place in the merge.
+                early
+                if index == 0 and early is not None
+                else self.vector_retriever.aretrieve(
                     value,
                     top_k=int(self.settings.query_vector_top_k),
                 )
-                for value in queries
+                for index, value in enumerate(queries)
             )
         )
         deduped: dict[str, RetrieverResult] = {}

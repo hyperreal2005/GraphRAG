@@ -16,6 +16,8 @@ import logging
 import random
 import threading
 import time
+from array import array
+from collections import OrderedDict
 from typing import Any
 
 from config import Settings
@@ -43,6 +45,12 @@ def _pace(min_interval: float) -> None:
         if wait > 0:
             time.sleep(wait)
         _LAST_REQUEST_AT = time.monotonic()
+
+
+# ROADMAP F1: process-wide, shared by every embedder instance (the vector, linking and community
+# retrievers each hold one). Keyed by model, dimension, task type and the prepared text.
+_CACHE: "OrderedDict[tuple[str, int, str, str], array]" = OrderedDict()
+_CACHE_LOCK = threading.Lock()
 
 
 class GeminiEmbedder:
@@ -110,12 +118,58 @@ class GeminiEmbedder:
             return []
 
         prepared = self._prepare_texts(texts, task_type=task_type, title=title)
+        cached, missing = self._cache_lookup(prepared, task_type)
         batch_size = max(1, int(self.settings.embedding_batch_size))
         vectors: list[list[float]] = []
-        for start in range(0, len(prepared), batch_size):
-            batch = prepared[start : start + batch_size]
+        for start in range(0, len(missing), batch_size):
+            batch = missing[start : start + batch_size]
             vectors.extend(self._embed_batch(batch, task_type=task_type))
-        return vectors
+        return self._cache_fill(prepared, task_type, cached, missing, vectors)
+
+    def _cache_key(self, text: str, task_type: str | None) -> tuple[str, int, str, str]:
+        resolved = str(task_type or self.settings.gemini_embedding_task_type)
+        return (str(self.settings.embedding_model_id), int(self.settings.embedding_dim), resolved, text)
+
+    def _cache_lookup(
+        self, prepared: list[str], task_type: str | None
+    ) -> tuple[dict[str, list[float]], list[str]]:
+        """ROADMAP F1: cached vectors for these texts, and the distinct texts still to embed."""
+        size = int(getattr(self.settings, "embedding_cache_size", 0) or 0)
+        if size <= 0:
+            return {}, list(prepared)
+        cached: dict[str, list[float]] = {}
+        with _CACHE_LOCK:
+            for text in prepared:
+                hit = _CACHE.get(self._cache_key(text, task_type))
+                if hit is not None:
+                    _CACHE.move_to_end(self._cache_key(text, task_type))
+                    cached[text] = list(hit)
+        missing = list(dict.fromkeys(text for text in prepared if text not in cached))
+        return cached, missing
+
+    def _cache_fill(
+        self,
+        prepared: list[str],
+        task_type: str | None,
+        cached: dict[str, list[float]],
+        missing: list[str],
+        vectors: list[list[float]],
+    ) -> list[list[float]]:
+        """Store the new vectors and return one vector per input text, in input order."""
+        if len(vectors) != len(missing):
+            raise RuntimeError("Embedding output length mismatch.")
+        size = int(getattr(self.settings, "embedding_cache_size", 0) or 0)
+        if size <= 0:
+            return vectors
+        fresh = dict(zip(missing, vectors))
+        with _CACHE_LOCK:
+            for text, vector in fresh.items():
+                # Doubles, not floats: a cached vector must be bit-identical to the one the
+                # provider returned, or a cache hit could reorder results.
+                _CACHE[self._cache_key(text, task_type)] = array("d", vector)
+            while len(_CACHE) > size:
+                _CACHE.popitem(last=False)
+        return [list(cached[text]) if text in cached else list(fresh[text]) for text in prepared]
 
     def _prepare_texts(
         self,
@@ -217,10 +271,11 @@ class GeminiEmbedder:
                 task_type,
                 title=title,
             )
+        cached, missing = self._cache_lookup(prepared, task_type)
         batch_size = max(1, int(self.settings.embedding_batch_size))
         vectors: list[list[float]] = []
-        for start in range(0, len(prepared), batch_size):
-            batch = prepared[start : start + batch_size]
+        for start in range(0, len(missing), batch_size):
+            batch = missing[start : start + batch_size]
             try:
                 response = await models.embed_content(
                     model=self.settings.embedding_model_id,
@@ -230,7 +285,7 @@ class GeminiEmbedder:
             except Exception as exc:
                 raise RuntimeError(f"Gemini embedding request failed: {exc}") from exc
             vectors.extend(self._parse_response(response))
-        return vectors
+        return self._cache_fill(prepared, task_type, cached, missing, vectors)
 
     def _build_config(self, task_type: str | None) -> Any:
         if self._types is None:
