@@ -135,7 +135,7 @@ function renderHealth(health) {
     coverage ? h("span", { class: "muted small", title: (cov.refused || []).map((r) => `${r.document}: ${r.reason}`).join(" · ") }, coverage) : null,
     h("span", { class: "muted small" }, `Models: ${health.models?.generation} · ${health.models?.embedding} · ${health.models?.rerank || "no rerank"}`),
     health.cohere ? h("span", { class: "muted small", title: `Key ${health.cohere.key}; ${health.cohere.counted_from}` },
-      `Cohere this month: ${fmt(health.cohere.calls_this_month)}${health.cohere.remaining != null ? ` · ${fmt(health.cohere.remaining)} left` : ""}`) : null);
+      `Cohere this month: ${fmt(health.cohere.calls_this_month)}${health.cohere.remaining != null ? ` · ${fmt(health.cohere.remaining)} left` : health.cohere.remaining_at_most != null ? ` · at most ${fmt(health.cohere.remaining_at_most)} left` : ""}`) : null);
 }
 
 // ---------------------------------------------------------------- ask

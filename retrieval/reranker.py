@@ -23,6 +23,46 @@ logger = logging.getLogger(__name__)
 
 _COHERE_PACE_LOCK = threading.Lock()
 _COHERE_LAST_CALL_AT = 0.0
+# Questions in a row whose rerank ended without a Cohere response after a rate-limit refusal.
+# A query degrades to fused order and carries on, which is right for a user; an evaluation
+# that carries on spends every remaining Gemini call on an invalid run (2026-10-22: a trial
+# key ran out of monthly calls mid-run and 100 questions went unreranked).
+_REFUSAL_LOCK = threading.Lock()
+_REFUSAL_STREAK = 0
+
+
+class CohereRefusing(RuntimeError):
+    """Cohere has refused several questions in a row; its quota is likely exhausted."""
+
+
+def _note_rerank_outcome(*, answered: bool, rate_limited: bool) -> None:
+    global _REFUSAL_STREAK
+    with _REFUSAL_LOCK:
+        if answered:
+            _REFUSAL_STREAK = 0
+        elif rate_limited:
+            _REFUSAL_STREAK += 1
+
+
+def cohere_refusal_streak() -> int:
+    with _REFUSAL_LOCK:
+        return _REFUSAL_STREAK
+
+
+def reset_cohere_refusals() -> None:
+    global _REFUSAL_STREAK
+    with _REFUSAL_LOCK:
+        _REFUSAL_STREAK = 0
+
+
+def raise_if_cohere_refusing(threshold: int = 3) -> None:
+    """For evaluation loops: stop once Cohere has refused `threshold` questions in a row."""
+    streak = cohere_refusal_streak()
+    if streak >= threshold:
+        raise CohereRefusing(
+            f"Cohere refused {streak} questions in a row with a rate limit (429); the key's quota "
+            "is likely exhausted. Stopping so no more Gemini calls are spent on an invalid run."
+        )
 
 
 def _pace_cohere(min_interval: float, *, max_wait: float = float("inf")) -> bool:
@@ -231,6 +271,14 @@ class QueryReranker:
 
     def rerank(self, query: str, items: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
         """Return reranked items plus mode marker."""
+        self._cohere_answered = False
+        self._cohere_rate_limited = False
+        result = self._rerank(query, items)
+        if self._cohere_answered or self._cohere_rate_limited:
+            _note_rerank_outcome(answered=self._cohere_answered, rate_limited=self._cohere_rate_limited)
+        return result
+
+    def _rerank(self, query: str, items: list[RetrieverResult]) -> tuple[list[RetrieverResult], str]:
         # ROADMAP F1/F2: how much of the stage is the trial key's pacing and how much the call.
         timing = {"rerank_pacing_wait": 0.0, "rerank_call": 0.0}
         self.last_timing = timing
@@ -281,10 +329,21 @@ class QueryReranker:
                     top_n=top_n,
                 )
                 timing["rerank_call"] += (time.perf_counter() - called_from) * 1000.0
+                self._cohere_answered = True
                 break
             except Exception as exc:
                 timing["rerank_call"] += (time.perf_counter() - called_from) * 1000.0
+                self._cohere_rate_limited = self._cohere_rate_limited or _is_rate_limited(exc)
                 stall = _is_stall(exc)
+                # Logged per attempt: a retry the pacing guard then refuses reports only the
+                # guard, which hid what actually failed first (ROADMAP F1 A/B).
+                logger.warning(
+                    "cohere_rerank_attempt_failed attempt=%d error_type=%s stall=%s rate_limited=%s",
+                    attempt + 1,
+                    type(exc).__name__,
+                    stall,
+                    _is_rate_limited(exc),
+                )
                 # A throttle backs off exponentially; a stall retries almost at once.
                 delay = 0.5 if stall else 1.0 * (2**attempt)
                 too_late = time.monotonic() + delay + request_timeout > deadline

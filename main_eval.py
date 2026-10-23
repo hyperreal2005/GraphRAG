@@ -135,7 +135,13 @@ def command_run(args: argparse.Namespace) -> int:
 
     usage_ledger.count_gemini_calls()
     before = usage_ledger.process_calls()
-    result = harness.run(settings, selected, resolution, progress_every=args.progress_every)
+    from retrieval.reranker import CohereRefusing
+
+    try:
+        result = harness.run(settings, selected, resolution, progress_every=args.progress_every)
+    except CohereRefusing as exc:
+        print(f"\nRun stopped: {exc}")
+        return 2
     query_calls = usage_ledger.calls_since(before)
 
     faithfulness = None

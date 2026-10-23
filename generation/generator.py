@@ -72,6 +72,24 @@ POLAR_ABSENT_SOURCE_JUDGED = (
     "evidence on the same story, and say which publication that evidence comes from."
 )
 POLAR_ANSWER_OPENING = "\n`answer` then begins with \"Yes,\" or \"No,\" matching `verdict`, and says why."
+# Comparison follow-up, check first: the verdict is set from written checks, not before them.
+POLAR_SET_VERDICT_FIRST = "Set `verdict` before writing `answer`."
+POLAR_CHECK_FIRST = (
+    "First fill `conditions`: one entry per condition the question sets, naming the source it is "
+    "about and whether that source's evidence supports it. Then set `verdict` from those checks, "
+    "and write `answer` to agree with `verdict`."
+)
+# Comparison follow-up, substance: the "no" rule judges what a source says, not its wording.
+POLAR_STRICT_NO = (
+    "- \"yes\" when every condition holds. \"no\" when any condition fails, including when the "
+    "question attributes to a source something its evidence does not say or contradicts."
+)
+POLAR_SUBSTANCE_NO = (
+    "- A condition holds when its source supports it in substance, even if the source puts it more "
+    "weakly or in other words: a report that a company promoted its product as the fastest supports "
+    "\"the article claims the product is the fastest\". \"yes\" when every condition holds. \"no\" "
+    "when a condition is contradicted by its source, or its source says nothing that bears on it."
+)
 # ROADMAP C1, variant 2. B1's one abstention miss asked what a publication absent from the
 # corpus had reported; the system answered from another outlet's coverage of the story.
 ABSENT_NAMED_SOURCE_INSTRUCTION = (
@@ -100,6 +118,7 @@ class AnswerGenerator:
         self._types = None
         self._response_schema = None
         self._polar_response_schema = None
+        self._polar_check_schema = None
         self.last_usage: dict[str, int] = {}
         self._publishers: frozenset[str] | None = None
 
@@ -153,6 +172,33 @@ class AnswerGenerator:
                 property_ordering=["answerable", "verdict", "answer", "claims"],
                 properties={
                     "answerable": self._types.Schema(type="BOOLEAN"),
+                    "verdict": self._types.Schema(type="STRING", enum=list(VERDICTS)),
+                    "answer": self._types.Schema(type="STRING"),
+                    "claims": claims_schema,
+                },
+            )
+            # Comparison follow-up, check first: the conditions are written before the verdict,
+            # so the verdict follows the checks. They are never shown; the answer explains.
+            self._polar_check_schema = self._types.Schema(
+                type="OBJECT",
+                required=["answerable", "conditions", "verdict", "answer", "claims"],
+                property_ordering=["answerable", "conditions", "verdict", "answer", "claims"],
+                properties={
+                    "answerable": self._types.Schema(type="BOOLEAN"),
+                    "conditions": self._types.Schema(
+                        type="ARRAY",
+                        items=self._types.Schema(
+                            type="OBJECT",
+                            required=["condition", "source", "supported"],
+                            properties={
+                                "condition": self._types.Schema(type="STRING"),
+                                "source": self._types.Schema(type="STRING"),
+                                "supported": self._types.Schema(
+                                    type="STRING", enum=["yes", "no", "no evidence"]
+                                ),
+                            },
+                        ),
+                    ),
                     "verdict": self._types.Schema(type="STRING", enum=list(VERDICTS)),
                     "answer": self._types.Schema(type="STRING"),
                     "claims": claims_schema,
@@ -337,13 +383,23 @@ class AnswerGenerator:
             "together the claims must account for every factual statement in `answer`. "
             "Use only evidence IDs shown in the retrieved evidence."
         )
+        check_first = polar and self.settings.generation_polar_check_first
         if polar:
+            instruction = POLAR_VERDICT_INSTRUCTION
+            if check_first:
+                instruction = instruction.replace(POLAR_SET_VERDICT_FIRST, POLAR_CHECK_FIRST)
+            if self.settings.generation_polar_substance:
+                instruction = instruction.replace(POLAR_STRICT_NO, POLAR_SUBSTANCE_NO)
             prompt += (
-                POLAR_VERDICT_INSTRUCTION
+                instruction
                 + ("" if refuse_absent_source else POLAR_ABSENT_SOURCE_JUDGED)
                 + POLAR_ANSWER_OPENING
             )
-        schema = self._polar_response_schema if polar else self._response_schema
+        schema = (
+            self._polar_check_schema
+            if check_first
+            else self._polar_response_schema if polar else self._response_schema
+        )
         last_valid: list[AnswerClaim] = []
         last_flagged: list[str] = []
         last_answer = ""

@@ -21,7 +21,7 @@ import inspect
 import json
 import threading
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -96,10 +96,38 @@ def _ledger(settings: Any, month: str | None = None) -> Path:
     return Path(settings.usage_dir) / f"cohere-{month}.jsonl"
 
 
+def _started(settings: Any) -> date | None:
+    """The day the ledger began counting, or None if it has never counted anything.
+
+    Calls before it are invisible, so a month it began part-way through has an unknown start:
+    on 2026-10-22 a trial key ran out at what the ledger read as 498 calls left, because the
+    month's first 400-odd calls predated it.
+    """
+    usage_dir = Path(settings.usage_dir)
+    try:
+        return date.fromisoformat((usage_dir / "started.txt").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pass
+    earliest: date | None = None
+    for path in usage_dir.glob("cohere-*.jsonl"):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                at = datetime.fromisoformat(json.loads(handle.readline())["at"]).date()
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        earliest = at if earliest is None or at < earliest else earliest
+    return earliest
+
+
 def record_cohere_call(settings: Any, kind: str = "rerank") -> None:
     """Count one call. A ledger that cannot be written must never fail the query."""
     _count("cohere", kind, getattr(settings, "query_rerank_model", None))
     try:
+        marker = Path(settings.usage_dir) / "started.txt"
+        if not marker.exists():
+            started = _started(settings) or datetime.now(timezone.utc).date()
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(started.isoformat(), encoding="utf-8")
         path = _ledger(settings)
         line = json.dumps({
             "at": datetime.now(timezone.utc).isoformat(),
@@ -131,13 +159,23 @@ def month_calls(settings: Any, month: str | None = None) -> int:
 
 
 def summary(settings: Any) -> dict[str, Any]:
+    """This month's calls on the configured key. `remaining` is exact only when the ledger has
+    counted the whole month; otherwise it is reported as `remaining_at_most`."""
     calls = month_calls(settings)
     limit = int(settings.cohere_monthly_call_limit)
-    return {
+    started = _started(settings)
+    whole_month = started is not None and started <= datetime.now(timezone.utc).date().replace(day=1)
+    out: dict[str, Any] = {
         "key": key_fingerprint(settings.cohere_api_key),
         "month": datetime.now(timezone.utc).strftime("%Y-%m"),
         "calls_this_month": calls,
         "monthly_limit": limit or None,
-        "remaining": max(0, limit - calls) if limit else None,
-        "counted_from": "the ledger; calls made before it existed are not included",
+        "counted_from": started.isoformat() if started else None,
     }
+    if limit:
+        if whole_month:
+            out["remaining"] = max(0, limit - calls)
+        else:
+            out["remaining"] = None
+            out["remaining_at_most"] = max(0, limit - calls)
+    return out

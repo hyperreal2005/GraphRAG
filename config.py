@@ -145,14 +145,13 @@ class Settings:
     # ROADMAP F2: where provider calls are counted, and the Cohere key's monthly call limit
     # (the trial key's is 1,000; 0 means no limit is shown).
     usage_dir: Path = Path("data/usage")
-    # ROADMAP F1, both off until measured. Overlap: the raw question's vector search runs
-    # alongside analysis, and vector and community retrieval run alongside entity linking -
-    # none of them reads what it overlaps, so results are unchanged and only waiting goes.
-    # The cache keeps recent embeddings by model, dimension, task type and prepared text, so a
-    # text embedded twice (the vector and community retrievers both embed the question) is
-    # sent once; 0 disables it.
-    query_overlap_retrieval: bool = False
-    embedding_cache_size: int = 0
+    # ROADMAP F1, adopted 2026-10-22 (news A/B: 1.26 s median saving, evidence unchanged on the
+    # questions reranked in both runs). Overlap: the raw question's vector search runs alongside
+    # analysis, and vector and community retrieval run alongside entity linking - none of them
+    # reads what it overlaps. The cache keeps recent embeddings by model, dimension, task type
+    # and prepared text, so a text embedded twice is sent once; 0 disables it.
+    query_overlap_retrieval: bool = True
+    embedding_cache_size: int = 512
     cohere_monthly_call_limit: int = 1000
     # Switched from `gemini-embedding-2` on 2026-09-05. That model sheds load
     # server-side regardless of billing tier: measured interleaved against -001 on one key
@@ -373,6 +372,15 @@ class Settings:
     # refused that question (20/20) but also 11 news questions V1 answers, 6 of them with a
     # gold article at rank 1 - news verdicts 15 -> 9 of 18, entity answers 31 -> 27.
     generation_refuse_absent_named_source: bool = False
+    # Comparison follow-up to C1 (2026-10-22), both off until measured. Six comparison verdicts
+    # are wrong in every run since C1: two answers contradict their own verdict, and four
+    # reject a condition the source supports in other words.
+    # Check first: the model lists each condition and whether its source supports it, in a
+    # `conditions` field ordered before `verdict`, then sets the verdict from those checks.
+    generation_polar_check_first: bool = False
+    # Substance: a condition holds when its source supports it in substance, even worded more
+    # weakly or differently; "no" needs a source that contradicts it or says nothing on it.
+    generation_polar_substance: bool = False
     # ROADMAP C2. For a GLOBAL or HYBRID question, each retrieved community adds this many of
     # its most central member passages, one per document, so the answer can cite real text and
     # draw on more of the theme's documents. 0 is off. Measured at 3 and not adopted: uncited
@@ -916,6 +924,10 @@ class Settings:
         polar_env = os.getenv("GENERATION_POLAR_VERDICTS")
         if polar_env is not None:
             self.generation_polar_verdicts = polar_env.strip().lower() not in {"0", "false", "no"}
+        for name in ("generation_polar_check_first", "generation_polar_substance"):
+            flag_env = os.getenv(name.upper())
+            if flag_env is not None:
+                setattr(self, name, flag_env.strip().lower() not in {"0", "false", "no"})
         absent_source_env = os.getenv("GENERATION_REFUSE_ABSENT_NAMED_SOURCE")
         if absent_source_env is not None:
             self.generation_refuse_absent_named_source = (
