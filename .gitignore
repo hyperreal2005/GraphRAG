@@ -33,6 +33,3 @@ docs/
 tests/
 eval/
 scripts/
-
-# Not the README the project will ship; revisited when everything is complete.
-README.md
