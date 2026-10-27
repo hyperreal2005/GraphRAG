@@ -1,3 +1,7 @@
+# Fixed so the stack and its volumes keep one name whatever folder the repo is cloned into.
+# `docker compose -p <name>` or COMPOSE_PROJECT_NAME still overrides it.
+name: graphrag_r2
+
 services:
   neo4j:
     image: neo4j:5.26.22-community

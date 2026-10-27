@@ -220,7 +220,9 @@ class QueryOrchestrator:
                 timeout=max(0.1, float(self.settings.query_entity_link_timeout_seconds)),
             )
         except Exception as exc:
-            logger.warning("entity_linking_failed error_type=%s", type(exc).__name__)
+            # The message, not only the type: G3's run lost six questions to RuntimeErrors whose
+            # cause - provider error or local fault - the log could not say (2026-10-23).
+            logger.warning("entity_linking_failed error_type=%s error=%.200s", type(exc).__name__, exc)
             warnings.append(f"entity_linking_failed:{type(exc).__name__}")
             linked_entities = []
         stage_timings_ms["entity_linking"] = (time.perf_counter() - stage_started) * 1000.0
@@ -439,7 +441,7 @@ class QueryOrchestrator:
             )
             return results, None, (time.perf_counter() - started) * 1000.0
         except Exception as exc:
-            logger.warning("%s_failed error_type=%s", component, type(exc).__name__)
+            logger.warning("%s_failed error_type=%s error=%.200s", component, type(exc).__name__, exc)
             return (
                 [],
                 f"{component}_failed:{type(exc).__name__}",
